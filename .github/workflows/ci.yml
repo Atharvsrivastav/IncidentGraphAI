@@ -34,6 +34,9 @@ jobs:
       - name: Generate Prisma Client
         run: npx prisma generate
 
+      - name: Initialize Database Schema
+        run: npx prisma db push
+
       - name: Typecheck (tsc)
         run: npx tsc --noEmit
 
