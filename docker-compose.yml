@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # -------------------------------------------------------------
+  # OpenTelemetry Collector
+  # Receives OTLP metrics and traces, processes them, and exports:
+  # - Metrics -> Prometheus (:8889)
+  # - Traces  -> Jaeger (:4317)
+  # -------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.95.0
+    container_name: incidentgraph-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./docker/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8889:8889"   # Prometheus metrics exporter endpoint
+      - "13133:13133" # Health check extension
+    depends_on:
+      - jaeger
+
+  # -------------------------------------------------------------
+  # Prometheus
+  # Time-series metrics storage and PromQL querying engine
+  # -------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: incidentgraph-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090" # Prometheus Web UI & PromQL Query API
+    depends_on:
+      - otel-collector
+
+  # -------------------------------------------------------------
+  # Jaeger
+  # Distributed tracing storage and Trace Investigation UI
+  # -------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.54.0
+    container_name: incidentgraph-jaeger
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger Web UI & Query API
+      - "14268:14268" # Jaeger HTTP collector
+      - "6831:6831/udp" # Jaeger UDP agent
+
+  # -------------------------------------------------------------
+  # Sample PostgreSQL Database
+  # Real database storage backing Order and Inventory records
+  # -------------------------------------------------------------
+  sample-postgres:
+    image: postgres:16-alpine
+    container_name: incidentgraph-sample-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: sample_ecommerce
+    ports:
+      - "5433:5432" # Mapped to 5433 to avoid local port 5432 conflicts
+    volumes:
+      - sample_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  sample_postgres_data:

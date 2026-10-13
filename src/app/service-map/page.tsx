@@ -1,0 +1,352 @@
+"use client";
+
+import { useEffect, useState, useCallback } from "react";
+import { ServiceGraph } from "@/components/graph/ServiceGraph";
+import {
+  Search,
+  RefreshCw,
+  GitFork,
+  CheckCircle2,
+  AlertTriangle,
+  Radio,
+  ExternalLink,
+  HelpCircle,
+} from "lucide-react";
+import Link from "next/link";
+import { BackendHealthStatus, ObservedServiceMetric } from "@/lib/telemetry/types";
+
+interface MapServiceItem {
+  id: string;
+  name: string;
+  serviceType: string;
+  tier: number;
+  status: "HEALTHY" | "DEGRADED" | "DOWN";
+  currentLatency: number;
+  baselineLatency: number;
+  currentErrorRate: number;
+  baselineErrorRate: number;
+  requestRate: number;
+  description: string;
+}
+
+interface MapDependencyItem {
+  sourceServiceId: string;
+  targetServiceId: string;
+  dependencyType: string;
+  timeoutThreshold: number;
+  criticality: string;
+}
+
+interface ActiveIncidentItem {
+  id: string;
+  suspectedRootCauseId?: string | null;
+}
+
+export default function ServiceMapPage() {
+  const [services, setServices] = useState<MapServiceItem[]>([]);
+  const [dependencies, setDependencies] = useState<MapDependencyItem[]>([]);
+  const [activeIncident, setActiveIncident] = useState<ActiveIncidentItem | null>(null);
+  const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+
+  // Telemetry Mode & Backend Status
+  const [telemetryMode, setTelemetryMode] = useState<"SIMULATION" | "REAL">("SIMULATION");
+  const [backendHealth, setBackendHealth] = useState<BackendHealthStatus | null>(null);
+  const [lastCollectedAt, setLastCollectedAt] = useState<string | null>(null);
+  const [unknownServices, setUnknownServices] = useState<ObservedServiceMetric[]>([]);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const [svcRes, depRes, simRes, telRes] = await Promise.all([
+        fetch("/api/services"),
+        fetch("/api/dependencies"),
+        fetch("/api/simulations/state"),
+        fetch("/api/telemetry/overview"),
+      ]);
+
+      let currentMode: "SIMULATION" | "REAL" = "SIMULATION";
+
+      if (telRes.ok) {
+        const telData = await telRes.json();
+        currentMode = telData.mode || "SIMULATION";
+        setTelemetryMode(currentMode);
+        setBackendHealth(telData.backendHealth || null);
+        setLastCollectedAt(telData.lastCollectedAt || null);
+        setUnknownServices(telData.unknownServices || []);
+
+        // If in REAL mode, apply real measured metrics to graph services
+        if (currentMode === "REAL" && telData.observedServices && svcRes.ok) {
+          const rawSvcData = await svcRes.json();
+          const dbServices: MapServiceItem[] = rawSvcData.services ?? [];
+
+          const mergedServices = dbServices.map((svc) => {
+            const realObs = telData.observedServices.find((o: ObservedServiceMetric) => o.serviceId === svc.id);
+            if (realObs && !realObs.isStale && realObs.status !== "UNKNOWN") {
+              return {
+                ...svc,
+                status: realObs.status as "HEALTHY" | "DEGRADED" | "DOWN",
+                currentLatency: realObs.latencyMs,
+                currentErrorRate: realObs.errorRate,
+                requestRate: realObs.requestRate,
+              };
+            }
+            return svc;
+          });
+
+          setServices(mergedServices);
+        } else if (svcRes.ok) {
+          const data = await svcRes.json();
+          setServices(data.services ?? []);
+        }
+      } else if (svcRes.ok) {
+        const data = await svcRes.json();
+        setServices(data.services ?? []);
+      }
+
+      if (depRes.ok) {
+        const data = await depRes.json();
+        setDependencies(data.dependencies ?? []);
+      }
+      if (simRes.ok) {
+        const data = await simRes.json();
+        setActiveIncident(data.activeIncident ?? null);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      if (active) await fetchData();
+    };
+    void poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [fetchData]);
+
+  const filteredServices = services.filter((svc) => {
+    const matchesStatus = statusFilter === "ALL" || svc.status === statusFilter;
+    const matchesSearch =
+      svc.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      svc.id.toLowerCase().includes(searchQuery.toLowerCase());
+    return matchesStatus && matchesSearch;
+  });
+
+  return (
+    <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-6">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-indigo-500/20 px-2.5 py-0.5 text-xs font-semibold text-indigo-400 border border-indigo-500/30">
+              Topology Visualization
+            </span>
+            <span className="text-xs text-slate-400 font-mono">Directed Dependency Graph</span>
+            {telemetryMode === "REAL" && (
+              <span className="rounded bg-purple-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-purple-300 border border-purple-500/30">
+                ● Live OpenTelemetry Source
+              </span>
+            )}
+          </div>
+          <h1 className="mt-1.5 text-2xl font-black text-white tracking-tight sm:text-3xl">
+            Service Dependency Map
+          </h1>
+          <p className="mt-1 text-xs text-slate-400">
+            {telemetryMode === "REAL"
+              ? "Observing live runtime measurements from Prometheus and Jaeger distributed tracing."
+              : "Simulated microservices topology and causal failure propagation graph."}
+          </p>
+        </div>
+
+        {/* Quick Toolbar */}
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search service..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="rounded-xl border border-slate-800 bg-slate-900/90 pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none"
+            />
+          </div>
+
+          {/* Status Filter */}
+          <div className="flex items-center rounded-xl border border-slate-800 bg-slate-900/90 p-1 text-xs">
+            {["ALL", "HEALTHY", "DEGRADED", "DOWN"].map((filter) => (
+              <button
+                key={filter}
+                onClick={() => setStatusFilter(filter)}
+                className={`rounded-lg px-2.5 py-1 font-mono transition-colors ${
+                  statusFilter === filter
+                    ? "bg-slate-800 text-blue-400 font-bold"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {filter}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={fetchData}
+            title="Refresh topology"
+            className="rounded-xl border border-slate-800 bg-slate-900/90 p-2 text-slate-400 hover:text-white transition-colors"
+          >
+            <RefreshCw className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Real Telemetry Observation Banner */}
+      {telemetryMode === "REAL" && (
+        <div className="rounded-2xl border border-indigo-500/40 bg-gradient-to-r from-indigo-950/40 via-slate-900/80 to-slate-950 p-4 backdrop-blur-md">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600/30 border border-indigo-500/40 text-indigo-400">
+                <Radio className="h-4 w-4 animate-pulse" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-white">Live Telemetry Mode Active</span>
+                  {backendHealth?.backendType === "GRAFANA_CLOUD" && (
+                    <span className="rounded bg-sky-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-sky-300 border border-sky-500/30">
+                      ☁ Grafana Cloud (Hosted)
+                    </span>
+                  )}
+                  {backendHealth?.backendType === "GENUINE_STACK" && (
+                    <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-500/30">
+                      Genuine Docker Stack
+                    </span>
+                  )}
+                  {backendHealth?.backendType === "MOCK_EMULATION" && (
+                    <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30" title="Connected to in-process development mock server, not Docker containers.">
+                      Dev Mock Emulation Stack
+                    </span>
+                  )}
+                  {backendHealth?.backendType === "UNAVAILABLE" && (
+                    <span className="rounded bg-rose-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-rose-300 border border-rose-500/30">
+                      Backends Offline
+                    </span>
+                  )}
+                  <span className="text-[10px] font-mono text-slate-400">
+                    Latest poll: {lastCollectedAt ? new Date(lastCollectedAt).toLocaleTimeString() : "just now"}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-300 flex items-center gap-3 mt-1 flex-wrap">
+                  <span>
+                    Metrics Backend:{" "}
+                    <strong className={backendHealth?.prometheusAvailable ? "text-emerald-400" : "text-rose-400"}>
+                      {backendHealth?.prometheusAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                    </strong>
+                  </span>
+                  <span>
+                    Traces Backend:{" "}
+                    <strong className={backendHealth?.jaegerAvailable ? "text-emerald-400" : "text-rose-400"}>
+                      {backendHealth?.jaegerAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud Tempo)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                    </strong>
+                  </span>
+                </div>
+                {backendHealth?.details && (
+                  <p className="text-[10px] text-slate-400 mt-0.5 font-mono">
+                    {backendHealth.details}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Link
+                href="/traces"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-3.5 py-2 font-semibold text-white shadow-md shadow-indigo-600/30 transition-all text-xs"
+              >
+                <span>Inspect Live Traces</span>
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Unknown Services Warning Banner */}
+      {unknownServices.length > 0 && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-950/20 p-4 text-xs text-amber-200">
+          <div className="flex items-center gap-2 font-bold">
+            <HelpCircle className="h-4 w-4 text-amber-400" />
+            <span>Unknown Services Discovered in Telemetry Stream:</span>
+          </div>
+          <p className="mt-1 text-slate-300">
+            The following services are transmitting OpenTelemetry metrics but are not configured in the static database topology:
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {unknownServices.map((u) => (
+              <span key={u.serviceId} className="rounded bg-slate-900 border border-slate-700 px-2.5 py-1 font-mono text-[11px]">
+                {u.serviceName} ({u.requestRate} req/s, {u.latencyMs}ms)
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Interactive Service Graph */}
+      {loading ? (
+        <div className="flex h-[620px] items-center justify-center rounded-2xl border border-slate-800 bg-slate-950">
+          <div className="flex items-center gap-3 text-slate-400">
+            <RefreshCw className="h-5 w-5 animate-spin text-blue-500" />
+            <span className="font-mono text-sm">Rendering topology graph...</span>
+          </div>
+        </div>
+      ) : (
+        <ServiceGraph
+          services={filteredServices}
+          dependencies={dependencies}
+          suspectedRootCauseId={activeIncident?.suspectedRootCauseId}
+          onServiceRestored={fetchData}
+        />
+      )}
+
+      {/* Architecture Topology Info Card */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center gap-2 text-blue-400 text-xs font-semibold uppercase font-mono">
+            <GitFork className="h-4 w-4" />
+            <span>Edge Direction Convention</span>
+          </div>
+          <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+            <strong className="text-slate-200 font-mono">A → B</strong> denotes that Service A
+            calls or depends on Service B. Impact propagates in reverse along callers.
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center gap-2 text-purple-400 text-xs font-semibold uppercase font-mono">
+            <AlertTriangle className="h-4 w-4" />
+            <span>Root Cause Isolation</span>
+          </div>
+          <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+            The active incident highlights the suspected root-cause node with a purple beacon,
+            isolating the originating failure from downstream victim cascades.
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold uppercase font-mono">
+            <CheckCircle2 className="h-4 w-4" />
+            <span>Interactive Node Inspection</span>
+          </div>
+          <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+            Click any service node to slide out its inspection drawer, verify latency vs baseline,
+            and view live OpenTelemetry metrics.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
