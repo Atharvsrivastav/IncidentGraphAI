@@ -81,7 +81,8 @@ export class RootCauseEngine {
 
     // Evaluate each candidate service using our Priority Queue
     const priorityQueue = new PriorityQueue<RootCauseCandidateResult>("MAX");
-    const allNodeIds = graph.getAllNodeIds();
+    // Sort allNodeIds alphabetically to guarantee deterministic evaluation order
+    const allNodeIds = graph.getAllNodeIds().sort();
 
     for (const serviceId of allNodeIds) {
       const candidateResult = this.evaluateCandidate(
@@ -98,17 +99,26 @@ export class RootCauseEngine {
     }
 
     // Extract candidates in ranked order from Priority Queue
-    const rankedCandidates: RootCauseCandidateResult[] = [];
-    let rank = 1;
-
+    const extractedCandidates: RootCauseCandidateResult[] = [];
     while (!priorityQueue.isEmpty()) {
       const node = priorityQueue.extract();
       if (node) {
-        const candidate = { ...node.item, rank };
-        rankedCandidates.push(candidate);
-        rank++;
+        extractedCandidates.push(node.item);
       }
     }
+
+    // Stable tie-breaking: Primary by score descending, secondary by serviceId ascending
+    extractedCandidates.sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return a.serviceId.localeCompare(b.serviceId);
+    });
+
+    const rankedCandidates: RootCauseCandidateResult[] = extractedCandidates.map((cand, idx) => ({
+      ...cand,
+      rank: idx + 1,
+    }));
 
     const topCandidate = rankedCandidates[0] ?? null;
     const isConclusive = Boolean(
@@ -265,6 +275,39 @@ export class RootCauseEngine {
         penalty: 40,
       });
       rawScore -= 40;
+    }
+
+    // Contradictory signal: Service marked HEALTHY despite anomalous telemetry
+    if (state?.status === "HEALTHY" && metrics && (metrics.hasLatencyAnomaly || metrics.hasErrorAnomaly)) {
+      contradictory.push({
+        description: "Contradictory status signal: Service is reported HEALTHY despite anomalous telemetry observations.",
+        penalty: 15,
+      });
+      rawScore -= 15;
+    }
+
+    // Contradictory signal: Service marked DOWN/DEGRADED but telemetry is pristine
+    if (
+      (state?.status === "DOWN" || state?.status === "DEGRADED") &&
+      metrics &&
+      metrics.sampleCount >= 2 &&
+      !metrics.hasLatencyAnomaly &&
+      !metrics.hasErrorAnomaly
+    ) {
+      contradictory.push({
+        description: "Contradictory telemetry signals: Service status is flagged abnormal, but sliding window metrics remain within baseline limits.",
+        penalty: 15,
+      });
+      rawScore -= 15;
+    }
+
+    // Missing telemetry penalty on degraded/down service
+    if ((state?.status === "DOWN" || state?.status === "DEGRADED") && (!metrics || metrics.sampleCount === 0)) {
+      contradictory.push({
+        description: "Missing telemetry: Zero metric samples recorded in the observation window.",
+        penalty: 5,
+      });
+      rawScore -= 5;
     }
 
     const finalScore = Math.max(0, Math.min(100, rawScore));

@@ -9,6 +9,8 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:benchmark": "vitest run tests/benchmark.test.ts",
+    "benchmark": "tsx scripts/run-benchmark.ts",
     "test:e2e": "node scripts/e2e-live-test.mjs",
     "test:browser": "node tests/browser-e2e.mjs",
     "test:live": "tsx scripts/verify-live-pipeline.ts",
