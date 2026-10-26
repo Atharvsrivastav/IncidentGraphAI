@@ -65,6 +65,7 @@ model Incident {
 
   evidences            IncidentEvidence[]
   rootCauseCandidates  RootCauseCandidate[]
+  aiInvestigation      AiInvestigation?
 
   @@index([status])
   @@index([severity])
@@ -139,4 +140,34 @@ model SimulationState {
   severity           String?
   status             String    @default("IDLE") // IDLE | ACTIVE | RESOLVED
   updatedAt          DateTime  @updatedAt
+}
+
+model AiInvestigation {
+  id                     String    @id @default(cuid())
+  incidentId             String    @unique
+  summary                String
+  verifiedImpact         String
+  diagnosisStatus        String    // PROBABLE_ROOT_CAUSE | MULTIPLE_CANDIDATES | INCONCLUSIVE
+  confidenceCategory     String    // HIGH | MEDIUM | LOW | UNCERTAIN
+  confidenceExplanation  String
+  rankedHypothesesJson   String    // JSON array of RankedHypothesis
+  recommendedChecksJson  String    // JSON array of DiagnosticCheck
+  remediationOptionsJson String    // JSON array of RemediationOption
+  missingEvidenceJson    String    // JSON array of string
+  nextObservationsJson   String    // JSON array of string
+  provenance             String    // LIVE_TELEMETRY | SIMULATED | MOCK
+  provider               String    // e.g. "openai" | "mock"
+  model                  String    // e.g. "gpt-4o-mini"
+  executionTimeMs        Int
+  promptTokens           Int?
+  completionTokens       Int?
+  totalTokens            Int?
+  rawResponseJson        String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  incident               Incident  @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+  @@index([diagnosisStatus])
 }
