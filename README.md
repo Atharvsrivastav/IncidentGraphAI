@@ -5,9 +5,9 @@
 [![Next.js](https://img.shields.io/badge/Next.js-16.4-black?logo=next.js&logoColor=white)](https://nextjs.org/)
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
-[![Tests](https://img.shields.io/badge/Vitest-36%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Vitest-74%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 
-> **Intelligent, explainable incident investigation and root-cause analysis for distributed software architectures using directed graphs, deterministic algorithms, and OpenTelemetry.**
+> **Intelligent, explainable incident investigation and root-cause analysis for distributed software architectures using directed graphs, deterministic algorithms, OpenTelemetry, and evidence-grounded AI synthesis.**
 
 ---
 
@@ -24,13 +24,14 @@ In modern microservice architectures, diagnosing outages is notoriously difficul
 
 ## 2. The Solution: IncidentGraph AI
 
-**IncidentGraph AI** replaces guesswork with **deterministic graph algorithms** and **evidence-based heuristics**. By modeling microservice topologies as a directed graph ($A \rightarrow B$ means service $A$ calls or depends on service $B$) and correlating live OpenTelemetry signals, it isolates the true originating failure in seconds.
+**IncidentGraph AI** replaces guesswork with **deterministic graph algorithms**, **evidence-based heuristics**, and **grounded AI synthesis**. By modeling microservice topologies as a directed graph ($A \rightarrow B$ means service $A$ calls or depends on service $B$) and correlating live OpenTelemetry signals, it isolates the true originating failure in seconds.
 
 ### Key Highlights
 - **100% Deterministic & Explainable**: Root causes are identified using proven graph traversal algorithms (Reverse BFS, 3-Color DFS) and a multi-factor ranking heuristic. No black-box hallucinations.
-- **Zero Ground-Truth Leakage**: The analysis engine evaluates only observable runtime evidence (metrics, trace bottlenecks, graph reachability, temporal precedence) without peeking at simulation ground truth.
-- **Dual Telemetry Modes**: Operates offline via local SQLite and a deterministic chaos simulator, or connects to live production-grade **Grafana Cloud** (Prometheus Mimir + Tempo Traces) without requiring Docker or root privileges.
-- **Interactive SRE Operations Console**: Visualizes service topologies, blast radius cascades, trace waterfalls, and algorithmic execution benchmarks in real time.
+- **Evidence-Grounded AI Investigation**: Server-side LLM synthesis (`OpenAIProvider` or deterministic `MockAIProvider`) that correlates telemetry anomalies, trace spans, and graph reachability into an actionable SRE incident brief. Every claim is validated against genuine database evidence IDs, discarding hallucinated citations and enforcing calibrated uncertainty.
+- **Zero Ground-Truth Leakage & Secret Redaction**: The analysis engine evaluates only observable runtime evidence without peeking at simulation ground truth. All credentials, tokens, and database passwords are automatically redacted before LLM transmission.
+- **Dual Telemetry Modes with Truthful Provenance**: Operates offline via local SQLite and a deterministic chaos simulator, or connects to live production-grade **Grafana Cloud** (Prometheus Mimir + Tempo Traces) without requiring Docker or root privileges.
+- **Interactive SRE Operations Console**: Visualizes service topologies, blast radius cascades, trace waterfalls, and algorithmic execution benchmarks in real time. Full incident triage with copyable Markdown incident briefs.
 
 ---
 

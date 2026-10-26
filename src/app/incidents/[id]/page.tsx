@@ -2,7 +2,8 @@
 
 import { useEffect, useState, use, Suspense, useCallback } from "react";
 import Link from "next/link";
-import { ArrowLeft, Zap, RefreshCw, FileText } from "lucide-react";
+import { ArrowLeft, Zap, RefreshCw, FileText, Sparkles } from "lucide-react";
+import { AiInvestigationSection } from "@/components/incident/AiInvestigationSection";
 
 interface SupportingSignal {
   scoreContribution: number;
@@ -65,7 +66,7 @@ function IncidentDetailContent({
   const [incident, setIncident] = useState<IncidentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
-  const [activeTab, setActiveTab] = useState<"root-causes" | "evidence">("root-causes");
+  const [activeTab, setActiveTab] = useState<"ai-investigation" | "root-causes" | "evidence">("ai-investigation");
 
   const fetchIncident = useCallback(async () => {
     try {
@@ -172,6 +173,17 @@ function IncidentDetailContent({
       {/* Tabs */}
       <div className="flex border-b border-slate-800">
         <button
+          onClick={() => setActiveTab("ai-investigation")}
+          className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
+            activeTab === "ai-investigation"
+              ? "border-purple-500 text-purple-400 font-bold"
+              : "border-transparent text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          <Sparkles className="h-4 w-4" />
+          <span>AI Investigation</span>
+        </button>
+        <button
           onClick={() => setActiveTab("root-causes")}
           className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
             activeTab === "root-causes"
@@ -180,7 +192,7 @@ function IncidentDetailContent({
           }`}
         >
           <Zap className="h-4 w-4" />
-          <span>Ranked Root Causes ({candidates.length})</span>
+          <span>DSA Graph Candidates ({candidates.length})</span>
         </button>
         <button
           onClick={() => setActiveTab("evidence")}
@@ -194,6 +206,14 @@ function IncidentDetailContent({
           <span>Evidence Timeline ({evidences.length})</span>
         </button>
       </div>
+
+      {/* Tab 0: AI Investigation */}
+      {activeTab === "ai-investigation" && (
+        <AiInvestigationSection
+          incidentId={id}
+          onNavigateToEvidence={() => setActiveTab("evidence")}
+        />
+      )}
 
       {/* Tab 1: Ranked Root Causes */}
       {activeTab === "root-causes" && (
