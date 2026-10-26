@@ -65,14 +65,17 @@ export function AiInvestigationSection({
     };
   }, [incidentId]);
 
-  const handleRunInvestigation = async () => {
+  const handleRunInvestigation = async (providerOverride?: "mock" | "openai") => {
     setAnalyzing(true);
     setError(null);
     try {
       const res = await fetch(`/api/incidents/${incidentId}/ai-investigation`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ forceRefresh: true }),
+        body: JSON.stringify({
+          forceRefresh: true,
+          provider: providerOverride,
+        }),
       });
 
       const data = await res.json();
@@ -146,7 +149,7 @@ export function AiInvestigationSection({
     );
   }
 
-  // AI Unconfigured State (truthful display)
+  // AI Unconfigured State (truthful display with offline replay option)
   if (!investigation && providerStatus && !providerStatus.isConfigured) {
     return (
       <div className="rounded-2xl border border-amber-500/30 bg-gradient-to-r from-amber-950/20 via-slate-900/80 to-slate-900/90 p-6 shadow-xl">
@@ -163,19 +166,25 @@ export function AiInvestigationSection({
             </h3>
             <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
               No live LLM key configured (<code className="rounded bg-slate-800 px-1.5 py-0.5 text-amber-300">OPENAI_API_KEY</code>).
-              The deterministic graph engine remains 100% active and testable on the adjacent tab.
-              To enable server-side AI synthesis, add your API key to <code className="text-slate-300">.env</code> or test using the deterministic mock provider.
+              The deterministic graph engine remains 100% active. You can run the investigation using the deterministic simulation replay provider below.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={handleRunInvestigation}
+              onClick={() => handleRunInvestigation("mock")}
               disabled={analyzing}
               className="flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all disabled:opacity-50"
             >
               <Sparkles className={`h-4 w-4 ${analyzing ? "animate-spin" : ""}`} />
-              <span>{analyzing ? "Synthesizing..." : "Run AI Investigation"}</span>
+              <span>{analyzing ? "Synthesizing Replay..." : "Run Simulation Replay Demo"}</span>
+            </button>
+            <button
+              onClick={() => handleRunInvestigation()}
+              disabled={analyzing}
+              className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 px-3 py-2.5 text-xs font-semibold text-slate-300 transition-all disabled:opacity-50"
+            >
+              <span>Test Live OpenAI</span>
             </button>
           </div>
         </div>
@@ -213,7 +222,7 @@ export function AiInvestigationSection({
         )}
 
         <button
-          onClick={handleRunInvestigation}
+          onClick={() => handleRunInvestigation()}
           disabled={analyzing}
           className="inline-flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all disabled:opacity-50"
         >
@@ -326,7 +335,7 @@ export function AiInvestigationSection({
             </button>
 
             <button
-              onClick={handleRunInvestigation}
+              onClick={() => handleRunInvestigation()}
               disabled={analyzing}
               className="flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 px-4 py-2 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all disabled:opacity-50"
             >

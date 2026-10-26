@@ -50,3 +50,6 @@ next-env.d.ts
 *.sqlite3
 sample-services/data/sample_store.json
 *.log
+
+.vercel
+.env*

@@ -14,6 +14,7 @@ import { POST as resetSimulation } from "../src/app/api/simulations/reset/route"
 import { GET as getSimulationState } from "../src/app/api/simulations/state/route";
 import { GET as getOverview } from "../src/app/api/analytics/overview/route";
 import { POST as runDsa } from "../src/app/api/dsa/run/route";
+import { GET as getHealth } from "../src/app/api/health/route";
 import { seedDatabase } from "../src/lib/db/seed";
 
 describe("REST API Endpoints & Data Integrity Tests", () => {
@@ -205,5 +206,16 @@ describe("REST API Endpoints & Data Integrity Tests", () => {
     });
     const invRes = await runDsa(invReq);
     expect(invRes.status).toBe(400);
+  });
+
+  it("GET /api/health returns 200 with database, telemetry, and AI provider status", async () => {
+    const res = await getHealth();
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.status).toBe("healthy");
+    expect(json.database.status).toBe("connected");
+    expect(json.database.servicesCount).toBeGreaterThanOrEqual(7);
+    expect(json.telemetry.mode).toBeDefined();
+    expect(json.aiProvider.provider).toBeDefined();
   });
 });

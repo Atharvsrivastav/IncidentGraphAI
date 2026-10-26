@@ -1,0 +1,173 @@
+// Prisma schema for IncidentGraph AI (PostgreSQL Production Target)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Service {
+  id                  String             @id
+  name                String
+  serviceType         String             // GATEWAY | AUTH | ORDER | PAYMENT | INVENTORY | DATABASE | NOTIFICATION
+  description         String
+  status              String             @default("HEALTHY") // HEALTHY | DEGRADED | DOWN
+  baselineLatency     Float              // in ms
+  currentLatency      Float              // in ms
+  baselineErrorRate   Float              // percentage (0 - 100)
+  currentErrorRate    Float              // percentage (0 - 100)
+  requestRate         Float              // req/sec
+  tier                Int                @default(1) // 1: Edge, 2: Core, 3: Storage/Infra
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  outgoingDependencies ServiceDependency[] @relation("SourceDependencies") // Services this service depends on
+  incomingDependencies ServiceDependency[] @relation("TargetDependencies") // Services that depend on this service
+
+  telemetrySamples     TelemetrySample[]
+  incidentEvidences    IncidentEvidence[]
+  rootCauseCandidates  RootCauseCandidate[]
+}
+
+model ServiceDependency {
+  id               String   @id @default(cuid())
+  sourceServiceId  String   // A depends on B (source calls target)
+  targetServiceId  String
+  dependencyType   String   @default("SYNC_HTTP") // SYNC_HTTP | ASYNC_QUEUE | DATABASE_CONN
+  timeoutThreshold Float    @default(2000.0) // ms
+  criticality      String   @default("HIGH") // CRITICAL | HIGH | MEDIUM | LOW
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  sourceService    Service  @relation("SourceDependencies", fields: [sourceServiceId], references: [id], onDelete: Cascade)
+  targetService    Service  @relation("TargetDependencies", fields: [targetServiceId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceServiceId, targetServiceId])
+  @@index([sourceServiceId])
+  @@index([targetServiceId])
+}
+
+model Incident {
+  id                   String               @id @default(cuid())
+  title                String
+  description          String
+  severity             String               @default("HIGH") // CRITICAL | HIGH | MEDIUM | LOW
+  status               String               @default("INVESTIGATING") // INVESTIGATING | IDENTIFIED | MITIGATED | RESOLVED
+  startedAt            DateTime             @default(now())
+  resolvedAt           DateTime?
+  simulationScenario   String?
+  rootCauseStatus      String               @default("PENDING") // PENDING | ANALYZED | INCONCLUSIVE
+  suspectedRootCauseId String?
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  evidences            IncidentEvidence[]
+  rootCauseCandidates  RootCauseCandidate[]
+  aiInvestigation      AiInvestigation?
+
+  @@index([status])
+  @@index([severity])
+}
+
+model TelemetrySample {
+  id             String   @id @default(cuid())
+  serviceId      String
+  simulationStep Int      @default(0)
+  timestamp      DateTime @default(now())
+  latency        Float
+  errorRate      Float
+  requestCount   Float
+  healthStatus   String   @default("HEALTHY")
+  cpuUsage       Float?
+  memoryUsage    Float?
+  createdAt      DateTime @default(now())
+
+  service        Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, simulationStep])
+  @@index([timestamp])
+}
+
+model IncidentEvidence {
+  id            String   @id @default(cuid())
+  incidentId    String
+  serviceId     String
+  evidenceType  String   // LATENCY_SPIKE | ERROR_RATE_SPIKE | SERVICE_UNAVAILABLE | TIMING_PRECEDENCE | DOWNSTREAM_CASCADE
+  observedValue Float
+  expectedValue Float
+  threshold     Float
+  unit          String   @default("ms")
+  timestamp     DateTime @default(now())
+  explanation   String
+  createdAt     DateTime @default(now())
+
+  incident      Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  service       Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+  @@index([serviceId])
+}
+
+model RootCauseCandidate {
+  id                    String   @id @default(cuid())
+  incidentId            String
+  candidateServiceId    String
+  score                 Float
+  rank                  Int
+  confidence            String   // HIGH | MEDIUM | LOW | INCONCLUSIVE
+  explanation           String
+  supportingEvidence    String   // JSON stringified array of evidence summaries
+  contradictoryEvidence String   // JSON stringified array of contradictory points
+  recommendedAction     String
+  createdAt             DateTime @default(now())
+
+  incident              Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  service               Service  @relation(fields: [candidateServiceId], references: [id], onDelete: Cascade)
+
+  @@unique([incidentId, rank])
+  @@index([incidentId])
+  @@index([candidateServiceId])
+}
+
+model SimulationState {
+  id                 String    @id @default("active_simulation")
+  currentStep        Int       @default(0)
+  activeScenario     String?
+  injectedServiceId  String?   // Engine private ground truth, NEVER accessible by root-cause ranking
+  failureType        String?
+  severity           String?
+  status             String    @default("IDLE") // IDLE | ACTIVE | RESOLVED
+  updatedAt          DateTime  @updatedAt
+}
+
+model AiInvestigation {
+  id                     String    @id @default(cuid())
+  incidentId             String    @unique
+  summary                String
+  verifiedImpact         String
+  diagnosisStatus        String    // PROBABLE_ROOT_CAUSE | MULTIPLE_CANDIDATES | INCONCLUSIVE
+  confidenceCategory     String    // HIGH | MEDIUM | LOW | UNCERTAIN
+  confidenceExplanation  String
+  rankedHypothesesJson   String    // JSON array of RankedHypothesis
+  recommendedChecksJson  String    // JSON array of DiagnosticCheck
+  remediationOptionsJson String    // JSON array of RemediationOption
+  missingEvidenceJson    String    // JSON array of string
+  nextObservationsJson   String    // JSON array of string
+  provenance             String    // LIVE_TELEMETRY | SIMULATED | MOCK
+  provider               String    // e.g. "openai" | "mock"
+  model                  String    // e.g. "gpt-4o-mini"
+  executionTimeMs        Int
+  promptTokens           Int?
+  completionTokens       Int?
+  totalTokens            Int?
+  rawResponseJson        String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  incident               Incident  @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+  @@index([diagnosisStatus])
+}

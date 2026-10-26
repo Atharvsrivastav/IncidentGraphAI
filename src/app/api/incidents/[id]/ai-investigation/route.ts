@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/db/prisma";
 import { investigateIncident } from "@/lib/ai/investigator";
 import { getAIProviderStatus } from "@/lib/ai/providers/factory";
+import { MockAIProvider } from "@/lib/ai/providers/mock";
 import { AIProviderError } from "@/lib/ai/providers/types";
 
 export async function GET(
@@ -57,21 +58,24 @@ export async function POST(
   try {
     const { id } = await props.params;
 
-    let body: { forceRefresh?: boolean } = {};
+    let body: { forceRefresh?: boolean; provider?: string } = {};
     try {
       body = await request.json();
     } catch {
       // Body is optional
     }
 
+    const providerOverride = body.provider === "mock" ? new MockAIProvider() : undefined;
+
     const investigation = await investigateIncident(id, {
       forceRefresh: body.forceRefresh ?? true,
+      provider: providerOverride,
     });
 
     return NextResponse.json({
       success: true,
       investigation,
-      providerStatus: getAIProviderStatus(),
+      providerStatus: getAIProviderStatus(providerOverride),
     });
   } catch (error: unknown) {
     console.error("POST /api/incidents/[id]/ai-investigation error:", error);

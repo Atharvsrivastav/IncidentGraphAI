@@ -446,7 +446,20 @@ incident-graph-ai/
 
 ---
 
-## 18. Troubleshooting
+## 18. Production Deployment & Live Demo
+
+IncidentGraph AI supports dual-target deployment for both zero-dependency local experimentation and production serverless cloud environments:
+
+- **Serverless Cloud (Vercel)**: Runs Next.js 16 App Router on Vercel Edge and Lambda serverless functions.
+- **Persistence Architecture**: Uses a dynamic Prisma configuration (`prisma.config.ts`) that selects SQLite (`prisma/schema.prisma`) for local development and hosted PostgreSQL (`prisma/schema.postgresql.prisma`, e.g., Neon or Supabase) when `DATABASE_URL` is configured for production.
+- **Health Check**: Continuous zero-downtime health endpoint at [`/api/health`](file:///c:/Users/Atharv/Desktop/IncidentGrapghAI/src/app/api/health/route.ts) reporting database connectivity, active telemetry mode, and AI provider status.
+- **Zero-Key Replay Mode**: For portfolio demonstrations without incurring third-party API costs or exposing keys, users can run offline deterministic AI investigation replays.
+
+*For complete configuration and deployment steps, consult [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).*
+
+---
+
+## 19. Troubleshooting
 
 | Issue | Common Cause | Resolution |
 |---|---|---|
@@ -459,13 +472,13 @@ incident-graph-ai/
 
 ---
 
-## 19. Contributing
+## 20. Contributing
 
 Contributions are welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for code style guidelines, architectural boundaries, and our pull-request verification checklist.
 
 ---
 
-## 20. License & Acknowledgments
+## 21. License & Acknowledgments
 
 This project is open-source software. *(Note: Review project repository settings for formal license declaration).*
 
