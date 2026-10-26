@@ -21,6 +21,7 @@
     "sample:traffic": "node scripts/traffic-generator.mjs",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
+    "postinstall": "prisma generate",
     "db:seed": "npx tsx src/lib/db/seed.ts"
   },
   "dependencies": {
