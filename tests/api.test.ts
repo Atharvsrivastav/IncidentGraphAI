@@ -216,6 +216,34 @@ describe("REST API Endpoints & Data Integrity Tests", () => {
     expect(json.database.status).toBe("connected");
     expect(json.database.servicesCount).toBeGreaterThanOrEqual(7);
     expect(json.telemetry.mode).toBeDefined();
+    expect(json.telemetry.backendType).toBeDefined();
+    expect(typeof json.telemetry.grafanaCloudConfigured).toBe("boolean");
+    expect(typeof json.telemetry.prometheusAvailable).toBe("boolean");
+    expect(typeof json.telemetry.tempoAvailable).toBe("boolean");
     expect(json.aiProvider.provider).toBeDefined();
+  });
+
+  it("POST /api/incidents rejects oversized titles or descriptions with 400", async () => {
+    const oversizedTitleReq = new Request("http://localhost/api/incidents", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "a".repeat(125),
+        description: "Valid description",
+        severity: "HIGH",
+      }),
+    });
+    const titleRes = await createIncident(oversizedTitleReq);
+    expect(titleRes.status).toBe(400);
+
+    const oversizedDescReq = new Request("http://localhost/api/incidents", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "Valid title",
+        description: "b".repeat(1005),
+        severity: "HIGH",
+      }),
+    });
+    const descRes = await createIncident(oversizedDescReq);
+    expect(descRes.status).toBe(400);
   });
 });

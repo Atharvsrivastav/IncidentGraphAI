@@ -3,8 +3,8 @@ import { z } from "zod";
 import prisma from "@/lib/db/prisma";
 
 const CreateIncidentSchema = z.object({
-  title: z.string().min(3),
-  description: z.string().min(5),
+  title: z.string().trim().min(3).max(120),
+  description: z.string().trim().min(5).max(1000),
   severity: z.enum(["CRITICAL", "HIGH", "MEDIUM", "LOW"]).default("HIGH"),
 });
 
@@ -49,6 +49,22 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const validated = CreateIncidentSchema.parse(body);
+
+    // Prune oldest incidents if exceeding 60 to protect database storage quota
+    const totalCount = await prisma.incident.count();
+    if (totalCount >= 60) {
+      const excess = totalCount - 50;
+      const oldestIncidents = await prisma.incident.findMany({
+        select: { id: true },
+        orderBy: { startedAt: "asc" },
+        take: excess,
+      });
+      if (oldestIncidents.length > 0) {
+        await prisma.incident.deleteMany({
+          where: { id: { in: oldestIncidents.map((i) => i.id) } },
+        });
+      }
+    }
 
     const incident = await prisma.incident.create({
       data: {

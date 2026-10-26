@@ -21,13 +21,26 @@ export async function GET() {
     dbError = err instanceof Error ? err.message : "Database ping failed";
   }
 
-  // 2. Telemetry Manager Status
+  // 2. Telemetry Manager & Backend Diagnostics
   const telemetryMgr = TelemetryManager.getInstance();
   const telemetryMode = telemetryMgr.getMode();
-  const grafanaConfigured = Boolean(
-    process.env.GRAFANA_CLOUD_OTLP_ENDPOINT &&
-    process.env.GRAFANA_CLOUD_PROMETHEUS_URL
-  );
+  let backendHealth;
+  try {
+    backendHealth = await telemetryMgr.getBackendHealth();
+  } catch (err) {
+    backendHealth = {
+      prometheusAvailable: false,
+      jaegerAvailable: false,
+      isMockBackend: false,
+      isCloudBackend: false,
+      cloudConfigured: Boolean(
+        process.env.GRAFANA_CLOUD_OTLP_ENDPOINT &&
+        process.env.GRAFANA_CLOUD_PROMETHEUS_URL
+      ),
+      backendType: "UNAVAILABLE" as const,
+      details: err instanceof Error ? err.message : "Failed to query telemetry backend health",
+    };
+  }
 
   // 3. AI Provider Status
   const aiStatus = getAIProviderStatus();
@@ -56,7 +69,11 @@ export async function GET() {
       },
       telemetry: {
         mode: telemetryMode,
-        grafanaCloudConfigured: grafanaConfigured,
+        grafanaCloudConfigured: backendHealth.cloudConfigured,
+        backendType: backendHealth.backendType,
+        prometheusAvailable: backendHealth.prometheusAvailable,
+        tempoAvailable: backendHealth.jaegerAvailable,
+        details: backendHealth.details,
       },
       aiProvider: {
         provider: aiStatus.providerName,
