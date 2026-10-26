@@ -53,3 +53,4 @@ sample-services/data/sample_store.json
 
 .vercel
 .env*
+.neon
