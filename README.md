@@ -1,13 +1,20 @@
 # IncidentGraph AI
 
+[![Production Live](https://img.shields.io/badge/Production-Live%20Demo-0070F3?logo=vercel&logoColor=white)](https://incident-graph-ai.vercel.app)
 [![CI](https://github.com/Atharvsrivastav/IncidentGraphAI/actions/workflows/ci.yml/badge.svg)](https://github.com/Atharvsrivastav/IncidentGraphAI/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-16.4-black?logo=next.js&logoColor=white)](https://nextjs.org/)
+[![Next.js](https://img.shields.io/badge/Next.js-16.4.3-black?logo=next.js&logoColor=white)](https://nextjs.org/)
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
-[![Tests](https://img.shields.io/badge/Vitest-74%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Neon Database](https://img.shields.io/badge/Neon-PostgreSQL%20Serverless-00E599?logo=postgresql&logoColor=white)](https://neon.tech/)
+[![Tests](https://img.shields.io/badge/Vitest-76%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Benchmark](https://img.shields.io/badge/Benchmark-117%2F117%20Passed-blueviolet)](docs/ROOT_CAUSE_BENCHMARK.md)
 
-> **Intelligent, explainable incident investigation and root-cause analysis for distributed software architectures using directed graphs, deterministic algorithms, OpenTelemetry, and evidence-grounded AI synthesis.**
+> **Intelligent, explainable incident investigation and root-cause analysis for distributed microservice architectures using directed graphs, deterministic algorithms, OpenTelemetry, Grafana Cloud, and evidence-grounded AI synthesis.**
+>
+> 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)
+>
+> ⚡ **Quick Walkthrough**: Click `1-Click Guided Demo` on the homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
 
 ---
 
@@ -81,59 +88,84 @@ Fully responsive SRE operations console optimized for mobile incident triage:
 
 ## 4. System Architecture
 
-```text
-                                  +-----------------------+
-                                  |      SRE Operator     |
-                                  +-----------+-----------+
-                                              |
-                                              v
-+-----------------------------------------------------------------------------------------+
-|                               Next.js 16 Operations Console                             |
-|                                                                                         |
-|  [Presentation Layer]                                                                   |
-|   ├── Overview Dashboard (/page.tsx)            ├── Service Dependency Map (/service-map)|
-|   ├── Incident Triage (/incidents/[id])         ├── Trace Waterfall (/traces)           |
-|   ├── Failure Simulator (/simulator)            └── DSA Educational Lab (/dsa-lab)      |
-|                                                                                         |
-|  [API Route Handlers (/api)]                                                            |
-|   ├── /services & /dependencies                 ├── /simulations (inject/advance/reset) |
-|   ├── /incidents & /evidence                    └── /telemetry (detect/overview/traces) |
-+--------------------------------------------+--------------------------------------------+
-                                             |
-                      +----------------------+----------------------+
-                      |                                             |
-                      v                                             v
-+-------------------------------------------+ +-------------------------------------------+
-|          Deterministic DSA Engine         | |           Telemetry Provider Layer        |
-|                                           | |                                           |
-|  ├── DirectedGraph<T, E> (Adjacency list) | |  ├── TelemetryManager (Provider router)   |
-|  ├── Reverse BFS (Impact propagation)     | |  ├── PrometheusClient (PromQL query)      |
-|  ├── 3-Color DFS (Cycle detection)        | |  ├── JaegerClient (Tempo/Jaeger query)    |
-|  ├── PriorityQueue<T> (Binary Max-Heap)   | |  └── RuleDetector (Threshold evaluation)  |
-|  ├── SlidingWindow (Metric smoothing)     | +---------------------+---------------------+
-|  └── RootCauseEngine (Heuristic scoring)  |                       |
-+---------------------+---------------------+                       |
-                      |                                             |
-                      v                                             v
-+-------------------------------------------+ +-------------------------------------------+
-|            Local SQLite Storage           | |         Sample Microservices Mesh         |
-|                                           | |                                           |
-|  ├── Services, Dependencies, Health       | |  ├── API Gateway        (:4000)           |
-|  ├── Incident Records & Evidence Logs     | |  ├── Order Service      (:4001)           |
-|  └── Prisma ORM Client Singleton          | |  ├── Payment Service    (:4002)           |
-+-------------------------------------------+ |  ├── Inventory Service  (:4003)           |
-                                              |  └── Storage: Zero-Admin File Store / PG  |
-                                              +---------------------+---------------------+
-                                                                    |
-                                                     HTTPS OTLP     | (W3C traceparent + metrics)
-                                                                    v
-                                              +-------------------------------------------+
-                                              |               Grafana Cloud               |
-                                              |                                           |
-                                              |  ├── OTLP Gateway (Hosted Ingestion)      |
-                                              |  ├── Prometheus Mimir (Metrics Engine)    |
-                                              |  └── Tempo (Distributed Traces Engine)    |
-                                              +-------------------------------------------+
+```mermaid
+graph TD
+    User([SRE Operator / Recruiter]) -->|HTTPS| NextApp[Next.js 16 Operations Console]
+
+    subgraph UI & Presentation Layer
+        NextApp --> Overview[Overview Console /]
+        NextApp --> ServiceMap[Service Dependency Map /service-map]
+        NextApp --> IncidentPage[Incident Triage /incidents/:id]
+        NextApp --> TraceWaterfall[Trace Waterfall /traces]
+        NextApp --> DSALab[DSA Educational Lab /dsa-lab]
+        NextApp --> Simulator[Failure Simulator /simulator]
+    end
+
+    subgraph API Route Handlers
+        NextApp --> Routes["/api (services, simulations, incidents, health, telemetry)"]
+    end
+
+    subgraph Deterministic Graph & DSA Engine
+        Routes --> Engine[Root Cause Engine]
+        Engine --> Graph[DirectedGraph - Adjacency List]
+        Engine --> BFS[Reverse BFS - Impact Reachability]
+        Engine --> DFS[3-Color DFS - Cycle Detection]
+        Engine --> Heap[Binary Max-Heap - Priority Queue]
+    end
+
+    subgraph Persistence Layer
+        Routes --> Prisma[Prisma ORM Client]
+        Prisma -->|Production| NeonPG[(Neon PostgreSQL - aws-us-east-1)]
+        Prisma -->|Local Dev| SQLite[(SQLite - dev.db)]
+    end
+
+    subgraph Cloud Observability Stack
+        Routes --> TelemetryMgr[Telemetry Manager]
+        TelemetryMgr -->|PromQL| PromClient[Prometheus Mimir - Grafana Cloud]
+        TelemetryMgr -->|Trace Query| TempoClient[Tempo - Grafana Cloud]
+        TelemetryMgr -->|Simulation Mode| ChaosSimulator[Chaos Simulator Engine]
+    end
+
+    subgraph Evidence-Grounded AI Synthesis
+        Routes --> AIInvestigator[AI Investigator Engine]
+        AIInvestigator --> GroundingValidator[Evidence Grounding Validator]
+        AIInvestigator -->|Zero-Key Mode| MockProvider[Deterministic Replay Provider]
+        AIInvestigator -->|Optional Live| OpenAIProvider[OpenAI gpt-4o-mini]
+    end
+```
+
+### End-to-End Triage Request Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor SRE as SRE / Portfolio Reviewer
+    participant UI as Next.js 16 Console
+    participant API as Route Handlers (/api)
+    participant Graph as Deterministic Graph Engine
+    participant DB as Neon PostgreSQL
+    participant AI as AI Investigator Engine
+
+    SRE->>UI: Trigger "1-Click Guided Demo"
+    UI->>API: POST /api/simulations/inject {scenarioId: "database-slowdown"}
+    API->>DB: Create Incident Record & Init Simulation State
+    API->>Graph: Calculate step 1 failure propagation
+    Graph-->>API: Symptom deltas & candidate scores
+    API-->>UI: Incident ID & Initial Cascade State
+
+    UI->>API: POST /api/simulations/advance {incidentId}
+    API->>DB: Apply downstream cascade (Order, Payment, Inventory degrade)
+    API->>Graph: Run Reverse BFS Reachability & 3-Color DFS
+    Graph-->>API: Rank #1 postgres-db (Score: 85, Conf: HIGH)
+    API->>DB: Persist RootCauseCandidates & Observed Evidences
+    API-->>UI: Cascading Outage Confirmed
+
+    SRE->>UI: Click "Investigate Incident" -> "Run Simulation Replay Demo"
+    UI->>AI: POST /api/incidents/:id/ai-investigation {provider: "mock"}
+    AI->>DB: Query observed evidences & graph candidates
+    AI->>AI: Ground hypotheses against verified evidence IDs (discard ungrounded claims)
+    AI->>DB: Cache AIInvestigation report
+    AI-->>UI: Evidence-Grounded Brief with Telemetry Citations & SRE Runbook
 ```
 
 *For complete architectural blueprints and sequence diagrams, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).*
@@ -200,7 +232,75 @@ Reverse BFS Reachability   Latency / Error Deltas   Timestamp Precedence
 
 ---
 
-## 7. Telemetry Architecture: OpenTelemetry, Prometheus & Tempo
+## 7. Portfolio Demo Guide (3-Minute Recruiter Walkthrough)
+
+To evaluate the complete incident triage loop in under 3 minutes on the [live production deployment](https://incident-graph-ai.vercel.app):
+
+1. **Step 1 — Launch Guided Demo**:
+   - Navigate to [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app).
+   - Click the purple **`1-Click Guided Demo`** button in the top operations banner.
+   - *Under the hood*: The API injects a deterministic `database-slowdown` fault into Tier 3 PostgreSQL and automatically advances one step to trigger cascading symptom propagation.
+2. **Step 2 — Inspect Cascading Blast Radius**:
+   - Notice the green notification banner: `Demo Outage Active (Step 2)`.
+   - Visit the **[Service Map](https://incident-graph-ai.vercel.app/service-map)** to visualize the blast radius: PostgreSQL is degraded (amber ring), while dependent services (Order, Payment, Inventory) accumulate latency.
+3. **Step 3 — Review DSA Graph Engine Diagnosis**:
+   - Click **`Investigate Incident`** (or go to `/incidents`).
+   - Switch to the **`DSA Graph Candidates`** tab.
+   - Observe that the engine ranked `postgres-db` as **Rank #1 (Score: 85/100, HIGH Confidence)** using reverse BFS path reachability, correctly isolating the root cause despite high downstream alert noise.
+4. **Step 4 — Execute Evidence-Grounded AI Investigation**:
+   - Switch to the **`AI Investigation`** tab.
+   - Click **`Run Simulation Replay Demo`** (zero API key or login required).
+   - Observe the synthesized report: executive incident summary, verified operational impact, confidence rationale, and cited evidence IDs.
+5. **Step 5 — Review Actionable SRE Runbook & Traces**:
+   - Review recommended checks (connection pooling, lock contention, slow query logs).
+   - Visit **[Traces](https://incident-graph-ai.vercel.app/traces)** to inspect multi-hop span waterfalls and identify database bottleneck latencies.
+
+---
+
+## 8. Engineering Highlights & Resume Bullets
+
+### Production-Ready Resume Bullet Points
+- **Distributed Observability & Graph Architecture**: *Architected and deployed a microservice incident investigation platform in Next.js 16, TypeScript, Neon PostgreSQL, and Grafana Cloud (Mimir + Tempo), isolating root-cause anomalies in under 20ms using Reverse BFS reachability and 3-color DFS cycle detection.*
+- **Evidence-Grounded AI Synthesis**: *Built an evidence-grounded AI investigator with schema validation and citation verification, cross-referencing telemetry IDs against observed anomalies to enforce calibrated uncertainty and prevent LLM hallucinations with zero-key deterministic fallback.*
+- **OpenTelemetry & Chaos Benchmarking**: *Instrumented sample services with OpenTelemetry W3C trace context and PromQL queries; validated algorithmic stability with a 117-scenario benchmark achieving 100% Top-3 diagnostic accuracy across 5 topology archetypes.*
+
+### Concise LinkedIn Project Description
+> **IncidentGraph AI** is an open-source, full-stack incident investigation console designed to solve the cascading alert storm problem in distributed microservice architectures. Using directed dependency graphs, reverse BFS reachability, OpenTelemetry, and Grafana Cloud, it isolates true originating root causes in milliseconds rather than hours. Features evidence-grounded AI synthesis with strict citation validation, live Neon PostgreSQL serverless persistence, and zero-key deterministic replay.
+>
+> 🌐 Live Demo: https://incident-graph-ai.vercel.app
+>
+> 💻 GitHub: https://github.com/Atharvsrivastav/IncidentGraphAI
+
+---
+
+## 9. Algorithmic Diagnosis vs. AI Synthesis & Benchmark Scope
+
+IncidentGraph AI strictly separates mathematical root-cause diagnosis from generative narrative synthesis:
+
+```text
++-----------------------------------------------------------------------------------------+
+|                                    INCIDENT TRIAGE PIPELINE                             |
+|                                                                                         |
+|  [STAGE 1: Deterministic Graph Engine (DSA)]                                            |
+|   • Adjacency List + Reverse BFS + 3-Color DFS Cycle Detection                         |
+|   • Evaluates observable telemetry breaches, timestamp precedence, and path coverage   |
+|   • Computes mathematical candidate scores (0-100) and confidence category (HIGH/MED/LOW)|
+|   • 100% reproducible, zero hallucinations, no external API dependencies               |
+|                                                                                         |
+|  [STAGE 2: Evidence-Grounded AI Synthesis (LLM)]                                        |
+|   • Takes candidate rankings, topology, and verified evidence IDs as structured context|
+|   • Formulates executive briefs, verified impact assessments, and remediation runbooks |
+|   • Grounding validator verifies every citation against genuine database evidence IDs  |
+|   • Discards ungrounded claims; falls back to deterministic replay if no key is present|
++-----------------------------------------------------------------------------------------+
+```
+
+### Benchmark Scope & Methodological Honesty
+The **117-scenario robustness benchmark** ([`docs/ROOT_CAUSE_BENCHMARK.md`](docs/ROOT_CAUSE_BENCHMARK.md)) measures algorithmic reliability across synthetic graph archetypes (single-point failures, cascading timeouts, circular loops, noisy data, and contradictory signals). It evaluates mathematical correctness, cycle handling, and ranking stability under controlled conditions, rather than production incident accuracy across live heterogeneous clouds.
+
+---
+
+## 10. Telemetry Architecture: OpenTelemetry, Prometheus & Tempo
 
 IncidentGraph AI supports an end-to-end telemetry pipeline across three independent layers:
 
@@ -334,11 +434,13 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 
 | Check | Command | Description | Status |
 |---|---|---|---|
-| **Unit & Integration Tests** | `npm test` | Runs 36 Vitest tests covering algorithms, graph reachability, heap priority, and telemetry pipelines | **36 / 36 Passing** |
+| **Unit & Integration Tests** | `npm test` | Runs 76 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **76 / 76 Passing (100%)** |
+| **Robustness Benchmark** | `npm run benchmark` | Evaluates 117 synthetic chaos scenarios across 5 topology archetypes with zero non-conclusive verdicts on definitive failures | **117 / 117 Passing (100% Top-3 Hit Rate)** |
+| **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |
-| **Production Build** | `npm run build` | Compiles and optimizes Next.js production bundle with route pre-rendering | **25 / 25 Routes Compiled** |
-| **Cloud Pipeline Verification** | `npm run test:cloud` | 6-stage end-to-end verification of Grafana Cloud OTLP, Prometheus, and Tempo | **6 / 6 Gates Verified** |
+| **Production Build** | `npm run build` | Compiles and optimizes Next.js production bundle with route pre-rendering | **26 / 26 Routes Compiled** |
+| **Cloud Pipeline Verification** | `npm run test:cloud` | End-to-end verification of Grafana Cloud OTLP, Prometheus, and Tempo | **6 / 6 Gates Verified** |
 
 ---
 
