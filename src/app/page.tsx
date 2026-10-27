@@ -61,6 +61,9 @@ export default function OverviewPage() {
   const [loading, setLoading] = useState(true);
   const [advancing, setAdvancing] = useState(false);
 
+  const [demoTriggering, setDemoTriggering] = useState(false);
+  const [demoIncidentId, setDemoIncidentId] = useState<string | null>(null);
+
   const fetchOverview = async () => {
     try {
       const res = await fetch("/api/analytics/overview");
@@ -89,6 +92,32 @@ export default function OverviewPage() {
     }
   };
 
+  const handle1ClickDemo = async () => {
+    setDemoTriggering(true);
+    setDemoIncidentId(null);
+    try {
+      const injectRes = await fetch("/api/simulations/inject", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenarioId: "database-slowdown" }),
+      });
+      if (injectRes.ok) {
+        const injectData = await injectRes.json();
+        const incId = injectData.incidentId;
+        // Advance one step so downstream cascading dependencies show symptoms
+        await fetch("/api/simulations/advance", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ incidentId: incId }),
+        });
+        setDemoIncidentId(incId);
+        await fetchOverview();
+      }
+    } finally {
+      setDemoTriggering(false);
+    }
+  };
+
   if (loading || !data) {
     return (
       <div className="flex h-96 items-center justify-center">
@@ -107,44 +136,162 @@ export default function OverviewPage() {
       {/* Top Banner & Quick Simulation Controls */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 rounded-2xl border border-slate-800 bg-gradient-to-r from-slate-900/90 via-slate-900/60 to-slate-950 p-6 shadow-xl backdrop-blur-md">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="rounded bg-blue-500/20 px-2.5 py-0.5 text-xs font-semibold text-blue-400 border border-blue-500/30">
               Operations Center
             </span>
-            <span className="text-xs text-slate-400 font-mono">Real-Time Graph Observability</span>
+            <span className="rounded bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-emerald-400">
+              Neon PostgreSQL Connected
+            </span>
+            <span className="rounded bg-purple-500/10 border border-purple-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-purple-400">
+              Grafana Cloud Active
+            </span>
           </div>
           <h1 className="mt-2 text-2xl font-black text-white tracking-tight sm:text-3xl">
             IncidentGraph AI Console
           </h1>
-          <p className="mt-1 text-xs text-slate-400 max-w-2xl">
-            Simulate distributed system outages, inspect cascading reverse-dependency impact,
-            and rank originating root causes via explainable graph algorithms.
+          <p className="mt-1 text-xs text-slate-400 max-w-2xl leading-relaxed">
+            Diagnose cascading microservice failures in milliseconds using directed dependency graphs,
+            reverse topological reachability, and evidence-grounded AI synthesis.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            onClick={handle1ClickDemo}
+            disabled={demoTriggering}
+            className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all hover:scale-[1.02] disabled:opacity-50"
+          >
+            <Zap className={`h-4 w-4 ${demoTriggering ? "animate-spin" : "text-amber-300"}`} />
+            <span>{demoTriggering ? "Injecting Demo Outage..." : "1-Click Guided Demo"}</span>
+          </button>
           <Link
             href="/simulator"
-            className="flex items-center gap-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-blue-600/30 transition-all hover:scale-[1.02]"
+            className="flex items-center gap-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 px-3.5 py-2.5 text-xs font-bold text-white shadow-lg shadow-blue-600/30 transition-all hover:scale-[1.02]"
           >
             <Play className="h-4 w-4" />
-            <span>Failure Simulator</span>
+            <span>Simulator</span>
           </Link>
           <button
             onClick={handleAdvanceSimulation}
             disabled={advancing || summary.activeIncidentsCount === 0}
-            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 px-3.5 py-2.5 text-xs font-semibold text-slate-200 transition-colors"
+            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 px-3 py-2.5 text-xs font-semibold text-slate-200 transition-colors"
           >
             <TrendingUp className={`h-4 w-4 ${advancing ? "animate-spin text-blue-400" : ""}`} />
             <span>Advance Step</span>
           </button>
           <Link
             href="/service-map"
-            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 px-3.5 py-2.5 text-xs font-semibold text-slate-200 transition-colors"
+            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 px-3 py-2.5 text-xs font-semibold text-slate-200 transition-colors"
           >
-            <span>Service Map</span>
+            <span>Topology</span>
             <ArrowRight className="h-3.5 w-3.5" />
           </Link>
+        </div>
+      </div>
+
+      {/* 1-Click Demo Alert / Transition Banner */}
+      {demoIncidentId && (
+        <div className="rounded-2xl border border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-slate-900/90 to-slate-950 p-5 shadow-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 animate-in fade-in">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="rounded bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[11px] font-mono font-bold text-emerald-400 uppercase">
+                Demo Outage Active (Step 2)
+              </span>
+              <span className="text-xs text-slate-300 font-medium">PostgreSQL Latency Surge & Downstream Cascade</span>
+            </div>
+            <p className="text-xs text-slate-400">
+              Downstream services (Order, Payment, Inventory) are reporting elevated latency. The graph engine has ranked PostgreSQL with 85/100 confidence.
+            </p>
+          </div>
+          <Link
+            href={`/incidents/${demoIncidentId}`}
+            className="flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-emerald-600/30 transition-all shrink-0"
+          >
+            <span>Investigate Incident</span>
+            <ArrowRight className="h-4 w-4" />
+          </Link>
+        </div>
+      )}
+
+      {/* 30-Second Guided Portfolio Walkthrough Ribbon */}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6 backdrop-blur-sm space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-3">
+          <div>
+            <h2 className="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-500/20 text-blue-400 text-xs font-mono font-bold">★</span>
+              <span>Portfolio Demo Guide: 5-Stage Triage Workflow</span>
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              How IncidentGraph AI isolates root-cause anomalies across distributed systems without alert noise
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">
+            <span className="h-2 w-2 rounded-full bg-emerald-400"></span>
+            <span>Zero-Key Deterministic Replay Enabled</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3 text-xs">
+          {/* Step 1 */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-blue-400 font-mono text-[11px] font-bold">
+              <span>01. INJECT</span>
+              <Play className="h-3.5 w-3.5" />
+            </div>
+            <h4 className="font-bold text-slate-200 text-xs">Failure Scenario</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Inject deterministic fault into Tier 3 database or Tier 2 microservice via simulator.
+            </p>
+          </div>
+
+          {/* Step 2 */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-amber-400 font-mono text-[11px] font-bold">
+              <span>02. CASCADE</span>
+              <TrendingUp className="h-3.5 w-3.5" />
+            </div>
+            <h4 className="font-bold text-slate-200 text-xs">Symptom Spread</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Dependency edges propagate latency & 504 timeouts to API Gateway and ingress.
+            </p>
+          </div>
+
+          {/* Step 3 */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-purple-400 font-mono text-[11px] font-bold">
+              <span>03. DIAGNOSE</span>
+              <Cpu className="h-3.5 w-3.5" />
+            </div>
+            <h4 className="font-bold text-slate-200 text-xs">Graph Algorithms</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Reverse BFS + 3-color DFS cycle detector score candidates in O(V + E) time.
+            </p>
+          </div>
+
+          {/* Step 4 */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-indigo-400 font-mono text-[11px] font-bold">
+              <span>04. SYNTHESIZE</span>
+              <Zap className="h-3.5 w-3.5" />
+            </div>
+            <h4 className="font-bold text-slate-200 text-xs">AI Investigation</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Correlates telemetry IDs & trace spans into a verified brief with zero hallucinations.
+            </p>
+          </div>
+
+          {/* Step 5 */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-emerald-400 font-mono text-[11px] font-bold">
+              <span>05. REMEDIATE</span>
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            </div>
+            <h4 className="font-bold text-slate-200 text-xs">SRE Runbook</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Actionable operational remediation: connection pooling, circuit breakers, scale-outs.
+            </p>
+          </div>
         </div>
       </div>
 
