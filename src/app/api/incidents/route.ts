@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import prisma from "@/lib/db/prisma";
 
+import { safePruneResolvedIncidents } from "@/lib/incidents/pruning";
+
 const CreateIncidentSchema = z.object({
   title: z.string().trim().min(3).max(120),
   description: z.string().trim().min(5).max(1000),
@@ -50,20 +52,16 @@ export async function POST(request: Request) {
     const body = await request.json();
     const validated = CreateIncidentSchema.parse(body);
 
-    // Prune oldest incidents if exceeding 60 to protect database storage quota
-    const totalCount = await prisma.incident.count();
-    if (totalCount >= 60) {
-      const excess = totalCount - 50;
-      const oldestIncidents = await prisma.incident.findMany({
-        select: { id: true },
-        orderBy: { startedAt: "asc" },
-        take: excess,
-      });
-      if (oldestIncidents.length > 0) {
-        await prisma.incident.deleteMany({
-          where: { id: { in: oldestIncidents.map((i) => i.id) } },
-        });
-      }
+    // Safely prune resolved demo incidents if capacity is reached
+    const pruneResult = await safePruneResolvedIncidents();
+    if (pruneResult.capacityReached) {
+      return NextResponse.json(
+        {
+          error: "Incident capacity reached (60 active incidents). Active incidents cannot be pruned. Please resolve existing incidents before creating new ones.",
+          code: "CAPACITY_EXCEEDED",
+        },
+        { status: 429 }
+      );
     }
 
     const incident = await prisma.incident.create({

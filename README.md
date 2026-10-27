@@ -457,7 +457,7 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 | `POST` | `/api/incidents/:id/analyze` | Triggers on-demand DSA root-cause re-analysis |
 | `POST` | `/api/simulations/inject` | Injects a deterministic failure scenario |
 | `POST` | `/api/simulations/advance` | Advances simulation step with cascading blast-radius propagation |
-| `POST` | `/api/simulations/reset` | Resets all services and restores baseline topology |
+| `POST` | `/api/simulations/reset` | Resets services to baseline (Protected in production; requires admin authentication) |
 | `GET` | `/api/telemetry/overview` | Telemetry health summary with active backend provider status |
 | `GET` / `POST` | `/api/telemetry/mode` | Inspects or switches active telemetry mode (`SIMULATION` vs `REAL`) |
 | `GET` | `/api/telemetry/traces` | Lists recent distributed traces with duration and error filters |

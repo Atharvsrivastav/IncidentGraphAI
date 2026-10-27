@@ -50,6 +50,7 @@ export default function SimulatorPage() {
   const [activeIncident, setActiveIncident] = useState<ActiveIncidentModel | null>(null);
   const [actionInProgress, setActionInProgress] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [canReset, setCanReset] = useState<boolean>(false);
 
   const fetchState = useCallback(async () => {
     try {
@@ -63,6 +64,9 @@ export default function SimulatorPage() {
         setScenarios(data.availableScenarios ?? []);
         setSimState(data.state);
         setActiveIncident(data.activeIncident);
+        if (typeof data.canReset === "boolean") {
+          setCanReset(data.canReset);
+        }
       }
       if (svcRes.ok) {
         const data = await svcRes.json();
@@ -125,12 +129,21 @@ export default function SimulatorPage() {
   };
 
   const handleReset = async () => {
+    if (!canReset) {
+      setStatusMessage("Database reset is disabled in production environments.");
+      return;
+    }
     setActionInProgress(true);
     setStatusMessage("Resetting system to clean baseline...");
     try {
-      await fetch("/api/simulations/reset", { method: "POST" });
-      setStatusMessage("System successfully restored to baseline.");
-      await fetchState();
+      const res = await fetch("/api/simulations/reset", { method: "POST" });
+      if (res.ok) {
+        setStatusMessage("System successfully restored to baseline.");
+        await fetchState();
+      } else {
+        const data = await res.json().catch(() => null);
+        setStatusMessage(data?.error || "Failed to reset database.");
+      }
     } finally {
       setActionInProgress(false);
     }
@@ -182,14 +195,16 @@ export default function SimulatorPage() {
             <span>Advance Step</span>
           </button>
 
-          <button
-            onClick={handleReset}
-            disabled={actionInProgress}
-            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 px-4 py-2.5 text-xs font-bold text-slate-200 transition-colors"
-          >
-            <RotateCcw className="h-4 w-4" />
-            <span>Reset Baseline</span>
-          </button>
+          {canReset && (
+            <button
+              onClick={handleReset}
+              disabled={actionInProgress}
+              className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 px-4 py-2.5 text-xs font-bold text-slate-200 transition-colors"
+            >
+              <RotateCcw className="h-4 w-4" />
+              <span>Reset Baseline</span>
+            </button>
+          )}
         </div>
       </div>
 

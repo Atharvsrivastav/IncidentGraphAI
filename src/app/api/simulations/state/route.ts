@@ -13,9 +13,14 @@ export async function GET() {
       orderBy: { startedAt: "desc" },
     });
 
+    const isProduction =
+      process.env.NODE_ENV === "production" ||
+      process.env.VERCEL_ENV === "production";
+
     return NextResponse.json({
       state,
       activeIncident,
+      canReset: !isProduction,
       availableScenarios: Object.values(SIMULATION_SCENARIOS).map((s) => ({
         id: s.id,
         name: s.name,

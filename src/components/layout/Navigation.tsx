@@ -31,6 +31,7 @@ export function Navigation() {
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
+  const [canReset, setCanReset] = useState<boolean>(false);
   const [telemetryMode, setTelemetryMode] = useState<"SIMULATION" | "REAL">("SIMULATION");
 
   const fetchStatus = useCallback(async () => {
@@ -43,6 +44,9 @@ export function Navigation() {
         const data = await simRes.json();
         setCurrentStep(data.state?.currentStep ?? 0);
         setActiveScenario(data.state?.activeScenario ?? null);
+        if (typeof data.canReset === "boolean") {
+          setCanReset(data.canReset);
+        }
         if (data.activeIncident) {
           setSystemStatus("INCIDENT");
         } else {
@@ -72,11 +76,14 @@ export function Navigation() {
   }, [pathname, fetchStatus]);
 
   const handleReset = async () => {
+    if (!canReset) return;
     setIsResetting(true);
     try {
-      await fetch("/api/simulations/reset", { method: "POST" });
-      await fetchStatus();
-      window.location.reload();
+      const res = await fetch("/api/simulations/reset", { method: "POST" });
+      if (res.ok) {
+        await fetchStatus();
+        window.location.reload();
+      }
     } finally {
       setIsResetting(false);
     }
@@ -190,16 +197,18 @@ export function Navigation() {
             )}
           </div>
 
-          {/* Quick Reset Baseline Button */}
-          <button
-            onClick={handleReset}
-            disabled={isResetting}
-            title="Reset system to healthy baseline"
-            className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-200 transition-colors disabled:opacity-50"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${isResetting ? "animate-spin text-blue-400" : "text-slate-400"}`} />
-            <span className="hidden sm:inline">Reset Baseline</span>
-          </button>
+          {/* Quick Reset Baseline Button (Dev/Test only) */}
+          {canReset && (
+            <button
+              onClick={handleReset}
+              disabled={isResetting}
+              title="Reset system to healthy baseline"
+              className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-200 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isResetting ? "animate-spin text-blue-400" : "text-slate-400"}`} />
+              <span className="hidden sm:inline">Reset Baseline</span>
+            </button>
+          )}
         </div>
       </div>
     </header>
