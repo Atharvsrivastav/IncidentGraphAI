@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { RefreshCw, Server, Activity, Cpu, ShieldCheck } from "lucide-react";
+import { RefreshCw, Server, Activity, Cpu, ShieldCheck, Lock } from "lucide-react";
 
 interface HealthData {
   status: string;
@@ -65,6 +65,10 @@ export default function SettingsPage() {
   }, []);
 
   const handleReset = async () => {
+    if (health?.environment === "production") {
+      setMessage("Database reset is disabled in production environments.");
+      return;
+    }
     setResetting(true);
     setMessage(null);
     try {
@@ -73,7 +77,8 @@ export default function SettingsPage() {
         setMessage("Database successfully re-seeded with 7 services and 8 dependencies.");
         await fetchHealth();
       } else {
-        setMessage("Failed to reset database.");
+        const data = await res.json().catch(() => null);
+        setMessage(data?.error || "Failed to reset database.");
       }
     } finally {
       setResetting(false);
@@ -156,25 +161,44 @@ export default function SettingsPage() {
 
       {/* Database Reset Action */}
       <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 backdrop-blur-md space-y-4">
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <h3 className="text-sm font-bold text-white tracking-tight uppercase font-mono">
-              Reset & Re-Seed Database
-            </h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-bold text-white tracking-tight uppercase font-mono">
+                Reset & Re-Seed Database
+              </h3>
+              {health?.environment === "production" && (
+                <span className="rounded bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-mono font-semibold text-amber-400">
+                  Protected in Production
+                </span>
+              )}
+            </div>
             <p className="mt-1 text-xs text-slate-400 leading-relaxed max-w-xl">
-              Restores the active database ({health?.database.provider === "postgresql" ? "Neon PostgreSQL" : "Local SQLite"}) to the initial clean baseline topology (7 microservices, 8 dependencies).
-              Clears all historical simulated faults, incident records, and telemetry logs.
+              {health?.environment === "production"
+                ? "Destructive database reset operations are restricted in production environments to safeguard active incident history, telemetry samples, and service topologies."
+                : `Restores the active database (${health?.database.provider === "postgresql" ? "Neon PostgreSQL" : "Local SQLite"}) to the initial clean baseline topology (7 microservices, 8 dependencies). Clears all historical simulated faults, incident records, and telemetry logs.`}
             </p>
           </div>
 
-          <button
-            onClick={handleReset}
-            disabled={resetting}
-            className="flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-blue-600/30 transition-all shrink-0"
-          >
-            <RefreshCw className={`h-4 w-4 ${resetting ? "animate-spin" : ""}`} />
-            <span>Reset Database</span>
-          </button>
+          {health?.environment === "production" ? (
+            <button
+              disabled
+              title="Database reset is disabled in production"
+              className="flex items-center gap-2 rounded-xl bg-slate-800/80 border border-slate-700/60 px-4 py-2.5 text-xs font-bold text-slate-400 cursor-not-allowed shrink-0"
+            >
+              <Lock className="h-4 w-4 text-slate-400" />
+              <span>Reset Protected</span>
+            </button>
+          ) : (
+            <button
+              onClick={handleReset}
+              disabled={resetting}
+              className="flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-blue-600/30 transition-all shrink-0"
+            >
+              <RefreshCw className={`h-4 w-4 ${resetting ? "animate-spin" : ""}`} />
+              <span>Reset Database</span>
+            </button>
+          )}
         </div>
       </div>
 

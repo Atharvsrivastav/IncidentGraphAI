@@ -4,6 +4,7 @@ import { DirectedGraph } from "../algorithms/graph";
 import { RootCauseEngine } from "../algorithms/rootCauseEngine";
 import { ServiceNodeData, TelemetryPoint } from "../algorithms/types";
 import { seedDatabase } from "../db/seed";
+import { safePruneResolvedIncidents } from "../incidents/pruning";
 
 export interface InjectParams {
   scenarioId: string;
@@ -29,6 +30,14 @@ export class SimulationManager {
 
     const targetServiceId = params.targetServiceId ?? scenario.targetServiceId;
     const severity = params.severity ?? scenario.defaultSeverity;
+
+    // Ensure capacity is available without deleting active incidents
+    const pruneResult = await safePruneResolvedIncidents();
+    if (pruneResult.capacityReached) {
+      throw new Error(
+        "Incident capacity reached (60 active incidents). Active incidents cannot be pruned. Please resolve existing incidents before injecting new failures."
+      );
+    }
 
     // Create a new Incident record
     const incident = await prisma.incident.create({
@@ -365,8 +374,17 @@ export class SimulationManager {
 
   /**
    * Resets the entire system back to clean baseline state.
+   * Prohibited in production by default to protect persistent data and live telemetry.
    */
-  public async resetSimulation() {
+  public async resetSimulation(options?: { allowInProduction?: boolean }) {
+    const isProduction =
+      process.env.NODE_ENV === "production" ||
+      process.env.VERCEL_ENV === "production";
+
+    if (isProduction && !options?.allowInProduction) {
+      throw new Error("Destructive database reset is prohibited in production environments.");
+    }
+
     await seedDatabase();
     return { success: true, message: "System reset to healthy baseline topology." };
   }

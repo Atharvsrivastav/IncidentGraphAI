@@ -16,6 +16,8 @@ import { GET as getOverview } from "../src/app/api/analytics/overview/route";
 import { POST as runDsa } from "../src/app/api/dsa/run/route";
 import { GET as getHealth } from "../src/app/api/health/route";
 import { seedDatabase } from "../src/lib/db/seed";
+import prisma from "../src/lib/db/prisma";
+import { safePruneResolvedIncidents } from "../src/lib/incidents/pruning";
 
 describe("REST API Endpoints & Data Integrity Tests", () => {
   beforeEach(async () => {
@@ -245,5 +247,151 @@ describe("REST API Endpoints & Data Integrity Tests", () => {
     });
     const descRes = await createIncident(oversizedDescReq);
     expect(descRes.status).toBe(400);
+  });
+
+  it("POST /api/simulations/reset blocks unauthorized reset in production with 403", async () => {
+    const originalEnv = process.env.NODE_ENV;
+    try {
+      (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+      const req = new Request("http://localhost/api/simulations/reset", {
+        method: "POST",
+      });
+      const res = await resetSimulation(req);
+      expect(res.status).toBe(403);
+      const json = await res.json();
+      expect(json.error).toMatch(/disabled in production/i);
+      expect(json.code).toBe("FORBIDDEN");
+    } finally {
+      (process.env as Record<string, string | undefined>).NODE_ENV = originalEnv;
+    }
+  });
+
+  it("POST /api/simulations/reset blocks invalid admin token in production with 403", async () => {
+    const originalEnv = process.env.NODE_ENV;
+    const originalAdmin = process.env.ADMIN_API_KEY;
+    try {
+      (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+      process.env.ADMIN_API_KEY = "test-admin-secret-99";
+
+      // Wrong token
+      const reqWrong = new Request("http://localhost/api/simulations/reset", {
+        method: "POST",
+        headers: { Authorization: "Bearer wrong-secret" },
+      });
+      const resWrong = await resetSimulation(reqWrong);
+      expect(resWrong.status).toBe(403);
+
+      // Correct token allows reset in production for verified administrators
+      const reqRight = new Request("http://localhost/api/simulations/reset", {
+        method: "POST",
+        headers: { Authorization: "Bearer test-admin-secret-99" },
+      });
+      const resRight = await resetSimulation(reqRight);
+      expect(resRight.status).toBe(200);
+      const jsonRight = await resRight.json();
+      expect(jsonRight.success).toBe(true);
+    } finally {
+      (process.env as Record<string, string | undefined>).NODE_ENV = originalEnv;
+      process.env.ADMIN_API_KEY = originalAdmin;
+    }
+  });
+
+  it("POST /api/incidents auto-pruning never deletes ACTIVE or INVESTIGATING incidents", async () => {
+    // Clean existing incidents
+    await prisma.incident.deleteMany();
+
+    // Create 3 active/investigating incidents
+    const activeIds: string[] = [];
+    for (let i = 1; i <= 3; i++) {
+      const active = await prisma.incident.create({
+        data: {
+          title: `Active Incident ${i}`,
+          description: `Active incident investigation ${i}`,
+          status: "INVESTIGATING",
+          severity: "HIGH",
+        },
+      });
+      activeIds.push(active.id);
+    }
+
+    // Create 3 resolved incidents
+    for (let i = 1; i <= 3; i++) {
+      await prisma.incident.create({
+        data: {
+          title: `Resolved Demo Incident ${i}`,
+          description: `Resolved demo incident ${i}`,
+          status: "RESOLVED",
+          severity: "LOW",
+          resolvedAt: new Date(),
+        },
+      });
+    }
+
+    // Safe pruning with capacity limit = 4, target = 4 (excess = 6 - 4 = 2)
+    const pruneResult = await safePruneResolvedIncidents(4, 4);
+    expect(pruneResult.prunedCount).toBe(2);
+
+    // Verify all 3 active incidents remain completely untouched
+    const remainingActive = await prisma.incident.findMany({
+      where: { id: { in: activeIds } },
+    });
+    expect(remainingActive.length).toBe(3);
+
+    // Verify the remaining incidents in the database
+    const totalRemaining = await prisma.incident.count();
+    expect(totalRemaining).toBe(4);
+  });
+
+  it("POST /api/incidents safely rejects write with 429 when capacity is reached and zero resolved incidents can be pruned", async () => {
+    // Clean existing incidents
+    await prisma.incident.deleteMany();
+
+    // Fill capacity with 60 active incidents
+    const activeData = Array.from({ length: 60 }, (_, idx) => ({
+      title: `Active Load Incident ${idx + 1}`,
+      description: `Active incident ${idx + 1} undergoing active investigation`,
+      status: "INVESTIGATING",
+      severity: "HIGH",
+    }));
+    await prisma.incident.createMany({ data: activeData });
+
+    expect(await prisma.incident.count()).toBe(60);
+
+    // Attempt to create a 61st incident via the API
+    const newIncidentReq = new Request("http://localhost/api/incidents", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "Overflow Incident 61",
+        description: "This incident should be safely rejected with 429",
+        severity: "HIGH",
+      }),
+    });
+
+    const res = await createIncident(newIncidentReq);
+    expect(res.status).toBe(429);
+    const json = await res.json();
+    expect(json.code).toBe("CAPACITY_EXCEEDED");
+    expect(json.error).toMatch(/Active incidents cannot be pruned/i);
+
+    // Verify all 60 active incidents remain completely intact
+    const finalCount = await prisma.incident.count();
+    expect(finalCount).toBe(60);
+  });
+
+  it("Ensures API responses do not leak server secrets or credentials", async () => {
+    const healthRes = await getHealth();
+    const healthJson = await healthRes.json();
+    const healthString = JSON.stringify(healthJson);
+
+    // Never leak API keys, tokens, or passwords
+    expect(healthString).not.toContain("glc_");
+    expect(healthString).not.toContain("sk-");
+    expect(healthString).not.toContain("super-secret");
+
+    const simStateRes = await getSimulationState();
+    const simStateJson = await simStateRes.json();
+    const simStateString = JSON.stringify(simStateJson);
+    expect(simStateString).not.toContain("glc_");
+    expect(simStateString).not.toContain("sk-");
   });
 });
