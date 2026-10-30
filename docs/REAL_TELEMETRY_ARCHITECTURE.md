@@ -301,10 +301,10 @@ The telemetry suite includes deterministic mocked provider tests, normalization 
 # Run the dedicated live telemetry test suite (63 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the service map utility & state-logic unit test suite (38 tests)
+# Run the service map utility & state-logic unit test suite (42 tests)
 npx vitest run tests/service-map-ui.test.ts
 
-# Run the complete test suite (182 tests across 9 suites)
+# Run the complete test suite (187 tests across 9 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)

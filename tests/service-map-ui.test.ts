@@ -1356,7 +1356,9 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
     });
 
     it("returns SIMULATED for simulation incidents and simulation mode", () => {
+      // Explicit simulation incident + global SIMULATION -> SIMULATED
       const simProv = determineTelemetryProvenance({
+        simulationScenario: "payment-failure",
         isLiveScenario: false,
         requestedMode: "SIMULATION",
         effectiveMode: "SIMULATION",
@@ -1368,6 +1370,35 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
         },
       });
       expect(simProv).toBe("SIMULATED");
+
+      // Manual incident with null simulationScenario + global SIMULATION -> UNAVAILABLE
+      const manualSimProv = determineTelemetryProvenance({
+        simulationScenario: null,
+        hasSimulationScenario: false,
+        requestedMode: "SIMULATION",
+        effectiveMode: "SIMULATION",
+        backendHealth: {
+          backendType: "SIMULATION",
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+        },
+      });
+      expect(manualSimProv).toBe("UNAVAILABLE");
+
+      // Unknown origin + mock provider -> do not falsely label as simulation-derived
+      const unknownMock = determineTelemetryProvenance({
+        simulationScenario: null,
+        hasSimulationScenario: false,
+        requestedMode: "SIMULATION",
+        effectiveMode: "SIMULATION",
+        backendHealth: {
+          backendType: "MOCK_EMULATION",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(unknownMock).toBe("MOCK");
+      expect(unknownMock).not.toBe("SIMULATED");
     });
 
     it("safely parses persisted provenance records: preserves valid, maps legacy, empty and unknown to UNAVAILABLE", () => {

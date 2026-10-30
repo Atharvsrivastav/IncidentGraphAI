@@ -27,9 +27,10 @@ export function determineTelemetryProvenance(params: {
     jaegerAvailable: boolean;
   };
 }): TelemetryProvenance {
-  const { backendHealth, effectiveMode, requestedMode } = params;
+  const { backendHealth, effectiveMode } = params;
 
   // 1. Identify simulation-origin incidents
+  // Explicit simulation scenario or a reliable persisted origin marker is required to assign SIMULATED.
   // A simulation-origin incident must remain SIMULATED even after the application switches to LIVE
   // or genuine/mock providers are present.
   const isSimulationOrigin =
@@ -44,22 +45,16 @@ export function determineTelemetryProvenance(params: {
     return "SIMULATED";
   }
 
-  // If simulation mode is explicitly requested and no live origin is specified
-  if (
-    requestedMode === "SIMULATION" &&
-    !params.isExplicitLiveObservation &&
-    params.simulationScenario !== "live-telemetry-observation"
-  ) {
-    return "SIMULATED";
-  }
-
   // 2. Identify live-origin incidents
+  // simulationScenario === "live-telemetry-observation" identifies explicit live-observation origin.
   const isLiveOrigin =
     params.isExplicitLiveObservation === true ||
     params.simulationScenario === "live-telemetry-observation" ||
     (params.isLiveScenario === true && !isSimulationOrigin);
 
   if (!isLiveOrigin && !params.isExplicitLiveObservation) {
+    // Incidents with unverified origin must NOT automatically become SIMULATED merely because global mode is SIMULATION.
+    // Unknown origin + mock provider returns MOCK without falsely labeling as simulation-derived.
     if (backendHealth.backendType === "MOCK_EMULATION") {
       return "MOCK";
     }
@@ -231,47 +226,57 @@ export async function investigateIncident(
     dependencies: s.outgoingDependencies.map((d) => d.targetServiceId),
   }));
 
-  // 6. Gather recent traces if available
+  // 6. Gather recent traces if available (strictly isolated by incident origin)
   let recentTraces: AIInvestigationContext["recentTraces"] = [];
-  try {
-    const rawTraces = await telemetryManager.getRecentTraces(undefined, 8);
-    recentTraces = rawTraces.map((t) => {
-      let bottleneckSpan:
-        | {
-            service: string;
-            operation: string;
-            durationMs: number;
-            isError: boolean;
+  if (isSimulationIncident) {
+    // Simulation-origin incidents must never query genuine live trace providers.
+    // If simulation-specific traces exist, retrieve only traces scoped to that incident/scenario.
+    // Otherwise pass an empty trace collection and make the lack of trace evidence explicit.
+    recentTraces = [];
+  } else if (isExplicitLiveObservation && health.jaegerAvailable) {
+    // Explicit live-observation incidents may collect genuine provider traces, subject to verified backend state
+    try {
+      const rawTraces = await telemetryManager.getRecentTraces(undefined, 8);
+      recentTraces = rawTraces.map((t) => {
+        let bottleneckSpan:
+          | {
+              service: string;
+              operation: string;
+              durationMs: number;
+              isError: boolean;
+            }
+          | undefined = undefined;
+
+        const spans = t.allSpans ?? [];
+        if (spans.length > 0) {
+          const longestSpan = spans.reduce(
+            (max, s) => (s.durationMs > (max?.durationMs ?? 0) ? s : max),
+            spans[0]
+          );
+          if (longestSpan) {
+            bottleneckSpan = {
+              service: longestSpan.serviceName,
+              operation: longestSpan.operationName,
+              durationMs: longestSpan.durationMs,
+              isError: longestSpan.statusCode === "ERROR",
+            };
           }
-        | undefined = undefined;
-
-      const spans = t.allSpans ?? [];
-      if (spans.length > 0) {
-        const longestSpan = spans.reduce(
-          (max, s) => (s.durationMs > (max?.durationMs ?? 0) ? s : max),
-          spans[0]
-        );
-        if (longestSpan) {
-          bottleneckSpan = {
-            service: longestSpan.serviceName,
-            operation: longestSpan.operationName,
-            durationMs: longestSpan.durationMs,
-            isError: longestSpan.statusCode === "ERROR",
-          };
         }
-      }
 
-      return {
-        traceId: t.traceId,
-        rootService: t.rootServiceName,
-        durationMs: t.durationMs,
-        hasErrors: t.hasErrors,
-        servicesInvolved: t.servicesInvolved,
-        bottleneckSpan,
-      };
-    });
-  } catch {
-    // Non-fatal if trace backend is offline
+        return {
+          traceId: t.traceId,
+          rootService: t.rootServiceName,
+          durationMs: t.durationMs,
+          hasErrors: t.hasErrors,
+          servicesInvolved: t.servicesInvolved,
+          bottleneckSpan,
+        };
+      });
+    } catch {
+      // Non-fatal if trace backend is offline
+      recentTraces = [];
+    }
+  } else {
     recentTraces = [];
   }
 
