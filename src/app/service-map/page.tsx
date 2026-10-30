@@ -86,9 +86,9 @@ export default function ServiceMapPage() {
               return {
                 ...svc,
                 status: realObs.status as "HEALTHY" | "DEGRADED" | "DOWN",
-                currentLatency: realObs.latencyMs,
-                currentErrorRate: realObs.errorRate,
-                requestRate: realObs.requestRate,
+                currentLatency: realObs.hasValidLatency !== false ? realObs.latencyMs : svc.currentLatency,
+                currentErrorRate: realObs.hasValidErrorRate !== false ? realObs.errorRate : svc.currentErrorRate,
+                requestRate: realObs.hasValidRequestRate !== false ? realObs.requestRate : svc.requestRate,
               };
             }
             return svc;

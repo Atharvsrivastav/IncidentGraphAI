@@ -28,6 +28,8 @@ export class SlidingWindowAnalyzer {
       return {
         serviceId,
         sampleCount: 0,
+        validLatencyCount: 0,
+        validErrorRateCount: 0,
         averageLatency: baselineLatency,
         baselineLatency,
         latencyRatio: 1.0,
@@ -37,6 +39,8 @@ export class SlidingWindowAnalyzer {
         firstAnomalousStep: null,
         hasLatencyAnomaly: false,
         hasErrorAnomaly: false,
+        hasValidLatency: false,
+        hasValidErrorRate: false,
       };
     }
 
@@ -46,43 +50,64 @@ export class SlidingWindowAnalyzer {
     const windowSlice = sortedSamples.slice(-this.windowSize);
     const count = windowSlice.length;
 
-    let latencySum = 0;
-    let errorRateSum = 0;
     let firstAnomalousStep: number | null = null;
-
     const LATENCY_ANOMALY_THRESHOLD_RATIO = 2.0; // 2x baseline
     const ERROR_ANOMALY_DELTA_THRESHOLD = 5.0; // 5% absolute error increase
 
+    // Temporal anomaly detection: independently evaluate metrics that actually exist
+    // Missing evidence must neither create an anomaly nor suppress the other metric's anomaly
     for (const sample of sortedSamples) {
-      const isLatencyAnomalous = baselineLatency > 0
-        ? sample.latency >= baselineLatency * LATENCY_ANOMALY_THRESHOLD_RATIO
-        : sample.latency > 50;
+      const hasLat = sample.hasValidLatency !== false && sample.latency !== undefined && !isNaN(sample.latency);
+      const hasErr = sample.hasValidErrorRate !== false && sample.errorRate !== undefined && !isNaN(sample.errorRate);
 
-      const isErrorAnomalous = sample.errorRate - baselineErrorRate >= ERROR_ANOMALY_DELTA_THRESHOLD;
+      const isLatencyAnomalous = hasLat && (
+        baselineLatency > 0
+          ? sample.latency! >= baselineLatency * LATENCY_ANOMALY_THRESHOLD_RATIO
+          : sample.latency! > 50
+      );
+
+      const isErrorAnomalous = hasErr && (
+        sample.errorRate! - baselineErrorRate >= ERROR_ANOMALY_DELTA_THRESHOLD
+      );
 
       if ((isLatencyAnomalous || isErrorAnomalous) && firstAnomalousStep === null) {
         firstAnomalousStep = sample.simulationStep;
       }
     }
 
+    // Sliding-window averages must use ONLY valid metric observations
+    // Missing samples must not dilute the other metric's average
+    let latencySum = 0;
+    let validLatencyCount = 0;
+    let errorRateSum = 0;
+    let validErrorRateCount = 0;
+
     for (const sample of windowSlice) {
-      latencySum += sample.latency;
-      errorRateSum += sample.errorRate;
+      if (sample.hasValidLatency !== false && sample.latency !== undefined && !isNaN(sample.latency)) {
+        latencySum += sample.latency;
+        validLatencyCount++;
+      }
+      if (sample.hasValidErrorRate !== false && sample.errorRate !== undefined && !isNaN(sample.errorRate)) {
+        errorRateSum += sample.errorRate;
+        validErrorRateCount++;
+      }
     }
 
-    const averageLatency = count > 0 ? latencySum / count : baselineLatency;
-    const averageErrorRate = count > 0 ? errorRateSum / count : baselineErrorRate;
+    const averageLatency = validLatencyCount > 0 ? latencySum / validLatencyCount : baselineLatency;
+    const averageErrorRate = validErrorRateCount > 0 ? errorRateSum / validErrorRateCount : baselineErrorRate;
 
     const safeBaselineLatency = baselineLatency > 0 ? baselineLatency : 1.0;
-    const latencyRatio = averageLatency / safeBaselineLatency;
-    const errorRateDelta = Math.max(0, averageErrorRate - baselineErrorRate);
+    const latencyRatio = validLatencyCount > 0 ? averageLatency / safeBaselineLatency : 1.0;
+    const errorRateDelta = validErrorRateCount > 0 ? Math.max(0, averageErrorRate - baselineErrorRate) : 0.0;
 
-    const hasLatencyAnomaly = latencyRatio >= LATENCY_ANOMALY_THRESHOLD_RATIO;
-    const hasErrorAnomaly = errorRateDelta >= ERROR_ANOMALY_DELTA_THRESHOLD;
+    const hasLatencyAnomaly = validLatencyCount > 0 && latencyRatio >= LATENCY_ANOMALY_THRESHOLD_RATIO;
+    const hasErrorAnomaly = validErrorRateCount > 0 && errorRateDelta >= ERROR_ANOMALY_DELTA_THRESHOLD;
 
     return {
       serviceId,
       sampleCount: count,
+      validLatencyCount,
+      validErrorRateCount,
       averageLatency: Math.round(averageLatency * 100) / 100,
       baselineLatency,
       latencyRatio: Math.round(latencyRatio * 100) / 100,
@@ -92,6 +117,8 @@ export class SlidingWindowAnalyzer {
       firstAnomalousStep,
       hasLatencyAnomaly,
       hasErrorAnomaly,
+      hasValidLatency: validLatencyCount > 0,
+      hasValidErrorRate: validErrorRateCount > 0,
     };
   }
 

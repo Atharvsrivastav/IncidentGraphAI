@@ -40,15 +40,20 @@ export interface TelemetryPoint {
   serviceId: string;
   simulationStep: number;
   timestamp: Date | string;
-  latency: number;
-  errorRate: number;
-  requestCount: number;
+  latency?: number;
+  errorRate?: number;
+  requestCount?: number;
   healthStatus: string;
+  hasValidLatency?: boolean;
+  hasValidErrorRate?: boolean;
+  hasValidRequestCount?: boolean;
 }
 
 export interface SlidingWindowStats {
   serviceId: string;
   sampleCount: number;
+  validLatencyCount: number;
+  validErrorRateCount: number;
   averageLatency: number;
   baselineLatency: number;
   latencyRatio: number; // current / baseline
@@ -58,6 +63,8 @@ export interface SlidingWindowStats {
   firstAnomalousStep: number | null;
   hasLatencyAnomaly: boolean;
   hasErrorAnomaly: boolean;
+  hasValidLatency: boolean;
+  hasValidErrorRate: boolean;
 }
 
 export interface RootCauseEvidenceDetail {

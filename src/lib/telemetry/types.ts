@@ -20,10 +20,13 @@ export interface ObservedServiceMetric {
   source: "PROMETHEUS" | "JAEGER" | "SIMULATION";
   status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
   latencyMs: number;
+  hasValidLatency?: boolean;
   latencyP95Ms?: number;
   hasValidP95?: boolean;
   errorRate: number; // 0 - 100 percentage
+  hasValidErrorRate?: boolean;
   requestRate: number; // req/sec
+  hasValidRequestRate?: boolean;
   lastObserved: string;
   traceCount: number;
   isStale: boolean;

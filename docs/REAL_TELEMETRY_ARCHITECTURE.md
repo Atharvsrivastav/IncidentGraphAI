@@ -213,17 +213,20 @@ Payment Service (Tier 3)
 PostgreSQL Database (Tier 4)
 ```
 
-### Incident Timeline Phases
-1. **Healthy Baseline (Steps 1–3):** All services report nominal latencies (DB: 12ms, Payment: 45ms, Order: 35ms, Gateway: 15ms) and 0% errors. Traces succeed in <50ms.
-2. **Fault Onset at PostgreSQL (Step 4):** Database connection contention causes DB query latency to surge to 1850ms.
-3. **Cascading Propagation (Step 5):** Payment Service stalls waiting for DB (latency 1950ms, 14% errors). Order Service checkout requests timeout waiting for Payment (latency 2100ms, 22% errors).
-4. **Peak Blast Radius (Step 6):** API Gateway breaches timeout threshold (latency 2250ms, 32% errors, HTTP 504 Gateway Timeout). Failure trace captures the 4-tier propagation waterfall down to the PostgreSQL lock contention span.
-5. **Recovery Period (Steps 7–8):** DB pool contention clears, and upstream services recover sequentially.
+### Incident Timeline Phases (6-Step Cascading Recovery Scenario)
+1. **Step 1 (t1 = now - 300s): Healthy Baseline (All Normal):** All four services report nominal latencies (`postgres-db`: 11ms, `payment-service`: 45ms, `order-service`: 35ms, `api-gateway`: 18ms) and 0% errors. Traces succeed in nominal time.
+2. **Step 2 (t2 = now - 240s): Originating Fault Onset at PostgreSQL:** Database connection lock contention causes `postgres-db` query latency to surge to 1850ms (~168x baseline, 0% error rate). Upstream services remain nominal.
+3. **Step 3 (t3 = now - 180s): Payment Contention Cascading:** Payment Service stalls waiting for DB (latency 1950ms, 15% errors). PostgreSQL remains elevated at 1900ms. Order and Gateway remain nominal.
+4. **Step 4 (t4 = now - 120s): Order Checkout Timeout Surge:** Order Service checkout requests timeout waiting on Payment (latency 2100ms, 25% errors). Payment continues stalling (2000ms, 22% errors) and PostgreSQL remains high (1920ms).
+5. **Step 5 (t5 = now - 60s): Peak Ingress Blast Radius at API Gateway:** API Gateway breaches ingress timeout threshold (latency 2250ms, 35% errors, HTTP 504 Gateway Timeout). Cascading failure spans all 4 tiers: Order (2150ms, 28% errors), Payment (1980ms, 25% errors), PostgreSQL (1900ms).
+6. **Step 6 (t6 = now): System-wide Recovery & Post-Incident State:** Database pool contention clears, and all four services recover to baseline performance (`postgres-db`: 12ms, `payment-service`: 50ms, `order-service`: 40ms, `api-gateway`: 22ms, 0% errors). Current observed services at t6 truthfully report `HEALTHY` statuses and nominal latency/error metrics, matching the historical t6 sample without contradiction.
 
 ### Root-Cause Ranking & Evidence Attribution
-- **Derivation:** The `RootCauseEngine` identifies `postgres-db` as the #1 candidate using temporal onset precedence (step 4 vs 5/6) and deepest dependency position.
-- **Blast Radius:** Correctly computes affected dependents count (3 services impacted upstream).
-- **Inconclusive Handling:** When fed telemetry with healthy baselines or no detectable anomalies, the engine returns `isConclusive: false` and `topRootCause: null`.
+- **Temporal Onset Precedence:** The `RootCauseEngine` identifies `postgres-db` as the #1 candidate using earliest abnormality onset precedence (detected at observation step 2, preceding dependent upstream services).
+- **Post-Recovery Anomaly Identification:** Historical sliding-window anomaly evidence successfully identifies the originating cause even after services recover to nominal `HEALTHY` states, without false contradictory-status penalties.
+- **Blast Radius & Topology:** Deepest dependency position explains cascading symptoms; upstream services (`payment-service`, `order-service`, `api-gateway`) are recognized as affected dependents rather than originating causes.
+- **Persistence Verification:** Persisted `Incident` (`rootCauseStatus: "ANALYZED"`, `suspectedRootCauseId: "postgres-db"`) and `RootCauseCandidate` records (rank 1: `postgres-db`) match the engine's findings.
+- **Inconclusive Handling:** When fed telemetry with healthy baselines or no confirmed metric anomalies, the engine returns `isConclusive: false` and `topRootCause: null`.
 
 ---
 
@@ -245,18 +248,21 @@ To maintain total documentation integrity, the capabilities of IncidentGraph AI 
 | **Unrounded Request-Rate Precision** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Retains floating-point precision for low volume |
 | **Temporally Meaningful Range History** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Dynamic step window aggregation over time |
 | **Histogram Bucket & P95 Quantile Consistency**| ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Cumulative buckets + Prometheus quantile formula |
+| **Partial Metric Validity Flags** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | `hasValidLatency` & `hasValidErrorRate` tracked independently |
+| **Non-Diluting Sliding Window** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Averages computed over valid samples only |
+| **Post-Recovery Root-Cause Analysis** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Detects historical root cause when current state is HEALTHY |
 | **Tempo OTLP v2 Hierarchy Parser** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Set `GRAFANA_CLOUD_TEMPO_TOKEN` |
 | **Recursive Span Depth (0 to 3+)** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Cycle-safe DFS with visited set |
 | **Truthful Mode (LIVE vs DEGRADED)** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Requires both providers & non-empty data |
 | **Strict Simulation Isolation** | ✅ Yes | ✅ Yes (Vitest) | N/A (Offline / In-Memory) | Zero fetch calls across all entry points |
-| **Mock Observability Server** | ✅ Yes | ✅ Yes (Vitest) | N/A (In-Memory Emulation) | Explicit PromQL evaluator & range API |
+| **Mock Observability Server** | ✅ Yes | ✅ Yes (Vitest) | N/A (In-Memory Emulation) | Explicit PromQL evaluator & per-second rates |
 | **Historical Batch RCA Evidence** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Feeds multi-step chronological samples to RCA engine |
 | **Fixed 60s Range Lookback Window** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | 60s window across 15, 30, 60, 120s step queries |
-| **Strict Missing-Metric Semantics** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | No fabricated healthy metrics; trace-only stays UNKNOWN |
+| **Strict Missing-Metric Semantics** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | No fabricated healthy metrics; partial stays UNKNOWN |
 | **Sample Microservice Stack** | ✅ Yes | ✅ Yes (E2E Test) | N/A (Local In-Memory / Docker) | Express HTTP & OpenTelemetry instrumentation |
 
 > [!NOTE]
-> Live end-to-end verification against external Grafana Cloud hosted infrastructure requires genuine cloud API tokens (`metrics:read` and `traces:read`). When running in CI or offline developer workstations without external credentials, the entire test suite executes deterministically against rigorous mocked provider responses with zero network leakage.
+> Live end-to-end verification against external Grafana Cloud hosted infrastructure requires genuine cloud API tokens (`metrics:read` and `traces:read`). When running in CI or offline developer workstations without external credentials, the entire test suite executes deterministically against rigorous mocked provider responses with zero network leakage. Genuine live Grafana Cloud validation remains pending configuration of production credentials.
 
 ---
 
@@ -286,10 +292,10 @@ All telemetry provider credentials remain strictly server-side:
 The telemetry suite includes deterministic mocked provider tests, normalization validation, multi-service incident evaluations, and mode transitions that run without external network dependencies:
 
 ```bash
-# Run the dedicated live telemetry test suite (57 tests)
+# Run the dedicated live telemetry test suite (63 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the complete test suite (138 tests across 8 suites)
+# Run the complete test suite (144 tests across 8 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)

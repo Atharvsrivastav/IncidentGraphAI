@@ -280,12 +280,16 @@ export class RootCauseEngine {
     }
 
     // Contradictory signal: Service marked HEALTHY despite anomalous telemetry
+    // Distinguish post-incident recovery (current state normal) from genuine contradiction (currently surging yet reported HEALTHY)
     if (state?.status === "HEALTHY" && metrics && (metrics.hasLatencyAnomaly || metrics.hasErrorAnomaly)) {
-      contradictory.push({
-        description: "Contradictory status signal: Service is reported HEALTHY despite anomalous telemetry observations.",
-        penalty: 15,
-      });
-      rawScore -= 15;
+      const isCurrentlySurging = (node?.baselineLatency && node.baselineLatency > 0 && state.latency >= node.baselineLatency * 1.8) || state.errorRate > 3;
+      if (isCurrentlySurging) {
+        contradictory.push({
+          description: "Contradictory status signal: Service is reported HEALTHY despite currently anomalous telemetry observations.",
+          penalty: 15,
+        });
+        rawScore -= 15;
+      }
     }
 
     // Contradictory signal: Service marked DOWN/DEGRADED but telemetry is pristine

@@ -87,17 +87,29 @@ export class RealRootCauseEngine {
         const latRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "LATENCY_AVG");
 
         // Only construct a valid TelemetryPoint when measurements actually exist
-        // Do not fabricate healthy metrics from database baselines!
+        // Do not fabricate healthy metrics from database baselines or use zero as missing-data sentinel!
         if (latRec !== undefined || errRec !== undefined) {
-          const latency = latRec?.value ?? 0;
-          const errorRate = errRec?.value ?? 0; // Preserves actual ERROR_RATE percentage, not throughput
-          const requestRate = reqRec?.value ?? 0;
+          const hasValidLatency = latRec !== undefined && Number.isFinite(latRec.value);
+          const hasValidErrorRate = errRec !== undefined && Number.isFinite(errRec.value);
+          const hasValidRequestCount = reqRec !== undefined && Number.isFinite(reqRec.value);
+
+          const latency = hasValidLatency ? latRec.value : undefined;
+          const errorRate = hasValidErrorRate ? errRec.value : undefined; // Preserves actual ERROR_RATE percentage
+          const requestCount = hasValidRequestCount ? reqRec.value * 60 : undefined;
 
           let healthStatus = "HEALTHY";
-          if (errorRate > 25 || (svc.baselineLatency > 0 && latency >= svc.baselineLatency * 4)) {
+          if (
+            (hasValidErrorRate && errorRate! > 25) ||
+            (hasValidLatency && svc.baselineLatency > 0 && latency! >= svc.baselineLatency * 4)
+          ) {
             healthStatus = "DOWN";
-          } else if (errorRate > 3 || (svc.baselineLatency > 0 && latency >= svc.baselineLatency * 1.8)) {
+          } else if (
+            (hasValidErrorRate && errorRate! > 3) ||
+            (hasValidLatency && svc.baselineLatency > 0 && latency! >= svc.baselineLatency * 1.8)
+          ) {
             healthStatus = "DEGRADED";
+          } else if (!hasValidLatency || !hasValidErrorRate) {
+            healthStatus = "UNKNOWN";
           }
 
           telemetrySamples.push({
@@ -106,8 +118,11 @@ export class RealRootCauseEngine {
             timestamp: new Date(ts),
             latency,
             errorRate,
-            requestCount: requestRate * 60,
+            requestCount,
             healthStatus,
+            hasValidLatency,
+            hasValidErrorRate,
+            hasValidRequestCount,
           });
         }
       }

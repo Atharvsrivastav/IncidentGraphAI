@@ -458,8 +458,9 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
       const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
       const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
       for (let idx = 0; idx < b1.length; idx++) {
-        const count = b1[idx].count + (b2[idx]?.count || 0);
-        points.push({ metric: { service: s, le: b1[idx].le }, value: [nowSec, String(count)] });
+        const totalCount = b1[idx].count + (b2[idx]?.count || 0);
+        const rate = totalCount / windowSec;
+        points.push({ metric: { service: s, le: b1[idx].le }, value: [nowSec, String(Number(rate.toFixed(4)))] });
       }
     }
     return points;
@@ -650,7 +651,9 @@ export function evaluateMockPromQlRange(
           const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
           const count1 = b1.find((b) => b.le === le)?.count || 0;
           const count2 = b2.find((b) => b.le === le)?.count || 0;
-          return [t, String(count1 + count2)];
+          const totalCount = count1 + count2;
+          const rate = totalCount / lookbackSec;
+          return [t, String(Number(rate.toFixed(4)))];
         });
         results.push({ metric: { service: s, le }, values });
       }

@@ -18,6 +18,7 @@ import {
   buildHealthyTrace,
 } from "../src/lib/telemetry/multiServiceIncident";
 import { RootCauseEngine } from "../src/lib/algorithms/rootCauseEngine";
+import { SlidingWindowAnalyzer } from "../src/lib/algorithms/slidingWindow";
 import { TelemetryPoint } from "../src/lib/algorithms/types";
 import {
   obsStore,
@@ -2649,10 +2650,10 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
         mode: "LIVE",
         backendHealth: liveHealthStatus,
         observedServices: [
-          { serviceId: "postgres-db", serviceName: "PostgreSQL Database Cluster", source: "PROMETHEUS", status: "DOWN", latencyMs: 1850, errorRate: 0, requestRate: 1550, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
-          { serviceId: "payment-service", serviceName: "Payment Gateway Service", source: "PROMETHEUS", status: "DEGRADED", latencyMs: 1950, errorRate: 15, requestRate: 240, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
-          { serviceId: "order-service", serviceName: "Order Service", source: "PROMETHEUS", status: "DEGRADED", latencyMs: 2100, errorRate: 25, requestRate: 520, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
-          { serviceId: "api-gateway", serviceName: "API Gateway", source: "PROMETHEUS", status: "DOWN", latencyMs: 2250, errorRate: 35, requestRate: 1450, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
+          { serviceId: "postgres-db", serviceName: "PostgreSQL Database Cluster", source: "PROMETHEUS", status: "HEALTHY", latencyMs: 12, errorRate: 0, requestRate: 1550, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true, hasValidLatency: true, hasValidErrorRate: true },
+          { serviceId: "payment-service", serviceName: "Payment Gateway Service", source: "PROMETHEUS", status: "HEALTHY", latencyMs: 50, errorRate: 0, requestRate: 240, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true, hasValidLatency: true, hasValidErrorRate: true },
+          { serviceId: "order-service", serviceName: "Order Service", source: "PROMETHEUS", status: "HEALTHY", latencyMs: 40, errorRate: 0, requestRate: 520, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true, hasValidLatency: true, hasValidErrorRate: true },
+          { serviceId: "api-gateway", serviceName: "API Gateway", source: "PROMETHEUS", status: "HEALTHY", latencyMs: 22, errorRate: 0, requestRate: 1450, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true, hasValidLatency: true, hasValidErrorRate: true },
         ],
         unknownServices: [],
         lastCollectedAt: t6,
@@ -2702,10 +2703,18 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(affectedServiceIds).toContain("order-service");
       expect(affectedServiceIds).toContain("api-gateway");
 
-      // Verify database persistence of the analysis
+      // Verify database persistence of the analysis and candidate records
       const updatedIncident = await prisma.incident.findUnique({ where: { id: incident.id } });
       expect(updatedIncident?.rootCauseStatus).toBe("ANALYZED");
       expect(updatedIncident?.suspectedRootCauseId).toBe("postgres-db");
+
+      const savedCandidates = await prisma.rootCauseCandidate.findMany({
+        where: { incidentId: incident.id },
+        orderBy: { rank: "asc" },
+      });
+      expect(savedCandidates.length).toBeGreaterThan(0);
+      expect(savedCandidates[0].candidateServiceId).toBe("postgres-db");
+      expect(savedCandidates[0].rank).toBe(1);
     });
 
     it("returns inconclusive when telemetry evidence is insufficient and never maps UNKNOWN to HEALTHY", async () => {
@@ -2783,6 +2792,316 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
 
       // Verify zero network requests occurred
       expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  // 9. Targeted Regression Suite: Partial-Metric & RCA Consistency Hardening
+  // =========================================================================
+  describe("Targeted Regression Suite: Partial-Metric & RCA Consistency Hardening", () => {
+    const analyzer = new SlidingWindowAnalyzer(5);
+
+    it("evaluates valid latency with missing error-rate series without diluting averages or suppressing anomaly", () => {
+      // 3 samples: latency is valid (180ms, 190ms, 200ms), errorRate is missing/undefined
+      const samples: TelemetryPoint[] = [
+        {
+          serviceId: "db-service",
+          simulationStep: 1,
+          timestamp: "2026-10-30T10:00:00Z",
+          latency: 180,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: true,
+          hasValidErrorRate: false,
+        },
+        {
+          serviceId: "db-service",
+          simulationStep: 2,
+          timestamp: "2026-10-30T10:01:00Z",
+          latency: 190,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: true,
+          hasValidErrorRate: false,
+        },
+        {
+          serviceId: "db-service",
+          simulationStep: 3,
+          timestamp: "2026-10-30T10:02:00Z",
+          latency: 200,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: true,
+          hasValidErrorRate: false,
+        },
+      ];
+
+      const baselineLatency = 50;
+      const baselineErrorRate = 0.5;
+      const stats = analyzer.analyzeServiceWindow("db-service", samples, baselineLatency, baselineErrorRate);
+
+      // Latency average MUST be (180 + 190 + 200) / 3 = 190ms (NOT diluted by missing error rate)
+      expect(stats.validLatencyCount).toBe(3);
+      expect(stats.averageLatency).toBe(190);
+      expect(stats.hasLatencyAnomaly).toBe(true);
+      expect(stats.firstAnomalousStep).toBe(1);
+
+      // Error rate was not observed: must remain invalid/unobserved and NOT trigger false anomaly or false 0%
+      expect(stats.validErrorRateCount).toBe(0);
+      expect(stats.hasValidErrorRate).toBe(false);
+      expect(stats.hasErrorAnomaly).toBe(false);
+    });
+
+    it("evaluates valid error rate with missing latency series without diluting averages or suppressing anomaly", () => {
+      // 3 samples: errorRate is valid (15%, 20%, 25%), latency is missing/undefined
+      const samples: TelemetryPoint[] = [
+        {
+          serviceId: "api-service",
+          simulationStep: 1,
+          timestamp: "2026-10-30T10:00:00Z",
+          errorRate: 15,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: false,
+          hasValidErrorRate: true,
+        },
+        {
+          serviceId: "api-service",
+          simulationStep: 2,
+          timestamp: "2026-10-30T10:01:00Z",
+          errorRate: 20,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: false,
+          hasValidErrorRate: true,
+        },
+        {
+          serviceId: "api-service",
+          simulationStep: 3,
+          timestamp: "2026-10-30T10:02:00Z",
+          errorRate: 25,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: false,
+          hasValidErrorRate: true,
+        },
+      ];
+
+      const baselineLatency = 20;
+      const baselineErrorRate = 0.1;
+      const stats = analyzer.analyzeServiceWindow("api-service", samples, baselineLatency, baselineErrorRate);
+
+      // Error rate average MUST be (15 + 20 + 25) / 3 = 20%
+      expect(stats.validErrorRateCount).toBe(3);
+      expect(stats.averageErrorRate).toBe(20);
+      expect(stats.hasErrorAnomaly).toBe(true);
+      expect(stats.firstAnomalousStep).toBe(1);
+
+      // Latency was not observed: must remain invalid and NOT trigger false latency anomaly
+      expect(stats.validLatencyCount).toBe(0);
+      expect(stats.hasValidLatency).toBe(false);
+      expect(stats.hasLatencyAnomaly).toBe(false);
+    });
+
+    it("proves missing metric samples do not dilute the other metric's sliding-window calculation", () => {
+      // Interleaved partial telemetry:
+      // Step 1: latency 100ms, error missing
+      // Step 2: latency missing, error 20%
+      // Step 3: latency 200ms, error 30%
+      const samples: TelemetryPoint[] = [
+        {
+          serviceId: "mixed-svc",
+          simulationStep: 1,
+          timestamp: "2026-10-30T10:00:00Z",
+          latency: 100,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: true,
+          hasValidErrorRate: false,
+        },
+        {
+          serviceId: "mixed-svc",
+          simulationStep: 2,
+          timestamp: "2026-10-30T10:01:00Z",
+          errorRate: 20,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: false,
+          hasValidErrorRate: true,
+        },
+        {
+          serviceId: "mixed-svc",
+          simulationStep: 3,
+          timestamp: "2026-10-30T10:02:00Z",
+          latency: 200,
+          errorRate: 30,
+          healthStatus: "UNKNOWN",
+          hasValidLatency: true,
+          hasValidErrorRate: true,
+        },
+      ];
+
+      const stats = analyzer.analyzeServiceWindow("mixed-svc", samples, 50, 1.0);
+
+      // Latency average MUST be (100 + 200) / 2 = 150ms!
+      // (If step 2 defaulted to 0, it would be 300 / 3 = 100ms, diluting latency by 33%)
+      expect(stats.validLatencyCount).toBe(2);
+      expect(stats.averageLatency).toBe(150);
+
+      // Error rate average MUST be (20 + 30) / 2 = 25%!
+      // (If step 1 defaulted to 0, it would be 50 / 3 = 16.67%, diluting error rate by 33%)
+      expect(stats.validErrorRateCount).toBe(2);
+      expect(stats.averageErrorRate).toBe(25);
+    });
+
+    it("strictly marks service UNKNOWN when partial metrics are present without confirmed anomaly", async () => {
+      telemetryManager.setMode("LIVE");
+
+      // Mock getBackendHealth
+      vi.spyOn(telemetryManager, "getBackendHealth").mockResolvedValue({
+        prometheusAvailable: true,
+        jaegerAvailable: true,
+        prometheusUrl: "http://localhost:9090",
+        jaegerUrl: "http://localhost:16686",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "GENUINE_STACK",
+        lastChecked: new Date().toISOString(),
+      });
+
+      // Service has valid, normal latency (25ms), but error rate series is completely missing
+      const mockPromDetailed: ServiceMetricsDetailedResult = {
+        success: true,
+        p95Supported: true,
+        diagnostics: [],
+        metrics: new Map([
+          [
+            "order-service",
+            {
+              serviceName: "order-service",
+              latencyMs: 25,
+              hasValidLatency: true,
+              errorRate: 0,
+              hasValidErrorRate: false, // Error metrics missing!
+              requestRate: 50,
+              hasValidRequestRate: true,
+              hasValidP95: false,
+              instanceCount: 1,
+            },
+          ],
+        ]),
+      };
+
+      vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue(mockPromDetailed);
+      vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+        success: true,
+        traces: [],
+        normalizedSpans: [],
+        diagnostic: {
+          provider: "TEMPO",
+          endpoint: "/api/traces",
+          status: "OK",
+          message: "Traces empty",
+          latencyMs: 5,
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      const { observedServices } = await telemetryManager.getObservedServices();
+      const orderObs = observedServices.find((s) => s.serviceId === "order-service");
+      expect(orderObs).toBeDefined();
+
+      // Must NOT be labeled HEALTHY because error-rate is uninstrumented/missing
+      expect(orderObs!.status).toBe("UNKNOWN");
+      expect(orderObs!.hasValidLatency).toBe(true);
+      expect(orderObs!.hasValidErrorRate).toBe(false);
+      expect(orderObs!.isStale).toBe(true);
+      expect(orderObs!.lastObserved).toContain("Error rate metrics missing");
+    });
+
+    it("verifies rate(bucket[1m]) represents per-second bucket rates and preserves P95 consistency", () => {
+      obsStore.clear();
+      const baseSec = 1730000000;
+
+      // Seed 60 observations across 60 seconds (1 req/sec) with latency 40ms (0.040s)
+      for (let s = 1; s <= 60; s++) {
+        obsStore.addObservation({
+          serviceName: "payment-service",
+          instance: "payment-service-inst-1",
+          timestampMs: (baseSec - 60 + s) * 1000,
+          latencyMs: 40,
+          isError: false,
+          requestCount: 1,
+        });
+      }
+
+      // Query bucket range: sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))
+      const matrix = evaluateMockPromQlRange(
+        "sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))",
+        baseSec - 60,
+        baseSec,
+        30
+      );
+
+      expect(matrix).not.toBeNull();
+      expect(matrix!.length).toBeGreaterThan(0);
+
+      // Verify each bucket returns per-second rate: total 60 requests / 60s = 1.0 req/s at +Inf
+      const infSeries = matrix!.find((m) => m.metric["service"] === "payment-service" && m.metric["le"] === "+Inf");
+      expect(infSeries).toBeDefined();
+
+      const evalPoint = infSeries!.values.find((v) => v[0] === baseSec);
+      expect(evalPoint).toBeDefined();
+      expect(parseFloat(evalPoint![1])).toBe(1.0);
+
+      // Verify cumulative monotonic property: bucket values must be non-decreasing across le bounds
+      const paymentBucketsAtEnd: Array<{ le: string; rate: number }> = [];
+      for (const series of matrix!.filter((m) => m.metric["service"] === "payment-service")) {
+        const pt = series.values.find((v) => v[0] === baseSec);
+        if (pt) {
+          paymentBucketsAtEnd.push({ le: series.metric["le"], rate: parseFloat(pt[1]) });
+        }
+      }
+
+      // Check non-decreasing across sorted LE bounds
+      for (let i = 1; i < paymentBucketsAtEnd.length; i++) {
+        expect(paymentBucketsAtEnd[i].rate).toBeGreaterThanOrEqual(paymentBucketsAtEnd[i - 1].rate);
+      }
+
+      // Query P95 quantile range: histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))
+      const p95Matrix = evaluateMockPromQlRange(
+        "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))",
+        baseSec - 60,
+        baseSec,
+        30
+      );
+
+      expect(p95Matrix).not.toBeNull();
+      const p95Series = p95Matrix!.find((m) => m.metric["service"] === "payment-service");
+      expect(p95Series).toBeDefined();
+      const p95Pt = p95Series!.values.find((v) => v[0] === baseSec);
+      expect(p95Pt).toBeDefined();
+      // Latency is 40ms (0.040s), so P95 should be within [0.025, 0.050] bucket range
+      const p95Val = parseFloat(p95Pt![1]);
+      expect(p95Val).toBeGreaterThanOrEqual(0.025);
+      expect(p95Val).toBeLessThanOrEqual(0.050);
+    });
+
+    it("proves RootCauseEngine returns INCONCLUSIVE when services are UNKNOWN with no confirmed anomalies", () => {
+      const engine = new RootCauseEngine(5);
+      const graph = createMultiServiceGraph();
+
+      // Current states are UNKNOWN (e.g. partial telemetry without anomaly)
+      const currentStates = new Map<string, { status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN"; latency: number; errorRate: number }>([
+        ["postgres-db", { status: "UNKNOWN", latency: 0, errorRate: 0 }],
+        ["payment-service", { status: "UNKNOWN", latency: 0, errorRate: 0 }],
+        ["order-service", { status: "UNKNOWN", latency: 0, errorRate: 0 }],
+        ["api-gateway", { status: "UNKNOWN", latency: 0, errorRate: 0 }],
+      ]);
+
+      const result = engine.analyzeIncident({
+        incidentId: "inc-unknown-test",
+        graph,
+        telemetrySamples: [],
+        currentServiceStates: currentStates,
+      });
+
+      // Must be inconclusive: UNKNOWN status alone without confirmed anomalies never establishes symptoms
+      expect(result.isConclusive).toBe(false);
+      expect(result.topRootCause).toBeNull();
     });
   });
 });

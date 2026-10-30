@@ -207,8 +207,11 @@ export class TelemetryManager {
       source: "SIMULATION" as const,
       status: s.status as "HEALTHY" | "DEGRADED" | "DOWN",
       latencyMs: s.currentLatency,
+      hasValidLatency: true,
       errorRate: s.currentErrorRate,
+      hasValidErrorRate: true,
       requestRate: s.requestRate,
+      hasValidRequestRate: true,
       lastObserved: s.updatedAt.toISOString(),
       traceCount: 0,
       isStale: false,
@@ -235,8 +238,11 @@ export class TelemetryManager {
       source: "PROMETHEUS" as const,
       status: "UNKNOWN" as const,
       latencyMs: 0,
+      hasValidLatency: false,
       errorRate: 0,
+      hasValidErrorRate: false,
       requestRate: 0,
+      hasValidRequestRate: false,
       lastObserved: "N/A (Backends Offline)",
       traceCount: 0,
       isStale: true,
@@ -280,8 +286,8 @@ export class TelemetryManager {
 
       // When Prometheus metric is missing or both latency and error rate observations are absent:
       // Keep trace evidence separate from metric evidence.
-      // Missing latency must remain unknown (0, isStale: true). Missing error rate must not silently become healthy 0%.
-      if (!metric || (metric.hasValidLatency === false && metric.hasValidErrorRate === false)) {
+      // Missing latency must remain unknown. Missing error rate must not silently become healthy 0%.
+      if (!metric || (!metric.hasValidLatency && !metric.hasValidErrorRate)) {
         let lastObserved = traceCount > 0
           ? "Trace observations present, but metric telemetry missing"
           : (hasTelemetryData ? "No metric observations received" : "Empty query response (No series matching)");
@@ -294,8 +300,11 @@ export class TelemetryManager {
           source: traceCount > 0 ? "JAEGER" : "PROMETHEUS",
           status: "UNKNOWN",
           latencyMs: 0,
+          hasValidLatency: false,
           errorRate: 0,
+          hasValidErrorRate: false,
           requestRate: metric?.requestRate ?? 0,
+          hasValidRequestRate: Boolean(metric?.hasValidRequestRate),
           lastObserved,
           traceCount,
           isStale: true,
@@ -304,15 +313,40 @@ export class TelemetryManager {
         continue;
       }
 
-      const latency = metric.latencyMs;
-      const errorRate = metric.errorRate;
-      const requestRate = metric.requestRate;
+      const hasValidLatency = Boolean(metric.hasValidLatency);
+      const hasValidErrorRate = Boolean(metric.hasValidErrorRate);
+      const hasValidRequestRate = Boolean(metric.hasValidRequestRate);
 
-      let status: "HEALTHY" | "DEGRADED" | "DOWN" = "HEALTHY";
-      if (errorRate > 25 || (svc.baselineLatency > 0 && latency > svc.baselineLatency * 4)) {
+      const latency = hasValidLatency ? metric.latencyMs : 0;
+      const errorRate = hasValidErrorRate ? metric.errorRate : 0;
+      const requestRate = hasValidRequestRate ? metric.requestRate : 0;
+
+      // Status determination with independent metric evaluation:
+      // Confirmed severe anomaly on either valid metric -> DOWN
+      // Confirmed moderate anomaly on either valid metric -> DEGRADED
+      // Partial metric evidence without confirmed anomaly -> UNKNOWN (cannot certify HEALTHY without complete evidence)
+      // Both metrics valid and within normal baseline bounds -> HEALTHY
+      let status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN" = "HEALTHY";
+      let lastObserved = new Date().toISOString();
+      let isStale = false;
+
+      const isLatencyDown = hasValidLatency && svc.baselineLatency > 0 && latency >= svc.baselineLatency * 4;
+      const isErrorDown = hasValidErrorRate && errorRate > 25;
+      const isLatencyDegraded = hasValidLatency && svc.baselineLatency > 0 && latency >= svc.baselineLatency * 1.8;
+      const isErrorDegraded = hasValidErrorRate && errorRate > 3;
+
+      if (isLatencyDown || isErrorDown) {
         status = "DOWN";
-      } else if (errorRate > 3 || (svc.baselineLatency > 0 && latency > svc.baselineLatency * 1.8)) {
+      } else if (isLatencyDegraded || isErrorDegraded) {
         status = "DEGRADED";
+      } else if (!hasValidLatency || !hasValidErrorRate) {
+        // Partial evidence: e.g. latency is normal, but error rate is uninstrumented/missing (or vice versa)
+        // Cannot certify HEALTHY without complete evidence!
+        status = "UNKNOWN";
+        isStale = true;
+        lastObserved = !hasValidLatency
+          ? "Partial metric telemetry: Latency metrics missing or unavailable"
+          : "Partial metric telemetry: Error rate metrics missing or unavailable";
       }
 
       observedServices.push({
@@ -321,32 +355,47 @@ export class TelemetryManager {
         source: "PROMETHEUS",
         status,
         latencyMs: latency,
+        hasValidLatency,
         latencyP95Ms: metric.latencyP95Ms,
         hasValidP95: metric.hasValidP95,
         errorRate,
+        hasValidErrorRate,
         requestRate,
-        lastObserved: new Date().toISOString(),
+        hasValidRequestRate,
+        lastObserved,
         traceCount,
-        isStale: false,
+        isStale,
         isKnownInTopology: true,
       });
     }
 
     for (const [serviceName, metric] of promMetrics.entries()) {
       if (!topologyIds.has(serviceName)) {
+        const hasValidLatency = Boolean(metric.hasValidLatency);
+        const hasValidErrorRate = Boolean(metric.hasValidErrorRate);
+        let status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN" = "HEALTHY";
+        if (hasValidErrorRate && metric.errorRate > 5) {
+          status = "DEGRADED";
+        } else if (!hasValidLatency || !hasValidErrorRate) {
+          status = "UNKNOWN";
+        }
+
         unknownServices.push({
           serviceId: serviceName,
           serviceName,
           source: "PROMETHEUS",
-          status: metric.errorRate > 5 ? "DEGRADED" : "HEALTHY",
-          latencyMs: metric.latencyMs,
+          status,
+          latencyMs: hasValidLatency ? metric.latencyMs : 0,
+          hasValidLatency,
           latencyP95Ms: metric.latencyP95Ms,
           hasValidP95: metric.hasValidP95,
-          errorRate: metric.errorRate,
+          errorRate: hasValidErrorRate ? metric.errorRate : 0,
+          hasValidErrorRate,
           requestRate: metric.requestRate,
+          hasValidRequestRate: Boolean(metric.hasValidRequestRate),
           lastObserved: new Date().toISOString(),
           traceCount: traceCountByService.get(serviceName) || 0,
-          isStale: false,
+          isStale: !hasValidLatency || !hasValidErrorRate,
           isKnownInTopology: false,
         });
       }
