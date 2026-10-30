@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { telemetryManager } from "@/lib/telemetry/telemetryManager";
+import { BackendHealthStatus } from "@/lib/telemetry/types";
 
 const ModeSchema = z.object({
   mode: z.enum(["SIMULATION", "LIVE", "DEGRADED", "REAL"]),
@@ -9,12 +10,13 @@ const ModeSchema = z.object({
 export async function GET() {
   const requestedMode = telemetryManager.getRequestedMode();
   let effectiveMode = telemetryManager.getEffectiveMode();
-  let health = await telemetryManager.getBackendHealth(false);
+  let health: BackendHealthStatus;
   let lastIngestedAt = telemetryManager.getLastIngestedAt();
 
   if (requestedMode === "SIMULATION") {
-    // Strict simulation isolation: zero external network probes
+    // Strict simulation isolation: zero external network probes, single isolated probe
     effectiveMode = "SIMULATION";
+    health = await telemetryManager.getBackendHealth(false);
   } else {
     try {
       // LIVE mode: obtain latest valid observation snapshot (reusing 3s cache)
@@ -23,7 +25,8 @@ export async function GET() {
       health = observation.backendHealth;
       lastIngestedAt = observation.lastIngestedAt ?? lastIngestedAt;
     } catch {
-      // Backend loss or failed observations transition the operational state to DEGRADED
+      // Backend loss or failed observations transition internal state and response to DEGRADED
+      telemetryManager.markDegraded();
       effectiveMode = "DEGRADED";
       const fallbackHealth = await telemetryManager.getBackendHealth(false).catch(() => null);
       health = fallbackHealth ?? {
@@ -62,9 +65,14 @@ export async function POST(request: Request) {
 
     // If LIVE or REAL was requested, probe observation to determine truthful initial operational state
     if (validated.mode === "LIVE" || validated.mode === "REAL") {
-      const observation = await telemetryManager.getObservedServices(true);
-      effectiveMode = observation.effectiveMode ?? observation.mode;
-      health = observation.backendHealth;
+      try {
+        const observation = await telemetryManager.getObservedServices(true);
+        effectiveMode = observation.effectiveMode ?? observation.mode;
+        health = observation.backendHealth;
+      } catch {
+        telemetryManager.markDegraded();
+        effectiveMode = "DEGRADED";
+      }
     }
 
     const requestedMode = telemetryManager.getRequestedMode();

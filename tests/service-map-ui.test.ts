@@ -9,6 +9,8 @@ import {
 } from "../src/lib/telemetry/mergeServiceMetrics";
 import { ObservedServiceMetric } from "../src/lib/telemetry/types";
 import { telemetryManager, TelemetryManager } from "../src/lib/telemetry/telemetryManager";
+import { prometheusClient } from "../src/lib/telemetry/prometheusClient";
+import { jaegerClient } from "../src/lib/telemetry/jaegerClient";
 import { determineTelemetryProvenance, parsePersistedProvenance } from "../src/lib/ai/investigator";
 import { GET as getModeRoute } from "../src/app/api/telemetry/mode/route";
 
@@ -1098,6 +1100,24 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
         telemetryManager.setMode("SIMULATION");
       }
     });
+    it("transitions internal manager state and response to DEGRADED when observation probe fails", async () => {
+      telemetryManager.setMode("LIVE");
+      const spy = vi
+        .spyOn(telemetryManager, "getObservedServices")
+        .mockRejectedValueOnce(new Error("Telemetry probe failure"));
+
+      try {
+        const res = await getModeRoute();
+        const json = await res.json();
+
+        expect(res.status).toBe(200);
+        expect(json.effectiveMode).toBe("DEGRADED");
+        expect(telemetryManager.getEffectiveMode()).toBe("DEGRADED");
+      } finally {
+        spy.mockRestore();
+        telemetryManager.setMode("SIMULATION");
+      }
+    });
 
     it("reuses 3-second observation cache during subsequent GET requests to avoid duplicate provider queries", async () => {
       telemetryManager.setMode("SIMULATION");
@@ -1111,41 +1131,216 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
       expect(json2.effectiveMode).toBe("SIMULATION");
       expect(json1.health.backendType).toBe(json2.health.backendType);
     });
+
+    it("manages LIVE mode observation cache: reuses within 3s, refreshes on expiry, and invalidates on SIMULATION switch", async () => {
+      telemetryManager.setMode("LIVE");
+      let currentTime = 1000000;
+      const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+
+      const healthSpy = vi.spyOn(telemetryManager, "getBackendHealth").mockResolvedValue({
+        prometheusAvailable: true,
+        jaegerAvailable: true,
+        prometheusUrl: "http://localhost:9090",
+        jaegerUrl: "http://localhost:16686",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "GENUINE_STACK",
+        lastChecked: new Date().toISOString(),
+        details: "Mocked healthy providers for cache test",
+      });
+
+      const promSpy = vi.spyOn(prometheusClient, "getServiceMetricsDetailed").mockResolvedValue({
+        success: true,
+        metrics: new Map(),
+        diagnostics: [],
+        p95Supported: true,
+      });
+
+      const jaegerSpy = vi.spyOn(jaegerClient, "getRecentTracesDetailed").mockResolvedValue({
+        success: true,
+        traces: [],
+        normalizedSpans: [],
+        diagnostic: {
+          provider: "TEMPO",
+          status: "OK",
+          endpoint: "http://localhost:16686",
+          message: "Traces fetched successfully",
+          latencyMs: 5,
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      try {
+        // First observation: cache is empty, invokes provider queries
+        const obs1 = await telemetryManager.getObservedServices(false);
+        const initialCallCount = promSpy.mock.calls.length;
+        expect(initialCallCount).toBeGreaterThan(0);
+        expect(healthSpy.mock.calls.length).toBeGreaterThan(0);
+
+        // Subsequent call within 3-second cache window (+1500ms)
+        currentTime += 1500;
+        const obs2 = await telemetryManager.getObservedServices(false);
+        // Provider queries are NOT re-invoked
+        expect(promSpy).toHaveBeenCalledTimes(initialCallCount);
+        expect(obs2).toBe(obs1);
+
+        // Advance time past 3000ms cache window (+2000ms, total 3500ms since initial)
+        currentTime += 2000;
+        const obs3 = await telemetryManager.getObservedServices(false);
+        // Cache expired; provider queries are re-invoked and new snapshot returned
+        expect(obs3).not.toBe(obs1);
+        expect(promSpy.mock.calls.length).toBeGreaterThan(initialCallCount);
+        const refreshedCallCount = promSpy.mock.calls.length;
+
+        // Switching to SIMULATION invalidates cached observation
+        telemetryManager.setMode("SIMULATION");
+        expect(telemetryManager.getOperationalState().effectiveMode).toBe("SIMULATION");
+
+        // Switching back to LIVE starts fresh with empty cache
+        telemetryManager.setMode("LIVE");
+        await telemetryManager.getObservedServices(false);
+        expect(promSpy.mock.calls.length).toBeGreaterThan(refreshedCallCount);
+      } finally {
+        promSpy.mockRestore();
+        jaegerSpy.mockRestore();
+        healthSpy.mockRestore();
+        dateSpy.mockRestore();
+        telemetryManager.setMode("SIMULATION");
+      }
+    });
   });
 
   // =========================================================================
   // 13. Truthful AI Telemetry Provenance Unit Tests
   // =========================================================================
   describe("Truthful AI Telemetry Provenance Unit Tests", () => {
-    it("returns LIVE_TELEMETRY only when effectiveMode is LIVE and provider is genuine (GRAFANA_CLOUD or GENUINE_STACK)", () => {
-      const cloudProv = determineTelemetryProvenance({
-        isLiveScenario: true,
+    it("returns SIMULATED for simulation incidents even when global mode is LIVE and providers are genuine or mock", () => {
+      // Simulation incident + global LIVE + genuine providers -> SIMULATED
+      const simGenuine = determineTelemetryProvenance({
+        isSimulationOrigin: true,
+        simulationScenario: "payment-failure",
         requestedMode: "LIVE",
         effectiveMode: "LIVE",
-        hasSimulationScenario: false,
-        backendHealth: {
-          backendType: "GRAFANA_CLOUD",
-          prometheusAvailable: true,
-          jaegerAvailable: true,
-        },
-      });
-      expect(cloudProv).toBe("LIVE_TELEMETRY");
-
-      const localProv = determineTelemetryProvenance({
-        isLiveScenario: true,
-        requestedMode: "LIVE",
-        effectiveMode: "LIVE",
-        hasSimulationScenario: false,
         backendHealth: {
           backendType: "GENUINE_STACK",
           prometheusAvailable: true,
           jaegerAvailable: true,
         },
       });
-      expect(localProv).toBe("LIVE_TELEMETRY");
+      expect(simGenuine).toBe("SIMULATED");
+
+      // Simulation incident + global LIVE + mock backend -> SIMULATED
+      const simMock = determineTelemetryProvenance({
+        simulationScenario: "database-exhaustion",
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "MOCK_EMULATION",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(simMock).toBe("SIMULATED");
     });
 
-    it("returns MOCK when backendType is MOCK_EMULATION even if live mode was requested", () => {
+    it("returns LIVE_TELEMETRY for explicit live observation only when genuine providers and verified LIVE state", () => {
+      const explicitLive = determineTelemetryProvenance({
+        simulationScenario: "live-telemetry-observation",
+        isExplicitLiveObservation: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "GRAFANA_CLOUD",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(explicitLive).toBe("LIVE_TELEMETRY");
+
+      const localLive = determineTelemetryProvenance({
+        simulationScenario: "live-telemetry-observation",
+        isExplicitLiveObservation: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "GENUINE_STACK",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(localLive).toBe("LIVE_TELEMETRY");
+    });
+
+    it("returns PARTIAL_TELEMETRY when explicit live observation has degraded genuine provider", () => {
+      const explicitPartial = determineTelemetryProvenance({
+        simulationScenario: "live-telemetry-observation",
+        isExplicitLiveObservation: true,
+        requestedMode: "LIVE",
+        effectiveMode: "DEGRADED",
+        backendHealth: {
+          backendType: "GENUINE_STACK",
+          prometheusAvailable: true,
+          jaegerAvailable: false,
+        },
+      });
+      expect(explicitPartial).toBe("PARTIAL_TELEMETRY");
+    });
+
+    it("returns PARTIAL_TELEMETRY when effectiveMode is LIVE but one provider availability flag is false", () => {
+      // Regression: Prometheus unavailable, Jaeger available
+      const promDown = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "GRAFANA_CLOUD",
+          prometheusAvailable: false,
+          jaegerAvailable: true,
+        },
+      });
+      expect(promDown).toBe("PARTIAL_TELEMETRY");
+
+      // Regression: Prometheus available, Jaeger unavailable
+      const jaegerDown = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "GENUINE_STACK",
+          prometheusAvailable: true,
+          jaegerAvailable: false,
+        },
+      });
+      expect(jaegerDown).toBe("PARTIAL_TELEMETRY");
+    });
+
+    it("returns UNAVAILABLE when there is no verified provider evidence", () => {
+      const unavail = determineTelemetryProvenance({
+        isExplicitLiveObservation: true,
+        requestedMode: "LIVE",
+        effectiveMode: "DEGRADED",
+        backendHealth: {
+          backendType: "UNAVAILABLE",
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+        },
+      });
+      expect(unavail).toBe("UNAVAILABLE");
+
+      const noEvidence = determineTelemetryProvenance({
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        backendHealth: {
+          backendType: "UNAVAILABLE",
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+        },
+      });
+      expect(noEvidence).toBe("UNAVAILABLE");
+    });
+
+    it("returns MOCK when backendType is MOCK_EMULATION for live scenarios", () => {
       const mockProv = determineTelemetryProvenance({
         isLiveScenario: true,
         requestedMode: "LIVE",
@@ -1158,49 +1353,6 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
         },
       });
       expect(mockProv).toBe("MOCK");
-    });
-
-    it("returns PARTIAL_TELEMETRY when genuine provider is degraded or partially available", () => {
-      const degradedProv = determineTelemetryProvenance({
-        isLiveScenario: true,
-        requestedMode: "LIVE",
-        effectiveMode: "DEGRADED",
-        hasSimulationScenario: false,
-        backendHealth: {
-          backendType: "GENUINE_STACK",
-          prometheusAvailable: true,
-          jaegerAvailable: false,
-        },
-      });
-      expect(degradedProv).toBe("PARTIAL_TELEMETRY");
-
-      const degradedCloudProv = determineTelemetryProvenance({
-        isLiveScenario: true,
-        requestedMode: "LIVE",
-        effectiveMode: "DEGRADED",
-        hasSimulationScenario: false,
-        backendHealth: {
-          backendType: "GRAFANA_CLOUD",
-          prometheusAvailable: false,
-          jaegerAvailable: true,
-        },
-      });
-      expect(degradedCloudProv).toBe("PARTIAL_TELEMETRY");
-    });
-
-    it("returns UNAVAILABLE when requested LIVE mode has zero available backends or UNAVAILABLE status", () => {
-      const unavailProv = determineTelemetryProvenance({
-        isLiveScenario: true,
-        requestedMode: "LIVE",
-        effectiveMode: "DEGRADED",
-        hasSimulationScenario: false,
-        backendHealth: {
-          backendType: "UNAVAILABLE",
-          prometheusAvailable: false,
-          jaegerAvailable: false,
-        },
-      });
-      expect(unavailProv).toBe("UNAVAILABLE");
     });
 
     it("returns SIMULATED for simulation incidents and simulation mode", () => {
@@ -1218,15 +1370,24 @@ describe("Service Map Utility & State-Logic Unit Test Suite", () => {
       expect(simProv).toBe("SIMULATED");
     });
 
-    it("safely parses legacy persisted provenance records without crashing or reinterpreting valid data", () => {
+    it("safely parses persisted provenance records: preserves valid, maps legacy, empty and unknown to UNAVAILABLE", () => {
+      // Valid known values preserved
       expect(parsePersistedProvenance("LIVE_TELEMETRY")).toBe("LIVE_TELEMETRY");
       expect(parsePersistedProvenance("PARTIAL_TELEMETRY")).toBe("PARTIAL_TELEMETRY");
       expect(parsePersistedProvenance("UNAVAILABLE")).toBe("UNAVAILABLE");
       expect(parsePersistedProvenance("SIMULATED")).toBe("SIMULATED");
       expect(parsePersistedProvenance("MOCK")).toBe("MOCK");
-      expect(parsePersistedProvenance("REAL")).toBe("LIVE_TELEMETRY");
-      expect(parsePersistedProvenance("LIVE")).toBe("LIVE_TELEMETRY");
-      expect(parsePersistedProvenance("legacy_unrecognized")).toBe("SIMULATED");
+
+      // Legacy values without verified evidence map to UNAVAILABLE
+      expect(parsePersistedProvenance("REAL")).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance("LIVE")).toBe("UNAVAILABLE");
+
+      // Empty, unknown, null, undefined map to UNAVAILABLE without throwing
+      expect(parsePersistedProvenance("")).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance("legacy_unrecognized")).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance("UNKNOWN_PROVIDER")).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance(null)).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance(undefined)).toBe("UNAVAILABLE");
     });
   });
 });

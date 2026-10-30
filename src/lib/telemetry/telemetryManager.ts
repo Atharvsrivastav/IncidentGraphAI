@@ -78,6 +78,13 @@ export class TelemetryManager {
     }
   }
 
+  public markDegraded(): void {
+    if (this.requestedMode !== "SIMULATION") {
+      this.effectiveMode = "DEGRADED";
+    }
+    this.cachedObservation = null;
+  }
+
   public getLastIngestedAt(): string | null {
     return this.lastIngestedAt;
   }
