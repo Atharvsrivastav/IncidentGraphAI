@@ -11,7 +11,7 @@ In this system, DSA is not a theoretical demonstration—every data structure an
 | Layer | Responsibility | Mechanism | Why Chosen Over Alternatives |
 | :--- | :--- | :--- | :--- |
 | **Telemetry Ingestion** | Signal collection & context propagation | W3C `traceparent`, OpenTelemetry SDK, Prometheus, Tempo | Industry standard for non-intrusive distributed trace and metric collection across process boundaries. |
-| **Deterministic DSA Engine** | Topological analysis, blast radius, anomaly correlation, candidate ranking | Directed graphs, BFS, DFS 3-coloring, Binary Max-Heap, Sliding Windows | **100% deterministic, zero hallucination, $O(V + E)$ predictable latency.** Does not guess causal links; proves them from graph edges and temporal ordering. |
+| **Deterministic DSA Engine** | Topological analysis, blast radius, anomaly correlation, candidate ranking | Directed graphs, BFS, DFS 3-coloring, Binary Max-Heap, Sliding Windows | **100% deterministic, non-generative, $O(V + E)$ predictable latency.** Does not guess causal links; computes them from graph reachability and temporal ordering. |
 | **AI / Synthesis Layer** | Natural-language explanation & remediation playbooks | Structured prompt synthesis, context grounding | Translates mathematically proven top-$K$ candidates and span metrics into human-readable runbooks for on-call engineers. |
 
 ---

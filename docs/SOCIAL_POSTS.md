@@ -39,7 +39,7 @@ IncidentGraph AI is an autonomous, explainable root-cause investigation platform
 
 ### 🌟 Key Engineering Capabilities
 - **Directed Graph Topology**: Real-time dependency graph with live latency percentiles, upstream blast radius, and cycle alerts.
-- **Deterministic DSA Engine**: Multi-factor root-cause scoring (anomaly z-score, topological depth, temporal precedence) with 100% recall on synthetic multi-tier benchmarks.
+- **Deterministic DSA Engine**: Multi-factor root-cause scoring (anomaly z-score, topological depth, temporal precedence) with 100% recall on 65 evaluable synthetic failure benchmarks across 5 topology families.
 - **Dual Telemetry Modes**: Real cloud telemetry (Grafana Cloud Prometheus & Tempo probes) + zero-cost deterministic fault simulation (7 realistic failure scenarios).
 - **Evidence-Grounded AI**: Strict Zod schema boundaries; verified evidence-ID provenance; deterministic replay in public production.
 - **Production Hardened**: Destructive reset endpoints guarded with HTTP 403 Forbidden; transactional pruning preserves active incidents.

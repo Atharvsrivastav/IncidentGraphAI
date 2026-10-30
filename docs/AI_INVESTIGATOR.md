@@ -143,7 +143,7 @@ In addition to the 117-scenario deterministic benchmark, the repository provides
 | **Performance & Latency** | Mean synthesis time & token tracking | `tests/ai-evaluation.test.ts` |
 
 > [!NOTE]
-> The synthetic 117-scenario benchmark hit rate (100% Top-1) measures deterministic graph algorithms, not LLM accuracy. We strictly separate the two benchmarks.
+> The synthetic 117-scenario benchmark hit rate (100% Top-1 on 65 evaluable definitive failure scenarios across 5 topology families) measures deterministic graph algorithms, not LLM accuracy. We strictly separate the two benchmarks.
 
 ---
 

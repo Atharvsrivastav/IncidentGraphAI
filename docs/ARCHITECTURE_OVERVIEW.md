@@ -66,19 +66,19 @@ $$\text{Score}(v) = w_1 \cdot Z_{\text{latency}}(v) + w_2 \cdot Z_{\text{error}}
 - **Statistical Z-Score**: Measures how many standard deviations current latency and error rates depart from baseline.
 - **Topological Depth Weighting**: Rewards upstream deep storage/infrastructure nodes (Tier 3) over shallow edge reverse proxies (Tier 1).
 - **Temporal Precedence Sorting**: Compares anomaly timestamps; services that degraded earliest in the cascade receive higher ranking weights. Scores represent relative heuristic weights rather than statistically calibrated probabilities.
-- **Synthetic Benchmark Evaluation**: Evaluated on the documented synthetic test suite (117 test cases across 5 topology families—distinct from the 7 interactive failure scenarios in the simulator), the ranking algorithm achieved 100% top-candidate recall in <350ms execution time. These metrics evaluate deterministic synthetic scenarios rather than arbitrary production incidents; see [Root-Cause Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md) for full experimental setup.
+- **Synthetic Benchmark Evaluation**: Evaluated on the documented synthetic test suite (117 total test cases across 5 topology families—distinct from the 7 interactive failure scenarios in the simulator), the ranking algorithm achieved 100% Top-1 root-cause recall among the 65 evaluable definitive failure scenarios (and 100% suite acceptance across all 117 cases) in <350ms execution time. These metrics evaluate deterministic synthetic scenarios rather than arbitrary production incidents; see [Root-Cause Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md) for full experimental setup.
 
 > [!NOTE]
-> **Clarification of Counts — 7 Simulator Scenarios vs. 5 Benchmark Topology Families**:
+> **Reconciliation of Counts — 7 Simulator Scenarios vs. 5 Benchmark Topology Families vs. 117 Total Benchmark Scenarios**:
 > - **7 Simulator Failure Scenarios**: The interactive simulator provides 7 concrete failure scenarios injected into the primary 7-node microservice graph (`database-slowdown`, `database-outage`, `payment-failure`, `inventory-timeout`, `auth-failure`, `gateway-errors`, and `network-latency`).
-> - **5 Benchmark Topology Families**: The algorithmic robustness benchmark evaluates 117 reproducible test cases generated across 5 structural graph architectures (Canonical E-Commerce, Linear Pipeline, Microservices Mesh, Hub-and-Spoke, and Cyclic Graph).
-> Both counts are accurate: 7 refers to the user-injectable failure scenarios in the application simulator, while 5 refers to the topology families evaluated in the 117-scenario benchmark suite.
+> - **5 Benchmark Topology Families**: The algorithmic robustness benchmark generates scenarios across 5 structural graph architectures (Canonical E-Commerce, Linear Pipeline, Microservices Mesh, Hub-and-Spoke, and Cyclic Graph).
+> - **117 Total Benchmark Scenarios**: Partitioned into 65 evaluable definitive failure scenarios (where 100% Top-1 / Top-3 hit rate is evaluated), 13 healthy baselines (0% false alarms), 5 recovery cycles (100% resolution verification), and 34 ambiguous / noisy scenarios (70.59% appropriate inconclusive abstention, 10 valid multi-root identifications). All 117/117 scenarios pass their configured acceptance criteria.
 
 ### D. Evidence-Grounded AI Investigator
 When AI triage is invoked, strict reliability boundaries are enforced:
 - **Zod Schema Validation**: AI outputs must conform to `AIInvestigationReport` schemas with required fields: `verifiedImpact`, `rankedHypotheses`, `recommendedChecks`, `remediationOptions`, and `missingEvidence`.
-- **Evidence-ID Validation**: Every hypothesis cites specific telemetry anomaly evidence IDs recorded during the incident. Non-matching or fabricated IDs are stripped during post-generation schema validation. Note that while syntactic evidence-ID validation ensures every cited ID corresponds to an existing database evidence record, it does not guarantee semantic accuracy or domain correctness of the generated textual claims.
-- **Standby & Deterministic Replay**: In public production, where no external OpenAI key is configured, the system transparently indicates standby mode and executes the deterministic simulation replay provider. All incident summaries are cross-checked against runtime evidence records.
+- **Evidence-ID Validation**: Every hypothesis cites specific telemetry anomaly evidence IDs recorded during the incident. Non-matching or fabricated IDs are stripped during post-generation schema validation. Note that while syntactic evidence-ID validation ensures every cited ID corresponds to an existing database evidence record, it does not guarantee semantic accuracy or domain correctness of the generated textual claims; human SRE review remains strictly necessary.
+- **Standby & Deterministic Replay**: Deterministic replay does not require a live LLM API. In public production, where no external OpenAI key is configured, the system transparently indicates standby mode and executes the deterministic simulation replay provider. All incident summaries are cross-checked against runtime evidence records.
 
 ---
 
