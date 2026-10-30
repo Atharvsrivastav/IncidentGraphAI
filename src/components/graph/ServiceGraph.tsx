@@ -31,11 +31,13 @@ const nodeTypes = {
   serviceNode: ServiceNode,
 };
 
+const DEFAULT_AFFECTED_IDS: string[] = [];
+
 export function ServiceGraph({
   services,
   dependencies,
   suspectedRootCauseId,
-  affectedServiceIds = [],
+  affectedServiceIds = DEFAULT_AFFECTED_IDS,
   onServiceRestored,
 }: ServiceGraphProps) {
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);

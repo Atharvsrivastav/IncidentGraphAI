@@ -185,6 +185,7 @@ function IncidentDetailContent({
         </button>
         <button
           onClick={() => setActiveTab("root-causes")}
+          data-testid="ranked-root-causes-tab"
           className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
             activeTab === "root-causes"
               ? "border-purple-500 text-purple-400 font-bold"
@@ -192,7 +193,7 @@ function IncidentDetailContent({
           }`}
         >
           <Zap className="h-4 w-4" />
-          <span>DSA Graph Candidates ({candidates.length})</span>
+          <span>Ranked Root Causes (DSA) ({candidates.length})</span>
         </button>
         <button
           onClick={() => setActiveTab("evidence")}
