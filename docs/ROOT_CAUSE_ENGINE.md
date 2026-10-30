@@ -38,7 +38,7 @@ Each candidate service is scored on a normalized scale from **0 to 100 points**.
 
 ## 3. Confidence Classification
 
-The final score is clamped between 0 and 100. Rather than claiming fabricated probabilistic certainty (e.g. "97.4% probability"), the engine assigns calibrated heuristic confidence labels:
+The final score is clamped between 0 and 100. Rather than claiming fabricated probabilistic certainty (e.g. "97.4% probability"), the engine assigns categorical heuristic confidence tiers (not calibrated probabilities):
 
 | Heuristic Score | Confidence Label | Interpretation |
 |---|---|---|

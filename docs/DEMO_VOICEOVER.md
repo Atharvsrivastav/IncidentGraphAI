@@ -55,14 +55,14 @@
 
 > *"Now let's examine the diagnosis on the Incident Triage page.*
 >
-> *Rather than relying on black-box heuristics or LLM hallucinations, IncidentGraph AI uses a deterministic data structures and algorithms engine.*
+> *Rather than relying on black-box heuristics or speculative guessing, IncidentGraph AI uses a deterministic data structures and algorithms engine.*
 >
 > *Our engine evaluates three distinct mathematical signals:*
 > 1. *First, anomaly severity using statistical z-scores.*
 > 2. *Second, topological depth—favoring root dependencies over ingress proxies.*
 > 3. *Third, temporal precedence—pinpointing which service degraded first.*
 >
-> *Using a binary heap priority queue, the engine assigns postgres-db as Candidate Number 1 with a 94 percent deterministic ranking score, while correctly discounting the API Gateway as merely a downstream victim.*
+> *Using a binary heap priority queue, the engine assigns postgres-db as Candidate Number 1 with a deterministic heuristic score of 94 out of 100, while correctly discounting the API Gateway as merely a downstream victim.*
 >
 > *Switching to the Evidence Timeline, we see the chronological proof clearly laid out."*
 

@@ -76,12 +76,12 @@ IncidentGraph AI combines **directed graph algorithms (BFS blast-radius traversa
   1. Navigate to `/incidents`. Note the auto-detected incident: *PostgreSQL Database Slowdown*.
   2. Click **Investigate**.
   3. Click the **Ranked Root Causes** tab.
-  4. Review candidate #1: `postgres-db` with a **94% deterministic ranking score**.
+  4. Review candidate #1: `postgres-db` with a **deterministic heuristic score of 94/100**.
   5. Click **Re-Run DSA Root-Cause Engine** to execute the priority queue re-weighting live.
   6. Switch to the **Evidence Timeline** tab to inspect the timestamped anomaly sequence.
 * **Visual Cue**: Screenshot `docs/screenshots/04_root_cause_diagnosis.png`.
 * **Talking Point**:
-  > *"Here is the algorithmic core: the engine runs a weighted traversal combining anomaly z-score, topological depth, and temporal precedence. The edge gateway exhibits errors at time T+4 seconds, but postgres-db showed latency spikes at T+0 seconds at depth 3. The engine assigns postgres-db a 94% ranking score, correctly identifying it as the originating candidate over edge symptoms."*
+  > *"Here is the algorithmic core: the engine runs a weighted traversal combining anomaly z-score, topological depth, and temporal precedence. The edge gateway exhibits errors at time T+4 seconds, but postgres-db showed latency spikes at T+0 seconds at depth 3. The engine assigns postgres-db a heuristic score of 94/100, correctly identifying it as the originating candidate over edge symptoms."*
 
 ---
 

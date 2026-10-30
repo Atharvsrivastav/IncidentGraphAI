@@ -152,7 +152,7 @@ Array-indexed complete binary tree:
 const queue = new PriorityQueue<RootCauseCandidate>();
 candidates.forEach(c => queue.insert(c, c.score));
 
-// Extract strictly the top-3 probable causes:
+// Extract strictly the top-3 highest-ranked candidate causes:
 const top3 = queue.extractTopK(3);
 ```
 

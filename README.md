@@ -42,7 +42,7 @@ Injects realistic failure scenarios (e.g., PostgreSQL connection pool exhaustion
 ![Failure Simulator Active Fault](docs/screenshots/03_failure_simulation.png)
 
 ### 4. Incident Investigation & Root-Cause Ranking
-Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas (e.g. `postgres-db` assigned a 94% deterministic ranking score):
+Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas (e.g. `postgres-db` assigned a deterministic heuristic score of 94/100):
 ![Incident Investigation and Root Cause](docs/screenshots/04_root_cause_diagnosis.png)
 
 ### 5. Evidence-Grounded AI Investigation & Replay

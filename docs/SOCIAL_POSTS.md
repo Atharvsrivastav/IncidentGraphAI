@@ -13,7 +13,7 @@ Traditional monitoring tools page on-call engineers with 20+ alerts simultaneous
 IncidentGraph AI takes a fundamentally different, mathematically grounded approach:
 1️⃣ In-Memory Directed Dependency Graph: Models microservice dependencies as a directed graph with edge criticalities, communication protocols (SYNC_HTTP, ASYNC_QUEUE, DATABASE_CONN), and cycle detection.
 2️⃣ Breadth-First Search (BFS) Blast-Radius Search: Real-time traversal computing graph reachability, blast radius, and topological impact scores across upstream dependents.
-3️⃣ Algorithmic Root-Cause Engine: Uses a binary heap priority queue combining anomaly statistical z-scores, topological depth weighting, and temporal onset precedence to rank the true culprit with a 94% deterministic score in under 300ms.
+3️⃣ Algorithmic Root-Cause Engine: Uses a binary heap priority queue combining anomaly statistical z-scores, topological depth weighting, and temporal onset precedence to rank the true culprit with a deterministic heuristic score of 94/100.
 4️⃣ Evidence-Grounded AI Investigation: Enforces strict Zod schema validation and post-generation evidence-ID cross-checking against database anomaly records (with deterministic simulation replay in public production where external LLM keys are unconfigured).
 5️⃣ Enterprise Observability & Hardening: Instrumented with OpenTelemetry and verified against Grafana Cloud (Prometheus + Tempo) over HTTPS; hardened with production authentication guards blocking destructive resets.
 

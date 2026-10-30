@@ -7,7 +7,7 @@ IncidentGraph AI integrates a server-side, evidence-grounded AI investigation pi
 3. Sanitizes all credentials, tokens, and database passwords via a zero-leakage redaction pipeline.
 4. Transmits redacted telemetry within an untrusted data boundary to an external LLM.
 5. Post-validates every hypothesis against actual database evidence IDs, discarding hallucinated citations.
-6. Presents a structured incident brief with calibrated uncertainty, read-only diagnostic checks, and human-approved remediation options.
+6. Presents a structured incident brief with explicit uncertainty tiers, read-only diagnostic checks, and human-approved remediation options.
 
 ---
 
@@ -50,7 +50,7 @@ sequenceDiagram
 
 - **Evidence Before Generated Explanations**: The LLM is never prompted to guess in a vacuum. Every hypothesis must cite explicit evidence IDs (`ev_...`) observed during the incident window.
 - **Independent Deterministic Ranking**: The 100% deterministic graph engine (`RootCauseEngine`) operates independently as a source of truth. The AI synthesis cross-references and evaluates alignment with this deterministic baseline.
-- **Calibrated Uncertainty**: No uncalibrated percentages or artificial certainty. If signals are ambiguous or contradictory, the diagnosis status explicitly declares `INCONCLUSIVE` or `MULTIPLE_CANDIDATES`.
+- **Explicit Uncertainty & Abstention**: Rejects artificial percentage certainty. If signals are ambiguous or contradictory, the diagnosis status explicitly declares `INCONCLUSIVE` or `MULTIPLE_CANDIDATES`.
 - **Truthful Provenance**: Every investigation is tagged with its genuine data provenance:
   - `LIVE_TELEMETRY`: Metrics and traces ingested from production Grafana Cloud (Mimir + Tempo).
   - `SIMULATED`: Generated via deterministic chaos fault injection.
