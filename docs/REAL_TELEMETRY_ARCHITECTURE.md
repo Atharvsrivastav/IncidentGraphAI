@@ -260,6 +260,8 @@ To maintain total documentation integrity, the capabilities of IncidentGraph AI 
 | **Fixed 60s Range Lookback Window** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | 60s window across 15, 30, 60, 120s step queries |
 | **Strict Missing-Metric Semantics** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | No fabricated healthy metrics; partial stays UNKNOWN |
 | **Sample Microservice Stack** | ✅ Yes | ✅ Yes (E2E Test) | N/A (Local In-Memory / Docker) | Express HTTP & OpenTelemetry instrumentation |
+| **React Flow State Synchronization** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side State) | Preserves user-dragged coordinates while updating node metrics |
+| **Live / Degraded Service Map UI** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side Rendering) | Honest LIVE vs DEGRADED banners and UNKNOWN metric states |
 
 > [!NOTE]
 > Live end-to-end verification against external Grafana Cloud hosted infrastructure requires genuine cloud API tokens (`metrics:read` and `traces:read`). When running in CI or offline developer workstations without external credentials, the entire test suite executes deterministically against rigorous mocked provider responses with zero network leakage. Genuine live Grafana Cloud validation remains pending configuration of production credentials.
@@ -295,7 +297,10 @@ The telemetry suite includes deterministic mocked provider tests, normalization 
 # Run the dedicated live telemetry test suite (63 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the complete test suite (144 tests across 8 suites)
+# Run the service map UI integration & synchronization suite (15 tests)
+npx vitest run tests/service-map-ui.test.ts
+
+# Run the complete test suite (159 tests across 9 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)

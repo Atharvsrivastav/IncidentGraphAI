@@ -11,31 +11,17 @@ import {
   Radio,
   ExternalLink,
   HelpCircle,
+  AlertCircle,
 } from "lucide-react";
 import Link from "next/link";
 import { BackendHealthStatus, ObservedServiceMetric } from "@/lib/telemetry/types";
-
-interface MapServiceItem {
-  id: string;
-  name: string;
-  serviceType: string;
-  tier: number;
-  status: "HEALTHY" | "DEGRADED" | "DOWN";
-  currentLatency: number;
-  baselineLatency: number;
-  currentErrorRate: number;
-  baselineErrorRate: number;
-  requestRate: number;
-  description: string;
-}
-
-interface MapDependencyItem {
-  sourceServiceId: string;
-  targetServiceId: string;
-  dependencyType: string;
-  timeoutThreshold: number;
-  criticality: string;
-}
+import {
+  ServiceMapItem,
+  ServiceDependencyItem,
+  TelemetryUIMode,
+  normalizeTelemetryMode,
+  mergeServiceMetrics,
+} from "@/lib/telemetry/mergeServiceMetrics";
 
 interface ActiveIncidentItem {
   id: string;
@@ -43,15 +29,15 @@ interface ActiveIncidentItem {
 }
 
 export default function ServiceMapPage() {
-  const [services, setServices] = useState<MapServiceItem[]>([]);
-  const [dependencies, setDependencies] = useState<MapDependencyItem[]>([]);
+  const [services, setServices] = useState<ServiceMapItem[]>([]);
+  const [dependencies, setDependencies] = useState<ServiceDependencyItem[]>([]);
   const [activeIncident, setActiveIncident] = useState<ActiveIncidentItem | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [loading, setLoading] = useState(true);
 
   // Telemetry Mode & Backend Status
-  const [telemetryMode, setTelemetryMode] = useState<"SIMULATION" | "REAL">("SIMULATION");
+  const [telemetryMode, setTelemetryMode] = useState<TelemetryUIMode>("SIMULATION");
   const [backendHealth, setBackendHealth] = useState<BackendHealthStatus | null>(null);
   const [lastCollectedAt, setLastCollectedAt] = useState<string | null>(null);
   const [unknownServices, setUnknownServices] = useState<ObservedServiceMetric[]>([]);
@@ -65,43 +51,24 @@ export default function ServiceMapPage() {
         fetch("/api/telemetry/overview"),
       ]);
 
-      let currentMode: "SIMULATION" | "REAL" = "SIMULATION";
+      let normalizedMode: TelemetryUIMode = "SIMULATION";
+      let observedMetrics: ObservedServiceMetric[] = [];
 
       if (telRes.ok) {
         const telData = await telRes.json();
-        currentMode = telData.mode || "SIMULATION";
-        setTelemetryMode(currentMode);
+        normalizedMode = normalizeTelemetryMode(telData.mode);
+        setTelemetryMode(normalizedMode);
         setBackendHealth(telData.backendHealth || null);
         setLastCollectedAt(telData.lastCollectedAt || null);
         setUnknownServices(telData.unknownServices || []);
+        observedMetrics = telData.observedServices || [];
+      }
 
-        // If in REAL mode, apply real measured metrics to graph services
-        if (currentMode === "REAL" && telData.observedServices && svcRes.ok) {
-          const rawSvcData = await svcRes.json();
-          const dbServices: MapServiceItem[] = rawSvcData.services ?? [];
-
-          const mergedServices = dbServices.map((svc) => {
-            const realObs = telData.observedServices.find((o: ObservedServiceMetric) => o.serviceId === svc.id);
-            if (realObs && !realObs.isStale && realObs.status !== "UNKNOWN") {
-              return {
-                ...svc,
-                status: realObs.status as "HEALTHY" | "DEGRADED" | "DOWN",
-                currentLatency: realObs.hasValidLatency !== false ? realObs.latencyMs : svc.currentLatency,
-                currentErrorRate: realObs.hasValidErrorRate !== false ? realObs.errorRate : svc.currentErrorRate,
-                requestRate: realObs.hasValidRequestRate !== false ? realObs.requestRate : svc.requestRate,
-              };
-            }
-            return svc;
-          });
-
-          setServices(mergedServices);
-        } else if (svcRes.ok) {
-          const data = await svcRes.json();
-          setServices(data.services ?? []);
-        }
-      } else if (svcRes.ok) {
-        const data = await svcRes.json();
-        setServices(data.services ?? []);
+      if (svcRes.ok) {
+        const rawSvcData = await svcRes.json();
+        const dbServices: ServiceMapItem[] = rawSvcData.services ?? [];
+        const merged = mergeServiceMetrics(dbServices, observedMetrics, normalizedMode);
+        setServices(merged);
       }
 
       if (depRes.ok) {
@@ -143,14 +110,24 @@ export default function ServiceMapPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="rounded bg-indigo-500/20 px-2.5 py-0.5 text-xs font-semibold text-indigo-400 border border-indigo-500/30">
               Topology Visualization
             </span>
             <span className="text-xs text-slate-400 font-mono">Directed Dependency Graph</span>
-            {telemetryMode === "REAL" && (
-              <span className="rounded bg-purple-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-purple-300 border border-purple-500/30">
-                ● Live OpenTelemetry Source
+            {telemetryMode === "LIVE" && (
+              <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-500/30">
+                ● Live Telemetry Source
+              </span>
+            )}
+            {telemetryMode === "DEGRADED" && (
+              <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30">
+                ⚠ Degraded Telemetry Ingestion
+              </span>
+            )}
+            {telemetryMode === "SIMULATION" && (
+              <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono font-semibold text-slate-400 border border-slate-700">
+                ⚙ Simulation Mode
               </span>
             )}
           </div>
@@ -158,8 +135,10 @@ export default function ServiceMapPage() {
             Service Dependency Map
           </h1>
           <p className="mt-1 text-xs text-slate-400">
-            {telemetryMode === "REAL"
-              ? "Observing live runtime measurements from Prometheus and Jaeger distributed tracing."
+            {telemetryMode === "LIVE"
+              ? "Observing verified live runtime measurements from Prometheus and Jaeger/Tempo distributed tracing."
+              : telemetryMode === "DEGRADED"
+              ? "Observability backends are degraded or partially unreachable. Displaying available partial signals with UNKNOWN states."
               : "Simulated microservices topology and causal failure propagation graph."}
           </p>
         </div>
@@ -180,7 +159,7 @@ export default function ServiceMapPage() {
 
           {/* Status Filter */}
           <div className="flex items-center rounded-xl border border-slate-800 bg-slate-900/90 p-1 text-xs">
-            {["ALL", "HEALTHY", "DEGRADED", "DOWN"].map((filter) => (
+            {["ALL", "HEALTHY", "DEGRADED", "DOWN", "UNKNOWN"].map((filter) => (
               <button
                 key={filter}
                 onClick={() => setStatusFilter(filter)}
@@ -205,12 +184,12 @@ export default function ServiceMapPage() {
         </div>
       </div>
 
-      {/* Real Telemetry Observation Banner */}
-      {telemetryMode === "REAL" && (
-        <div className="rounded-2xl border border-indigo-500/40 bg-gradient-to-r from-indigo-950/40 via-slate-900/80 to-slate-950 p-4 backdrop-blur-md">
+      {/* Verified LIVE Telemetry Observation Banner */}
+      {telemetryMode === "LIVE" && (
+        <div className="rounded-2xl border border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-slate-900/80 to-slate-950 p-4 backdrop-blur-md">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600/30 border border-indigo-500/40 text-indigo-400">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-600/30 border border-emerald-500/40 text-emerald-400">
                 <Radio className="h-4 w-4 animate-pulse" />
               </div>
               <div>
@@ -229,11 +208,6 @@ export default function ServiceMapPage() {
                   {backendHealth?.backendType === "MOCK_EMULATION" && (
                     <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30" title="Connected to in-process development mock server, not Docker containers.">
                       Dev Mock Emulation Stack
-                    </span>
-                  )}
-                  {backendHealth?.backendType === "UNAVAILABLE" && (
-                    <span className="rounded bg-rose-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-rose-300 border border-rose-500/30">
-                      Backends Offline
                     </span>
                   )}
                   <span className="text-[10px] font-mono text-slate-400">
@@ -265,9 +239,72 @@ export default function ServiceMapPage() {
             <div className="flex items-center gap-2">
               <Link
                 href="/traces"
-                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-3.5 py-2 font-semibold text-white shadow-md shadow-indigo-600/30 transition-all text-xs"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-3.5 py-2 font-semibold text-white shadow-md shadow-emerald-600/30 transition-all text-xs"
               >
                 <span>Inspect Live Traces</span>
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Honest DEGRADED Telemetry Banner */}
+      {telemetryMode === "DEGRADED" && (
+        <div className="rounded-2xl border border-amber-500/40 bg-gradient-to-r from-amber-950/40 via-slate-900/80 to-slate-950 p-4 backdrop-blur-md">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-amber-600/30 border border-amber-500/40 text-amber-400">
+                <AlertCircle className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-amber-200">Telemetry Ingestion Degraded — Live Telemetry Incomplete</span>
+                  {backendHealth?.backendType === "UNAVAILABLE" && (
+                    <span className="rounded bg-rose-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-rose-300 border border-rose-500/30">
+                      Backends Offline
+                    </span>
+                  )}
+                  {backendHealth?.backendType === "MOCK_EMULATION" && (
+                    <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30">
+                      Dev Mock Degraded
+                    </span>
+                  )}
+                  <span className="text-[10px] font-mono text-slate-400">
+                    Latest poll: {lastCollectedAt ? new Date(lastCollectedAt).toLocaleTimeString() : "just now"}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-300">
+                  Live telemetry ingestion was requested, but one or more required backends failed, timed out, or returned no matching series. Displaying available partial measurements with UNKNOWN states for missing signals.
+                </p>
+                <div className="text-[11px] text-slate-300 flex items-center gap-3 mt-1.5 flex-wrap">
+                  <span>
+                    Metrics Backend:{" "}
+                    <strong className={backendHealth?.prometheusAvailable ? "text-emerald-400" : "text-rose-400"}>
+                      {backendHealth?.prometheusAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                    </strong>
+                  </span>
+                  <span>
+                    Traces Backend:{" "}
+                    <strong className={backendHealth?.jaegerAvailable ? "text-emerald-400" : "text-rose-400"}>
+                      {backendHealth?.jaegerAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud Tempo)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                    </strong>
+                  </span>
+                </div>
+                {backendHealth?.details && (
+                  <p className="text-[10px] text-amber-300/80 mt-1 font-mono">
+                    Diagnostic: {backendHealth.details}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Link
+                href="/traces"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-600/80 hover:bg-amber-600 px-3.5 py-2 font-semibold text-white shadow-md shadow-amber-600/30 transition-all text-xs"
+              >
+                <span>Inspect Traces</span>
                 <ExternalLink className="h-3 w-3" />
               </Link>
             </div>

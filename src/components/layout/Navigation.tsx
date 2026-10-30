@@ -25,6 +25,8 @@ const NAV_ITEMS = [
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
+import { TelemetryUIMode, normalizeTelemetryMode } from "@/lib/telemetry/mergeServiceMetrics";
+
 export function Navigation() {
   const pathname = usePathname();
   const [systemStatus, setSystemStatus] = useState<string>("HEALTHY");
@@ -32,7 +34,7 @@ export function Navigation() {
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
   const [canReset, setCanReset] = useState<boolean>(false);
-  const [telemetryMode, setTelemetryMode] = useState<"SIMULATION" | "REAL">("SIMULATION");
+  const [telemetryMode, setTelemetryMode] = useState<TelemetryUIMode>("SIMULATION");
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -55,7 +57,7 @@ export function Navigation() {
       }
       if (modeRes.ok) {
         const modeData = await modeRes.json();
-        setTelemetryMode(modeData.mode || "SIMULATION");
+        setTelemetryMode(normalizeTelemetryMode(modeData.mode));
       }
     } catch {
       // Ignored in background polling
@@ -159,20 +161,27 @@ export function Navigation() {
             </button>
             <button
               onClick={async () => {
-                await fetch("/api/telemetry/mode", {
+                const res = await fetch("/api/telemetry/mode", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ mode: "REAL" }),
+                  body: JSON.stringify({ mode: "LIVE" }),
                 });
-                setTelemetryMode("REAL");
+                if (res.ok) {
+                  const data = await res.json();
+                  setTelemetryMode(normalizeTelemetryMode(data.mode));
+                } else {
+                  setTelemetryMode("LIVE");
+                }
               }}
               className={`rounded px-2 py-1 text-[10px] font-semibold transition-colors ${
-                telemetryMode === "REAL"
-                  ? "bg-indigo-600 text-white font-bold shadow-sm"
+                telemetryMode === "LIVE"
+                  ? "bg-emerald-600 text-white font-bold shadow-sm"
+                  : telemetryMode === "DEGRADED"
+                  ? "bg-amber-600 text-white font-bold shadow-sm"
                   : "text-slate-400 hover:text-slate-200"
               }`}
             >
-              Real OTel
+              {telemetryMode === "DEGRADED" ? "OTel (Degraded)" : "Live OTel"}
             </button>
           </div>
 

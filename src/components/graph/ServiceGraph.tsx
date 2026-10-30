@@ -1,42 +1,27 @@
 "use client";
 
-import React, { useMemo, useState, useCallback } from "react";
+import React, { useMemo, useState, useCallback, useEffect } from "react";
 import {
   ReactFlow,
   Controls,
   Background,
   MiniMap,
   Node,
-  Edge,
-  MarkerType,
   useNodesState,
   useEdgesState,
-  ConnectionLineType,
 } from "@xyflow/react";
 import { ServiceNode, ServiceNodeCustomData } from "./ServiceNode";
 import { ServiceDetailDrawer } from "./ServiceDetailDrawer";
+import {
+  ServiceMapItem,
+  ServiceDependencyItem,
+  buildGraphNodes,
+  buildGraphEdges,
+} from "@/lib/telemetry/mergeServiceMetrics";
 
 interface ServiceGraphProps {
-  services: {
-    id: string;
-    name: string;
-    serviceType: string;
-    tier: number;
-    status: "HEALTHY" | "DEGRADED" | "DOWN";
-    currentLatency: number;
-    baselineLatency: number;
-    currentErrorRate: number;
-    baselineErrorRate: number;
-    requestRate: number;
-    description: string;
-  }[];
-  dependencies: {
-    sourceServiceId: string;
-    targetServiceId: string;
-    dependencyType: string;
-    timeoutThreshold: number;
-    criticality: string;
-  }[];
+  services: ServiceMapItem[];
+  dependencies: ServiceDependencyItem[];
   suspectedRootCauseId?: string | null;
   affectedServiceIds?: string[];
   onServiceRestored?: (serviceId: string) => void;
@@ -44,17 +29,6 @@ interface ServiceGraphProps {
 
 const nodeTypes = {
   serviceNode: ServiceNode,
-};
-
-// Hierarchical layout positions based on architectural tiers
-const TIER_POSITIONS: Record<string, { x: number; y: number }> = {
-  "api-gateway": { x: 380, y: 40 }, // Tier 1: Ingress Edge
-  "auth-service": { x: 120, y: 190 }, // Tier 2: Auth
-  "order-service": { x: 380, y: 190 }, // Tier 2: Order Core
-  "notification-service": { x: 680, y: 190 }, // Tier 2: Async Notification
-  "payment-service": { x: 220, y: 340 }, // Tier 2: Payment
-  "inventory-service": { x: 500, y: 340 }, // Tier 2: Inventory
-  "postgres-db": { x: 380, y: 490 }, // Tier 3: PostgreSQL Data Store
 };
 
 export function ServiceGraph({
@@ -66,87 +40,30 @@ export function ServiceGraph({
 }: ServiceGraphProps) {
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
 
-  // Map services to React Flow Nodes
-  const initialNodes: Node[] = useMemo(() => {
-    return services.map((svc) => {
-      const position = TIER_POSITIONS[svc.id] ?? {
-        x: (svc.tier - 1) * 260 + 100,
-        y: svc.tier * 150,
-      };
-
-      const isRootCause = svc.id === suspectedRootCauseId;
-      const isAffected = affectedServiceIds.includes(svc.id);
-
-      const nodeData: ServiceNodeCustomData = {
-        id: svc.id,
-        name: svc.name,
-        serviceType: svc.serviceType,
-        tier: svc.tier,
-        status: svc.status,
-        latency: svc.currentLatency,
-        baselineLatency: svc.baselineLatency,
-        errorRate: svc.currentErrorRate,
-        baselineErrorRate: svc.baselineErrorRate,
-        requestRate: svc.requestRate,
-        isRootCause,
-        isAffected,
-      };
-
-      return {
-        id: svc.id,
-        type: "serviceNode",
-        position,
-        data: nodeData,
-      };
-    });
+  // Compute initial nodes and edges
+  const initialNodes = useMemo(() => {
+    return buildGraphNodes(services, [], suspectedRootCauseId, affectedServiceIds);
   }, [services, suspectedRootCauseId, affectedServiceIds]);
 
-  // Map dependencies to React Flow Edges
-  // Convention: source depends on target (A -> B means A calls B)
-  const initialEdges: Edge[] = useMemo(() => {
-    return dependencies.map((dep) => {
-      const isPathAffected =
-        dep.targetServiceId === suspectedRootCauseId ||
-        affectedServiceIds.includes(dep.sourceServiceId);
-
-      const edgeColor = isPathAffected ? "#f43f5e" : "#64748b";
-
-      return {
-        id: `${dep.sourceServiceId}->${dep.targetServiceId}`,
-        source: dep.sourceServiceId,
-        target: dep.targetServiceId,
-        type: ConnectionLineType.SmoothStep,
-        animated: isPathAffected,
-        style: {
-          stroke: edgeColor,
-          strokeWidth: isPathAffected ? 2.5 : 1.5,
-          strokeDasharray: dep.dependencyType === "ASYNC_QUEUE" ? "4,4" : undefined,
-        },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: edgeColor,
-          width: 14,
-          height: 14,
-        },
-        label: `${dep.dependencyType} (${dep.timeoutThreshold}ms)`,
-        labelStyle: {
-          fill: "#94a3b8",
-          fontWeight: 500,
-          fontSize: 10,
-          fontFamily: "monospace",
-        },
-        labelBgStyle: {
-          fill: "#0f172a",
-          fillOpacity: 0.9,
-          rx: 4,
-          ry: 4,
-        },
-      };
-    });
+  const initialEdges = useMemo(() => {
+    return buildGraphEdges(dependencies, suspectedRootCauseId, affectedServiceIds);
   }, [dependencies, suspectedRootCauseId, affectedServiceIds]);
 
-  const [nodes, , onNodesChange] = useNodesState(initialNodes);
-  const [edges, , onEdgesChange] = useEdgesState(initialEdges);
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+
+  // Synchronize React Flow nodes when polled services data or highlighting changes,
+  // while strictly preserving user-dragged positions
+  useEffect(() => {
+    setNodes((prevNodes) => {
+      return buildGraphNodes(services, prevNodes, suspectedRootCauseId, affectedServiceIds);
+    });
+  }, [services, suspectedRootCauseId, affectedServiceIds, setNodes]);
+
+  // Synchronize React Flow edges when dependencies or incident paths change
+  useEffect(() => {
+    setEdges(buildGraphEdges(dependencies, suspectedRootCauseId, affectedServiceIds));
+  }, [dependencies, suspectedRootCauseId, affectedServiceIds, setEdges]);
 
   const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     setSelectedServiceId(node.id);
@@ -169,6 +86,10 @@ export function ServiceGraph({
         <div className="flex items-center gap-1.5">
           <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
           <span className="text-slate-300">Down</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-full bg-slate-500" />
+          <span className="text-slate-300">Unknown</span>
         </div>
         <div className="h-3 w-px bg-slate-700" />
         <span className="text-[11px] text-slate-400 font-mono">
@@ -196,6 +117,7 @@ export function ServiceGraph({
             const data = n.data as unknown as ServiceNodeCustomData;
             if (data.status === "DOWN") return "#ef4444";
             if (data.status === "DEGRADED") return "#f59e0b";
+            if (data.status === "UNKNOWN") return "#64748b";
             return "#10b981";
           }}
           className="!m-4 !hidden md:!block"
