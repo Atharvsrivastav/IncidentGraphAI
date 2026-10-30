@@ -3,7 +3,7 @@
 > **Tone**: Confident, articulate, senior engineer / staff SRE.  
 > **Pacing**: Steady, deliberate (~130–140 words per minute).  
 > **Total Duration**: ~3 minutes (180 seconds).  
-> **Accompanying Video**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4`
+> **Accompanying Video**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4` *(Silent 1080p Screen Recording Walkthrough, 95s, no audio track. This script serves as the companion narration transcript for live presentation or voiceover recording).*
 
 ---
 
@@ -35,13 +35,13 @@
 
 ---
 
-### [0:55 – 1:25] Scene 3: Visualize the Cascade — Service Dependency Map
+### [0:55 – 1:25] Scene 3: Visualize the Cascade — Service Dependency Graph
 
-**(Visual: Navigate to `/service-map`. Interactive SVG topology DAG renders. postgres-db highlighted in warning/degraded color. Click node to highlight blast radius.)**
+**(Visual: Navigate to `/service-map`. Interactive SVG topology graph renders. postgres-db highlighted in warning/degraded color. Click node to highlight blast radius.)**
 
 > *"Next, we open the Service Dependency Map.*
 >
-> *Instead of sifting through fragmented dashboards or log dumps, engineers can visualize their entire microservice topology as a directed acyclic graph.*
+> *Instead of sifting through fragmented dashboards or log dumps, engineers can visualize their entire microservice topology as a directed dependency graph.*
 >
 > *Here, services are organized cleanly into tiers—Edge Ingress, Core Business Logic, and Infrastructure Storage.*
 >
@@ -62,7 +62,7 @@
 > 2. *Second, topological depth—favoring root dependencies over ingress proxies.*
 > 3. *Third, temporal precedence—pinpointing which service degraded first.*
 >
-> *Using a binary heap priority queue, the engine ranks postgres-db as Candidate Number 1 with a 94 percent confidence score, while correctly discounting the API Gateway as merely a downstream victim.*
+> *Using a binary heap priority queue, the engine assigns postgres-db as Candidate Number 1 with a 94 percent deterministic ranking score, while correctly discounting the API Gateway as merely a downstream victim.*
 >
 > *Switching to the Evidence Timeline, we see the chronological proof clearly laid out."*
 
@@ -74,9 +74,9 @@
 
 > *"For deeper triage, IncidentGraph AI includes an evidence-grounded AI investigator.*
 >
-> *Production reliability demands absolute truthfulness. If an LLM API key isn't configured, the system transparently indicates standby mode and activates our deterministic simulation replay engine.*
+> *Production reliability demands absolute truthfulness. In public production, where no external LLM key is configured, the system transparently indicates standby mode and activates our deterministic simulation replay engine.*
 >
-> *Notice how every single claim in this report is strictly grounded in telemetry evidence IDs validated by Zod schemas—eliminating hallucinations entirely.*
+> *Notice how every single claim in this report is strictly grounded in telemetry evidence IDs validated by Zod schemas and database cross-checking.*
 >
 > *The report delivers concise, actionable intelligence: verified latency impact, the blast radius, specific read-only diagnostic queries like checking active database locks, and safe remediation options with clear prerequisites."*
 
@@ -86,7 +86,7 @@
 
 **(Visual: Navigate to `/settings` & `/api/health`. Show Grafana Cloud, OpenTelemetry, Neon PostgreSQL, and production safety guards. Return to dashboard.)**
 
-> *"Under the hood, IncidentGraph AI is built with modern enterprise standards: Next.js 16 App Router, TypeScript, Neon Serverless PostgreSQL with Prisma ORM, and full OpenTelemetry instrumentation exporting directly to Grafana Cloud over HTTPS.*
+> *"Under the hood, IncidentGraph AI is built with modern enterprise standards: Next.js 16 App Router, TypeScript, Neon Serverless PostgreSQL with Prisma ORM, and full OpenTelemetry instrumentation with Grafana Cloud connectivity probes verified over HTTPS.*
 >
 > *Furthermore, the application is hardened for public production: destructive resets are blocked with HTTP 403 Forbidden, and active incidents are transactionally shielded from automated pruning.*
 >

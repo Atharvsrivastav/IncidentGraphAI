@@ -14,11 +14,14 @@
 > **Intelligent, explainable incident investigation and root-cause analysis for distributed microservice architectures using directed graphs, deterministic algorithms, OpenTelemetry, Grafana Cloud, and evidence-grounded AI synthesis.**
 >
 > 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)  
-> 🎬 **Recruiter Demo Video (1080p MP4)**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4)  
+> 🎬 **Recruiter Demo Video**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4) *(Silent 1080p Screen Recording Walkthrough, 1m 35s)*  
+> 🎙️ **Companion Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md) *(Timed narration script for live presentation)*  
 > 📑 **Recruiter Click-by-Click Guide**: [`docs/RECRUITER_DEMO.md`](docs/RECRUITER_DEMO.md)  
-> 🎙️ **Professional Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md)  
 > 🏛️ **Architecture Deep-Dive**: [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md)  
 > ⚡ **Quick Test**: Click `1-Click Guided Demo` on the live homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
+
+> [!NOTE]
+> **Production Telemetry & AI Configuration**: The public deployment at [incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app) reports `mode: SIMULATION` with Grafana Cloud connectivity probes verified (Prometheus and Tempo available). Because an external OpenAI key is intentionally not configured in the public environment, the AI Investigator operates in deterministic simulation replay mode, providing reproducible incident briefs with evidence-ID cross-checking and zero external cost.
 
 ---
 
@@ -30,8 +33,8 @@ All screenshots below are captured from the active running application at 1920x1
 The central command center displaying fleet health status, active incidents, telemetry breach timelines, and MTTR performance metrics:
 ![IncidentGraph AI Overview Dashboard](docs/screenshots/01_hero_dashboard.png)
 
-### 2. Interactive Service Dependency Map (DAG)
-Dynamic topology map powered by React Flow (`@xyflow/react`). Color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), and real-time inspection drawers:
+### 2. Interactive Service Dependency Graph
+Dynamic topology map powered by React Flow (`@xyflow/react`). Directed dependency graph with color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), cycle detection alerts, and real-time inspection drawers:
 ![Service Dependency Map](docs/screenshots/02_service_dependency_map.png)
 
 ### 3. Deterministic Failure Simulator (Active Fault Injection)
@@ -39,7 +42,7 @@ Injects realistic failure scenarios (e.g., PostgreSQL connection pool exhaustion
 ![Failure Simulator Active Fault](docs/screenshots/03_failure_simulation.png)
 
 ### 4. Incident Investigation & Root-Cause Ranking
-Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas:
+Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas (e.g. `postgres-db` assigned a 94% deterministic ranking score):
 ![Incident Investigation and Root Cause](docs/screenshots/04_root_cause_diagnosis.png)
 
 ### 5. Evidence-Grounded AI Investigation & Replay

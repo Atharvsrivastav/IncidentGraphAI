@@ -39,13 +39,13 @@ IncidentGraph AI is an autonomous root-cause analysis platform that ingests dist
 
 ## 2. Core Architectural Pillars
 
-### A. Directed Acyclic Graph (DAG) Topology Engine
+### A. Directed Dependency Graph & Topology Engine
 Microservices and their synchronous/asynchronous relationships are modeled as a weighted directed graph $G = (V, E)$:
 - **Vertices ($V$)**: Individual microservices, each with operational metadata (Tier 1 Edge, Tier 2 Core, Tier 3 Storage), baseline latencies, and moving error rates.
 - **Edges ($E$)**: Dependency calls (e.g. `order-service` $\rightarrow$ `postgres-db`) annotated with communication protocol (`SYNC_HTTP`, `ASYNC_QUEUE`, `DATABASE_CONN`), timeout thresholds, and criticality tiers.
 - **Algorithmic Traversals**:
   - **BFS Blast-Radius Search**: Propagates failure probabilities from any degraded node through downstream dependents, computing reachability and cumulative impact scores.
-  - **DFS Cycle Detection**: Implements Tarjan's strongly connected components algorithm to detect and warn against circular dependency deadlocks in microservice topology.
+  - **DFS Cycle Detection**: Implements Tarjan's strongly connected components algorithm to detect and warn against circular dependency loops in microservice topology.
 
 ### B. Dual-Mode Observability & Ingestion Pipeline
 IncidentGraph AI supports both live cloud telemetry and deterministic simulation replay:
@@ -53,6 +53,7 @@ IncidentGraph AI supports both live cloud telemetry and deterministic simulation
    - Uses `@opentelemetry/sdk-node` with HTTP OTLP metric and trace exporters.
    - Microservices stream metrics directly to Grafana Cloud Prometheus (`/api/prom`) and traces to Grafana Cloud Tempo (`/otlp`).
    - Query engine fetches Prometheus instant vectors via PromQL and parses Tempo trace span hierarchies.
+   - *Note on Public Production*: While Grafana Cloud Prometheus and Tempo probes are verified active, the public production deployment operates with health reporting `mode: SIMULATION` to eliminate egress billing and guarantee deterministic demo stability.
 2. **Deterministic Fault Simulator (Simulation Mode)**:
    - Built-in simulation engine featuring 7 real-world failure scenarios (e.g., PostgreSQL connection pool exhaustion, JWT rotation outage, 3rd-party payment gateway timeout).
    - Allows deterministic stepping ($t_0 \rightarrow t_1 \rightarrow t_2$) to inspect cascade dynamics without incurring cloud egress or compute costs.
@@ -71,7 +72,7 @@ $$\text{Score}(v) = w_1 \cdot Z_{\text{latency}}(v) + w_2 \cdot Z_{\text{error}}
 When AI triage is invoked, strict reliability boundaries are enforced:
 - **Zod Schema Validation**: AI outputs must conform to `AIInvestigationReport` schemas with required fields: `verifiedImpact`, `rankedHypotheses`, `recommendedChecks`, `remediationOptions`, and `missingEvidence`.
 - **Evidence Linking**: Every hypothesis must reference specific telemetry evidence IDs from the graph engine. Statements unsupported by telemetry are rejected.
-- **Standby & Deterministic Replay**: If an OpenAI API key is omitted, the system transparently indicates standby mode and executes the deterministic simulation replay provider. No fabricated data or hallucinations are ever presented to the user.
+- **Standby & Deterministic Replay**: In public production, where no external OpenAI key is configured, the system transparently indicates standby mode and executes the deterministic simulation replay provider. All incident summaries are cross-checked against runtime evidence records.
 
 ---
 
