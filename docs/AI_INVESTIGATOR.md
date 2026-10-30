@@ -139,7 +139,7 @@ In addition to the 117-scenario deterministic benchmark, the repository provides
 | **Citation Validity Rate** | % of cited evidence IDs that exist in DB (Target: 100%) | `tests/ai-evaluation.test.ts` |
 | **Unsupported Claim Rate** | % of citations hallucinated (Target: 0%) | `tests/ai-evaluation.test.ts` |
 | **Service Grounding Rate** | % of cited services in topology (Target: 100%) | `tests/ai-evaluation.test.ts` |
-| **Calibrated Abstention** | Appropriate abstention on ambiguous/false-alarm cases | `tests/ai-evaluation.test.ts` |
+| **Categorical SRE Abstention** | Appropriate abstention on ambiguous/false-alarm cases | `tests/ai-evaluation.test.ts` |
 | **Performance & Latency** | Mean synthesis time & token tracking | `tests/ai-evaluation.test.ts` |
 
 > [!NOTE]

@@ -1,6 +1,6 @@
 # IncidentGraph AI — System Architecture & Data Flow
 
-IncidentGraph AI is a hybrid Site Reliability Engineering (SRE) observability and automated root-cause analysis platform. It models microservice topologies using directed graphs, collects distributed telemetry via OpenTelemetry, and ranks probable failure origins using deterministic graph-traversal algorithms and statistical scoring.
+IncidentGraph AI is a hybrid Site Reliability Engineering (SRE) observability and automated root-cause analysis platform. It models microservice topologies using directed graphs, collects distributed telemetry via OpenTelemetry, and ranks candidate failure origins using deterministic graph-traversal algorithms and relative heuristic scoring.
 
 ---
 
