@@ -2,7 +2,14 @@ import { z } from "zod";
 
 export type DiagnosisStatus = "PROBABLE_ROOT_CAUSE" | "MULTIPLE_CANDIDATES" | "INCONCLUSIVE";
 export type ConfidenceCategory = "HIGH" | "MEDIUM" | "LOW" | "UNCERTAIN";
-export type TelemetryProvenance = "LIVE_TELEMETRY" | "SIMULATED" | "MOCK";
+export const TelemetryProvenanceSchema = z.enum([
+  "LIVE_TELEMETRY",
+  "PARTIAL_TELEMETRY",
+  "UNAVAILABLE",
+  "SIMULATED",
+  "MOCK",
+]);
+export type TelemetryProvenance = z.infer<typeof TelemetryProvenanceSchema>;
 
 export const DiagnosticCheckTypeSchema = z.enum([
   "METRIC_QUERY",

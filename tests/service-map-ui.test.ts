@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   normalizeTelemetryMode,
   mergeServiceMetrics,
@@ -8,9 +8,11 @@ import {
   ServiceDependencyItem,
 } from "../src/lib/telemetry/mergeServiceMetrics";
 import { ObservedServiceMetric } from "../src/lib/telemetry/types";
-import { TelemetryManager } from "../src/lib/telemetry/telemetryManager";
+import { telemetryManager, TelemetryManager } from "../src/lib/telemetry/telemetryManager";
+import { determineTelemetryProvenance, parsePersistedProvenance } from "../src/lib/ai/investigator";
+import { GET as getModeRoute } from "../src/app/api/telemetry/mode/route";
 
-describe("Service Map UI Integration & React Flow Synchronization Suite", () => {
+describe("Service Map Utility & State-Logic Unit Test Suite", () => {
   const baseDbServices: ServiceMapItem[] = [
     {
       id: "api-gateway",
@@ -441,10 +443,10 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
   });
 
   // =========================================================================
-  // 8. Navigation State and Failed Request Guard
+  // 8. Navigation State-Logic & Failed Request Guard Unit Tests
   // =========================================================================
-  describe("Navigation Status Handling & Failed Request Guard", () => {
-    it("simulates failed POST request and proves state is never falsely updated to LIVE", () => {
+  describe("Navigation State-Logic & Failed Request Guard Unit Tests", () => {
+    it("simulates failed POST request, awaits handler completion, and proves state is never falsely updated to LIVE", async () => {
       // Current navigation state
       let requestedState = "SIMULATION";
       let effectiveState = "SIMULATION";
@@ -462,15 +464,15 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
             effectiveState = normalizeTelemetryMode((data.effectiveMode ?? data.mode) as string | null);
             requestedState = normalizeTelemetryMode((data.requestedMode ?? targetMode) as string | null);
           } else {
-            // Failed request: NEVER set status to LIVE!
-            // State remains untouched
+            // Failed request: NEVER set status to LIVE! State remains untouched
           }
         } catch {
           // Network failure: NEVER set status to LIVE!
         }
       };
 
-      void handleModeSwitch("LIVE");
+      // Correctly await asynchronous mode switch operation
+      await handleModeSwitch("LIVE");
 
       expect(requestedState).toBe("SIMULATION");
       expect(effectiveState).toBe("SIMULATION");
@@ -506,41 +508,280 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
       expect(effectiveState).toBe("DEGRADED");
     });
 
-    it("evaluates Navigation status badge: never shows 'All Systems Operational' when live telemetry is degraded", () => {
-      const getNavigationBadge = (systemStatus: string, effectiveMode: string) => {
-        if (systemStatus === "INCIDENT") {
-          return { dot: "bg-red-500", label: "Active Incident" };
+    it("determines truthful Navigation OTel button label and never shows 'Live OTel (Connected)' for mock emulation", () => {
+      const getOtelButtonLabel = (params: {
+        isSwitchingMode: boolean;
+        requestedMode: string;
+        effectiveMode: string;
+        backendType: string;
+      }) => {
+        const { isSwitchingMode, requestedMode, effectiveMode, backendType } = params;
+        if (isSwitchingMode) return "Connecting...";
+        if (requestedMode === "LIVE") {
+          if (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE") {
+            return "OTel (Degraded)";
+          }
+          if (backendType === "MOCK_EMULATION") {
+            return "Mock Emulation";
+          }
+          if (backendType === "GRAFANA_CLOUD") {
+            return "Grafana Cloud (Connected)";
+          }
+          if (backendType === "GENUINE_STACK") {
+            return "Live OTel (Connected)";
+          }
+          return "Live OTel (Connected)";
         }
-        if (effectiveMode === "DEGRADED") {
-          return { dot: "bg-amber-500", label: "Telemetry Pipeline Degraded" };
+        return "Live OTel";
+      };
+
+      // 1. Inactive state (SIMULATION requested)
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: false,
+          requestedMode: "SIMULATION",
+          effectiveMode: "SIMULATION",
+          backendType: "SIMULATION",
+        })
+      ).toBe("Live OTel");
+
+      // 2. Switching mode in-flight
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: true,
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GENUINE_STACK",
+        })
+      ).toBe("Connecting...");
+
+      // 3. Mock emulation: MUST be "Mock Emulation", NEVER "Live OTel (Connected)"
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: false,
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "MOCK_EMULATION",
+        })
+      ).toBe("Mock Emulation");
+
+      // 4. Grafana Cloud: "Grafana Cloud (Connected)"
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: false,
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GRAFANA_CLOUD",
+        })
+      ).toBe("Grafana Cloud (Connected)");
+
+      // 5. Genuine Docker stack: "Live OTel (Connected)"
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: false,
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GENUINE_STACK",
+        })
+      ).toBe("Live OTel (Connected)");
+
+      // 6. Degraded or unavailable: "OTel (Degraded)"
+      expect(
+        getOtelButtonLabel({
+          isSwitchingMode: false,
+          requestedMode: "LIVE",
+          effectiveMode: "DEGRADED",
+          backendType: "UNAVAILABLE",
+        })
+      ).toBe("OTel (Degraded)");
+    });
+
+    it("evaluates Navigation status badge: accurately reflects backendType and degraded state", () => {
+      const getNavigationBadge = (params: {
+        systemStatus: string;
+        requestedMode: string;
+        effectiveMode: string;
+        backendType: string;
+        activeScenario?: string | null;
+      }) => {
+        const { systemStatus, requestedMode, effectiveMode, backendType, activeScenario } = params;
+        if (systemStatus === "INCIDENT") {
+          return {
+            dot: "bg-red-500 animate-pulse",
+            label: `Active Incident (${activeScenario ?? (requestedMode === "SIMULATION" ? "Simulated" : "Live")})`,
+          };
+        }
+        if (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE") {
+          return { dot: "bg-amber-500 animate-pulse", label: "Telemetry Pipeline Degraded" };
+        }
+        if (requestedMode === "LIVE" && backendType === "MOCK_EMULATION") {
+          return { dot: "bg-purple-400", label: "Mock Telemetry Emulation" };
+        }
+        if (requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD") {
+          return { dot: "bg-sky-400", label: "Grafana Cloud Telemetry" };
+        }
+        if (requestedMode === "LIVE" && backendType === "GENUINE_STACK") {
+          return { dot: "bg-emerald-500", label: "Genuine Local Telemetry" };
+        }
+        if (requestedMode === "SIMULATION") {
+          return { dot: "bg-blue-400", label: "Simulation Mode" };
         }
         return { dot: "bg-emerald-500", label: "All Systems Operational" };
       };
 
-      // 1. Simulation without incident -> All Systems Operational
-      expect(getNavigationBadge("HEALTHY", "SIMULATION")).toEqual({
-        dot: "bg-emerald-500",
-        label: "All Systems Operational",
+      // 1. Simulation without incident -> Simulation Mode
+      expect(
+        getNavigationBadge({
+          systemStatus: "HEALTHY",
+          requestedMode: "SIMULATION",
+          effectiveMode: "SIMULATION",
+          backendType: "SIMULATION",
+        })
+      ).toEqual({
+        dot: "bg-blue-400",
+        label: "Simulation Mode",
       });
 
-      // 2. Telemetry degraded without incident -> Telemetry Pipeline Degraded (NEVER All Systems Operational)
-      expect(getNavigationBadge("HEALTHY", "DEGRADED")).toEqual({
-        dot: "bg-amber-500",
+      // 2. LIVE + MOCK_EMULATION -> Mock Telemetry Emulation
+      expect(
+        getNavigationBadge({
+          systemStatus: "HEALTHY",
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "MOCK_EMULATION",
+        })
+      ).toEqual({
+        dot: "bg-purple-400",
+        label: "Mock Telemetry Emulation",
+      });
+
+      // 3. LIVE + GRAFANA_CLOUD -> Grafana Cloud Telemetry
+      expect(
+        getNavigationBadge({
+          systemStatus: "HEALTHY",
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GRAFANA_CLOUD",
+        })
+      ).toEqual({
+        dot: "bg-sky-400",
+        label: "Grafana Cloud Telemetry",
+      });
+
+      // 4. LIVE + GENUINE_STACK -> Genuine Local Telemetry
+      expect(
+        getNavigationBadge({
+          systemStatus: "HEALTHY",
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GENUINE_STACK",
+        })
+      ).toEqual({
+        dot: "bg-emerald-500",
+        label: "Genuine Local Telemetry",
+      });
+
+      // 5. Telemetry degraded -> Telemetry Pipeline Degraded
+      expect(
+        getNavigationBadge({
+          systemStatus: "HEALTHY",
+          requestedMode: "LIVE",
+          effectiveMode: "DEGRADED",
+          backendType: "UNAVAILABLE",
+        })
+      ).toEqual({
+        dot: "bg-amber-500 animate-pulse",
         label: "Telemetry Pipeline Degraded",
       });
 
-      // 3. Incident active -> Active Incident
-      expect(getNavigationBadge("INCIDENT", "DEGRADED")).toEqual({
-        dot: "bg-red-500",
-        label: "Active Incident",
+      // 6. Incident active -> Active Incident
+      expect(
+        getNavigationBadge({
+          systemStatus: "INCIDENT",
+          requestedMode: "LIVE",
+          effectiveMode: "LIVE",
+          backendType: "GENUINE_STACK",
+          activeScenario: "payment-outage",
+        })
+      ).toEqual({
+        dot: "bg-red-500 animate-pulse",
+        label: "Active Incident (payment-outage)",
       });
     });
   });
 
   // =========================================================================
-  // 9. Mock Emulation Honest Presentation
+  // 9. Service Map Header & Observation Banner Honest Presentation
   // =========================================================================
-  describe("Mock Emulation Honest Presentation", () => {
+  describe("Service Map Header & Observation Banner Honest Presentation", () => {
+    it("distinguishes all backend identities truthfully in Service Map header badge and subtitle", () => {
+      const getHeaderState = (params: {
+        telemetryMode: string;
+        backendHealth?: { backendType?: string };
+      }) => {
+        const { telemetryMode, backendHealth } = params;
+        const backendType = backendHealth?.backendType;
+
+        let badgeText = "● Genuine Local Telemetry";
+        let subtitleText = "Observing verified live runtime measurements from genuine local Prometheus and Jaeger observability stack.";
+
+        if (telemetryMode === "SIMULATION") {
+          badgeText = "⚙ Simulation Mode";
+          subtitleText = "Simulated microservices topology and causal failure propagation graph.";
+        } else if (telemetryMode === "DEGRADED" || backendType === "UNAVAILABLE") {
+          badgeText = "⚠ Telemetry Pipeline Degraded";
+          subtitleText = "Observability backends are degraded or partially unreachable. Displaying available partial signals with UNKNOWN states.";
+        } else if (backendType === "MOCK_EMULATION") {
+          badgeText = "● Mock Telemetry Emulation";
+          subtitleText = "Synthetic metrics and distributed traces generated by local development mock server. Non-production emulation.";
+        } else if (backendType === "GRAFANA_CLOUD") {
+          badgeText = "☁ Grafana Cloud Telemetry";
+          subtitleText = "Observing verified live runtime measurements from hosted Grafana Cloud OTLP and Prometheus/Tempo stack.";
+        }
+
+        return { badgeText, subtitleText };
+      };
+
+      // 1. Simulation
+      const sim = getHeaderState({ telemetryMode: "SIMULATION" });
+      expect(sim.badgeText).toBe("⚙ Simulation Mode");
+      expect(sim.subtitleText).toContain("Simulated microservices topology");
+
+      // 2. Mock Emulation: NEVER claims "Live Telemetry Source" or live runtime measurements
+      const mock = getHeaderState({
+        telemetryMode: "LIVE",
+        backendHealth: { backendType: "MOCK_EMULATION" },
+      });
+      expect(mock.badgeText).toBe("● Mock Telemetry Emulation");
+      expect(mock.badgeText).not.toBe("● Live Telemetry Source");
+      expect(mock.subtitleText).toContain("local development mock server");
+      expect(mock.subtitleText).not.toContain("verified live runtime measurements");
+
+      // 3. Grafana Cloud
+      const cloud = getHeaderState({
+        telemetryMode: "LIVE",
+        backendHealth: { backendType: "GRAFANA_CLOUD" },
+      });
+      expect(cloud.badgeText).toBe("☁ Grafana Cloud Telemetry");
+      expect(cloud.subtitleText).toContain("hosted Grafana Cloud OTLP");
+
+      // 4. Genuine Local Stack
+      const local = getHeaderState({
+        telemetryMode: "LIVE",
+        backendHealth: { backendType: "GENUINE_STACK" },
+      });
+      expect(local.badgeText).toBe("● Genuine Local Telemetry");
+      expect(local.subtitleText).toContain("genuine local Prometheus");
+
+      // 5. Degraded
+      const degraded = getHeaderState({
+        telemetryMode: "DEGRADED",
+        backendHealth: { backendType: "UNAVAILABLE" },
+      });
+      expect(degraded.badgeText).toBe("⚠ Telemetry Pipeline Degraded");
+      expect(degraded.subtitleText).toContain("Observability backends are degraded");
+    });
+
     it("distinguishes MOCK_EMULATION from genuine production telemetry in banner rendering", () => {
       const getBannerDisplay = (backendType: string, telemetryMode: string) => {
         if (telemetryMode !== "LIVE") return null;
@@ -549,7 +790,9 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
         return {
           title: isMock
             ? "Mock Telemetry Emulation Active (Dev Server)"
-            : "Live Telemetry Mode Active",
+            : backendType === "GRAFANA_CLOUD"
+            ? "Grafana Cloud Telemetry Active"
+            : "Genuine Local Telemetry Active",
           badge: isMock
             ? "MOCK EMULATION — NOT PRODUCTION TELEMETRY"
             : backendType === "GRAFANA_CLOUD"
@@ -567,13 +810,13 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
 
       // Genuine Grafana Cloud
       const cloudDisplay = getBannerDisplay("GRAFANA_CLOUD", "LIVE");
-      expect(cloudDisplay?.title).toBe("Live Telemetry Mode Active");
+      expect(cloudDisplay?.title).toBe("Grafana Cloud Telemetry Active");
       expect(cloudDisplay?.badge).toBe("☁ Grafana Cloud (Hosted)");
       expect(cloudDisplay?.isProduction).toBe(true);
 
       // Genuine Docker stack
       const dockerDisplay = getBannerDisplay("GENUINE_STACK", "LIVE");
-      expect(dockerDisplay?.title).toBe("Live Telemetry Mode Active");
+      expect(dockerDisplay?.title).toBe("Genuine Local Telemetry Active");
       expect(dockerDisplay?.badge).toBe("Genuine Docker Stack");
       expect(dockerDisplay?.isProduction).toBe(true);
     });
@@ -645,11 +888,11 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
   });
 
   // =========================================================================
-  // 11. Component-Level ServiceGraph Props & Drawer Telemetry Synchronization
+  // 11. ServiceGraph Node/Edge Builder Utilities & Drawer State-Logic Unit Tests
   // =========================================================================
-  describe("Component-Level ServiceGraph Props & Drawer Telemetry Synchronization", () => {
-    it("simulates ServiceGraph receiving updated service props and changing node data while preserving coordinates", () => {
-      // Step 1: Initial mount
+  describe("ServiceGraph Node/Edge Builder Utilities & Drawer State-Logic Unit Tests", () => {
+    it("verifies buildGraphNodes updates node telemetry data while preserving user-dragged coordinates", () => {
+      // Step 1: Initial nodes
       const initialServices = [...baseDbServices];
       let currentNodes = buildGraphNodes(initialServices, [], null, []);
 
@@ -676,7 +919,7 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
           : s
       );
 
-      // Effect execution: setNodes((prev) => buildGraphNodes(services, prev, ...))
+      // Pure utility transformation
       const synchronizedNodes = buildGraphNodes(updatedServices, currentNodes, null, []);
       const updatedGateway = synchronizedNodes.find((n) => n.id === "api-gateway");
 
@@ -689,7 +932,7 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
       expect((updatedGateway?.data as Record<string, unknown>).errorRate).toBe(6.2);
     });
 
-    it("simulates ServiceGraph receiving updated dependency props and updating rendered edges", () => {
+    it("verifies buildGraphEdges transforms updated dependency items to React Flow edge structures", () => {
       // Step 1: Initial dependencies
       let currentEdges = buildGraphEdges(baseDependencies, null, []);
       expect(currentEdges.length).toBe(3);
@@ -705,7 +948,7 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
         },
       ];
 
-      // Effect execution: setEdges(buildGraphEdges(dependencies, ...))
+      // Pure utility transformation
       currentEdges = buildGraphEdges(updatedDependencies, null, []);
       expect(currentEdges.length).toBe(4);
 
@@ -714,7 +957,7 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
       expect(asyncEdge?.source).toBe("order-service");
     });
 
-    it("verifies ServiceDetailDrawer renders N/A for UNKNOWN metrics and displays valid measurements", () => {
+    it("verifies drawer telemetry formatting logic renders N/A for UNKNOWN metrics and displays valid measurements", () => {
       const renderDrawerMetrics = (service: ServiceMapItem) => {
         const hasLatency =
           service.hasValidLatency !== false &&
@@ -771,6 +1014,219 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
       expect(unknownRender.errorText).toBe("N/A");
       expect(unknownRender.volumeText).toBe("N/A");
       expect(unknownRender.status).toBe("UNKNOWN");
+    });
+  });
+
+  // =========================================================================
+  // 12. Mode Transitions & Effective Mode Freshness Unit Tests
+  // =========================================================================
+  describe("Mode Transitions & Effective Mode Freshness Unit Tests", () => {
+    it("ensures SIMULATION mode operates in complete isolation with zero external network telemetry calls", async () => {
+      telemetryManager.setMode("SIMULATION");
+      const originalFetch = global.fetch;
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy;
+
+      try {
+        const res = await getModeRoute();
+        const json = await res.json();
+
+        expect(json.mode).toBe("SIMULATION");
+        expect(json.requestedMode).toBe("SIMULATION");
+        expect(json.effectiveMode).toBe("SIMULATION");
+        expect(json.health.backendType).toBe("SIMULATION");
+        // Strict isolation: ZERO external network calls made
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        global.fetch = originalFetch;
+      }
+    });
+
+    it("transitions operational state from LIVE to DEGRADED when backends are offline", async () => {
+      telemetryManager.setMode("LIVE");
+      const originalFetch = global.fetch;
+
+      // Simulate network loss / unreachable backend
+      global.fetch = vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:9090"));
+
+      try {
+        const res = await getModeRoute();
+        const json = await res.json();
+
+        expect(json.requestedMode).toBe("LIVE");
+        expect(json.effectiveMode).toBe("DEGRADED");
+        expect(json.mode).toBe("DEGRADED");
+        expect(json.health.backendType).toBe("UNAVAILABLE");
+        expect(json.health.prometheusAvailable).toBe(false);
+        expect(json.health.jaegerAvailable).toBe(false);
+      } finally {
+        global.fetch = originalFetch;
+        telemetryManager.setMode("SIMULATION");
+      }
+    });
+
+    it("transitions operational state to DEGRADED when only partial providers are available", async () => {
+      telemetryManager.setMode("LIVE");
+      const originalFetch = global.fetch;
+
+      // Prometheus responds ok, but Jaeger/Tempo rejects
+      global.fetch = vi.fn().mockImplementation(async (url: string | URL | Request) => {
+        const urlStr = url.toString();
+        if (urlStr.includes("9090") || urlStr.includes("/api/v1")) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ "content-type": "application/json" }),
+            json: async () => ({
+              status: "success",
+              data: { resultType: "vector", result: [] },
+            }),
+          };
+        }
+        throw new Error("Jaeger endpoint unreachable");
+      });
+
+      try {
+        const res = await getModeRoute();
+        const json = await res.json();
+
+        // Partial provider availability must transition effective mode to DEGRADED
+        expect(json.requestedMode).toBe("LIVE");
+        expect(json.effectiveMode).toBe("DEGRADED");
+      } finally {
+        global.fetch = originalFetch;
+        telemetryManager.setMode("SIMULATION");
+      }
+    });
+
+    it("reuses 3-second observation cache during subsequent GET requests to avoid duplicate provider queries", async () => {
+      telemetryManager.setMode("SIMULATION");
+      const res1 = await getModeRoute();
+      const json1 = await res1.json();
+
+      const res2 = await getModeRoute();
+      const json2 = await res2.json();
+
+      expect(json1.effectiveMode).toBe("SIMULATION");
+      expect(json2.effectiveMode).toBe("SIMULATION");
+      expect(json1.health.backendType).toBe(json2.health.backendType);
+    });
+  });
+
+  // =========================================================================
+  // 13. Truthful AI Telemetry Provenance Unit Tests
+  // =========================================================================
+  describe("Truthful AI Telemetry Provenance Unit Tests", () => {
+    it("returns LIVE_TELEMETRY only when effectiveMode is LIVE and provider is genuine (GRAFANA_CLOUD or GENUINE_STACK)", () => {
+      const cloudProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "GRAFANA_CLOUD",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(cloudProv).toBe("LIVE_TELEMETRY");
+
+      const localProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "GENUINE_STACK",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(localProv).toBe("LIVE_TELEMETRY");
+    });
+
+    it("returns MOCK when backendType is MOCK_EMULATION even if live mode was requested", () => {
+      const mockProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "LIVE",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "MOCK_EMULATION",
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+        },
+      });
+      expect(mockProv).toBe("MOCK");
+    });
+
+    it("returns PARTIAL_TELEMETRY when genuine provider is degraded or partially available", () => {
+      const degradedProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "DEGRADED",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "GENUINE_STACK",
+          prometheusAvailable: true,
+          jaegerAvailable: false,
+        },
+      });
+      expect(degradedProv).toBe("PARTIAL_TELEMETRY");
+
+      const degradedCloudProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "DEGRADED",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "GRAFANA_CLOUD",
+          prometheusAvailable: false,
+          jaegerAvailable: true,
+        },
+      });
+      expect(degradedCloudProv).toBe("PARTIAL_TELEMETRY");
+    });
+
+    it("returns UNAVAILABLE when requested LIVE mode has zero available backends or UNAVAILABLE status", () => {
+      const unavailProv = determineTelemetryProvenance({
+        isLiveScenario: true,
+        requestedMode: "LIVE",
+        effectiveMode: "DEGRADED",
+        hasSimulationScenario: false,
+        backendHealth: {
+          backendType: "UNAVAILABLE",
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+        },
+      });
+      expect(unavailProv).toBe("UNAVAILABLE");
+    });
+
+    it("returns SIMULATED for simulation incidents and simulation mode", () => {
+      const simProv = determineTelemetryProvenance({
+        isLiveScenario: false,
+        requestedMode: "SIMULATION",
+        effectiveMode: "SIMULATION",
+        hasSimulationScenario: true,
+        backendHealth: {
+          backendType: "SIMULATION",
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+        },
+      });
+      expect(simProv).toBe("SIMULATED");
+    });
+
+    it("safely parses legacy persisted provenance records without crashing or reinterpreting valid data", () => {
+      expect(parsePersistedProvenance("LIVE_TELEMETRY")).toBe("LIVE_TELEMETRY");
+      expect(parsePersistedProvenance("PARTIAL_TELEMETRY")).toBe("PARTIAL_TELEMETRY");
+      expect(parsePersistedProvenance("UNAVAILABLE")).toBe("UNAVAILABLE");
+      expect(parsePersistedProvenance("SIMULATED")).toBe("SIMULATED");
+      expect(parsePersistedProvenance("MOCK")).toBe("MOCK");
+      expect(parsePersistedProvenance("REAL")).toBe("LIVE_TELEMETRY");
+      expect(parsePersistedProvenance("LIVE")).toBe("LIVE_TELEMETRY");
+      expect(parsePersistedProvenance("legacy_unrecognized")).toBe("SIMULATED");
     });
   });
 });

@@ -1,3 +1,5 @@
+import { TelemetryProvenance } from "../types";
+
 export interface AIInvestigationContext {
   incidentId: string;
   incidentTitle: string;
@@ -5,7 +7,7 @@ export interface AIInvestigationContext {
   severity: string;
   status: string;
   startedAt: string;
-  provenance: "LIVE_TELEMETRY" | "SIMULATED" | "MOCK";
+  provenance: TelemetryProvenance;
   topology: Array<{
     id: string;
     name: string;

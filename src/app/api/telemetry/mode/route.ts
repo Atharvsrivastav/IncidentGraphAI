@@ -8,9 +8,39 @@ const ModeSchema = z.object({
 
 export async function GET() {
   const requestedMode = telemetryManager.getRequestedMode();
-  const effectiveMode = telemetryManager.getEffectiveMode();
-  const health = await telemetryManager.getBackendHealth();
-  const lastIngestedAt = telemetryManager.getLastIngestedAt();
+  let effectiveMode = telemetryManager.getEffectiveMode();
+  let health = await telemetryManager.getBackendHealth(false);
+  let lastIngestedAt = telemetryManager.getLastIngestedAt();
+
+  if (requestedMode === "SIMULATION") {
+    // Strict simulation isolation: zero external network probes
+    effectiveMode = "SIMULATION";
+  } else {
+    try {
+      // LIVE mode: obtain latest valid observation snapshot (reusing 3s cache)
+      const observation = await telemetryManager.getObservedServices(false);
+      effectiveMode = observation.effectiveMode ?? observation.mode;
+      health = observation.backendHealth;
+      lastIngestedAt = observation.lastIngestedAt ?? lastIngestedAt;
+    } catch {
+      // Backend loss or failed observations transition the operational state to DEGRADED
+      effectiveMode = "DEGRADED";
+      const fallbackHealth = await telemetryManager.getBackendHealth(false).catch(() => null);
+      health = fallbackHealth ?? {
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: "",
+        jaegerUrl: "",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "UNAVAILABLE",
+        lastChecked: new Date().toISOString(),
+        details: "Observation snapshot failed; operational state degraded.",
+      };
+    }
+  }
+
   return NextResponse.json({
     mode: effectiveMode,
     requestedMode,

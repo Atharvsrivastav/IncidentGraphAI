@@ -295,16 +295,16 @@ All telemetry provider credentials remain strictly server-side:
 
 ## 8. Verification & Testing
 
-The telemetry suite includes deterministic mocked provider tests, normalization validation, multi-service incident evaluations, and mode transitions that run without external network dependencies:
+The telemetry suite includes deterministic mocked provider tests, normalization validation, multi-service incident evaluations, mode transitions, and pure utility/state-logic tests that run without external network dependencies:
 
 ```bash
 # Run the dedicated live telemetry test suite (63 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the service map UI integration & synchronization suite (26 tests)
+# Run the service map utility & state-logic unit test suite (38 tests)
 npx vitest run tests/service-map-ui.test.ts
 
-# Run the complete test suite (170 tests across 9 suites)
+# Run the complete test suite (182 tests across 9 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)
@@ -319,3 +319,6 @@ npm run lint
 # Verify production build
 npm run build
 ```
+
+> [!NOTE]
+> `tests/service-map-ui.test.ts` exercises pure data-transformation, metric-merging, React Flow node/edge builder functions, Navigation state handling, failed-request guard, mode transition logic, and AI telemetry provenance branching. It is strictly a pure utility and state-logic unit test suite and does not mount React DOM components or claim browser lifecycle execution. Dedicated browser automation scripts (`node tests/browser-e2e.mjs`) remain separate.

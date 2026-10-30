@@ -12,6 +12,60 @@ export interface InvestigateOptions {
   forceRefresh?: boolean;
 }
 
+export function determineTelemetryProvenance(params: {
+  isLiveScenario: boolean;
+  requestedMode: string;
+  effectiveMode: string;
+  hasSimulationScenario: boolean;
+  backendHealth: {
+    backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" | "SIMULATION";
+    prometheusAvailable: boolean;
+    jaegerAvailable: boolean;
+  };
+}): TelemetryProvenance {
+  if (params.isLiveScenario) {
+    const { backendHealth, effectiveMode } = params;
+    if (backendHealth.backendType === "MOCK_EMULATION") {
+      return "MOCK";
+    }
+    if (backendHealth.backendType === "UNAVAILABLE" || (!backendHealth.prometheusAvailable && !backendHealth.jaegerAvailable)) {
+      return "UNAVAILABLE";
+    }
+    if (
+      effectiveMode === "LIVE" &&
+      (backendHealth.backendType === "GRAFANA_CLOUD" || backendHealth.backendType === "GENUINE_STACK")
+    ) {
+      return "LIVE_TELEMETRY";
+    }
+    if (
+      backendHealth.backendType === "GRAFANA_CLOUD" ||
+      backendHealth.backendType === "GENUINE_STACK" ||
+      effectiveMode === "DEGRADED"
+    ) {
+      return "PARTIAL_TELEMETRY";
+    }
+    return "UNAVAILABLE";
+  }
+  if (!params.hasSimulationScenario && params.requestedMode !== "SIMULATION") {
+    return params.backendHealth.backendType === "MOCK_EMULATION" ? "MOCK" : "UNAVAILABLE";
+  }
+  return "SIMULATED";
+}
+
+export function parsePersistedProvenance(raw: string): TelemetryProvenance {
+  if (
+    raw === "LIVE_TELEMETRY" ||
+    raw === "PARTIAL_TELEMETRY" ||
+    raw === "UNAVAILABLE" ||
+    raw === "SIMULATED" ||
+    raw === "MOCK"
+  ) {
+    return raw;
+  }
+  if (raw === "REAL" || raw === "LIVE") return "LIVE_TELEMETRY";
+  return "SIMULATED";
+}
+
 /**
  * Investigates an existing incident end-to-end.
  * Gathers telemetry, dependencies, deterministic engine candidates,
@@ -70,13 +124,16 @@ export async function investigateIncident(
   }
 
   // 4. Determine Provenance truthfully
-  let provenance: TelemetryProvenance = "SIMULATED";
-  if (isLiveScenario) {
-    const health = await telemetryManager.getBackendHealth();
-    provenance = health.backendType === "MOCK_EMULATION" ? "MOCK" : "LIVE_TELEMETRY";
-  } else if (!incident.simulationScenario) {
-    provenance = "MOCK";
-  }
+  const requestedMode = telemetryManager.getRequestedMode();
+  const effectiveMode = telemetryManager.getEffectiveMode();
+  const health = await telemetryManager.getBackendHealth();
+  const provenance: TelemetryProvenance = determineTelemetryProvenance({
+    isLiveScenario,
+    requestedMode,
+    effectiveMode,
+    hasSimulationScenario: Boolean(incident.simulationScenario),
+    backendHealth: health,
+  });
 
   // 5. Gather service topology
   const services = await prisma.service.findMany({
@@ -362,7 +419,7 @@ function parsePersistedInvestigation(
     remediationOptions,
     missingEvidence,
     nextObservations,
-    provenance: record.provenance as TelemetryProvenance,
+    provenance: parsePersistedProvenance(record.provenance),
     groundingValidation: {
       totalEvidenceCitations: totalCitations,
       validEvidenceCitations: validCitations,

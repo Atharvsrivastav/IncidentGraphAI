@@ -36,6 +36,7 @@ export function Navigation() {
   const [canReset, setCanReset] = useState<boolean>(false);
   const [requestedMode, setRequestedMode] = useState<TelemetryUIMode>("SIMULATION");
   const [effectiveMode, setEffectiveMode] = useState<TelemetryUIMode>("SIMULATION");
+  const [backendType, setBackendType] = useState<string>("SIMULATION");
   const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
 
   const fetchStatus = useCallback(async () => {
@@ -63,6 +64,9 @@ export function Navigation() {
         const req = normalizeTelemetryMode(modeData.requestedMode ?? modeData.mode);
         setEffectiveMode(eff);
         setRequestedMode(req);
+        if (modeData.health?.backendType) {
+          setBackendType(modeData.health.backendType);
+        }
       }
     } catch {
       // Ignored in background polling
@@ -160,6 +164,11 @@ export function Navigation() {
                     const data = await res.json();
                     setEffectiveMode(normalizeTelemetryMode(data.effectiveMode ?? data.mode));
                     setRequestedMode("SIMULATION");
+                    if (data.health?.backendType) {
+                      setBackendType(data.health.backendType);
+                    } else {
+                      setBackendType("SIMULATION");
+                    }
                   }
                 } catch {
                   // Keep current state on error; never fabricate mode
@@ -189,6 +198,9 @@ export function Navigation() {
                     const data = await res.json();
                     setEffectiveMode(normalizeTelemetryMode(data.effectiveMode ?? data.mode));
                     setRequestedMode("LIVE");
+                    if (data.health?.backendType) {
+                      setBackendType(data.health.backendType);
+                    }
                   } else {
                     // Under NO circumstance does a failed request set status to LIVE!
                     console.error("Failed to switch telemetry mode to LIVE");
@@ -204,19 +216,27 @@ export function Navigation() {
               className={`rounded px-2 py-1 text-[10px] font-semibold transition-colors ${
                 isSwitchingMode
                   ? "bg-slate-800 text-slate-300 font-bold shadow-sm animate-pulse"
+                  : requestedMode === "LIVE" && (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE")
+                  ? "bg-amber-600 text-white font-bold shadow-sm"
+                  : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                  ? "bg-purple-600 text-white font-bold shadow-sm"
+                  : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                  ? "bg-sky-600 text-white font-bold shadow-sm"
                   : requestedMode === "LIVE" && effectiveMode === "LIVE"
                   ? "bg-emerald-600 text-white font-bold shadow-sm"
-                  : requestedMode === "LIVE" && effectiveMode === "DEGRADED"
-                  ? "bg-amber-600 text-white font-bold shadow-sm"
                   : "text-slate-400 hover:text-slate-200"
               }`}
             >
               {isSwitchingMode
                 ? "Connecting..."
+                : requestedMode === "LIVE" && (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE")
+                ? "OTel (Degraded)"
+                : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                ? "Mock Emulation"
+                : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                ? "Grafana Cloud (Connected)"
                 : requestedMode === "LIVE" && effectiveMode === "LIVE"
                 ? "Live OTel (Connected)"
-                : requestedMode === "LIVE" && effectiveMode === "DEGRADED"
-                ? "OTel (Degraded)"
                 : "Live OTel"}
             </button>
           </div>
@@ -227,16 +247,30 @@ export function Navigation() {
               className={`h-2 w-2 rounded-full ${
                 systemStatus === "INCIDENT"
                   ? "bg-red-500 animate-pulse"
-                  : effectiveMode === "DEGRADED"
+                  : effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
                   ? "bg-amber-500 animate-pulse"
+                  : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                  ? "bg-purple-400"
+                  : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                  ? "bg-sky-400"
+                  : requestedMode === "SIMULATION"
+                  ? "bg-blue-400"
                   : "bg-emerald-500"
               }`}
             />
             <span className="font-medium text-slate-300">
               {systemStatus === "INCIDENT"
                 ? `Active Incident (${activeScenario ?? (requestedMode === "SIMULATION" ? "Simulated" : "Live")})`
-                : effectiveMode === "DEGRADED"
+                : effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
                 ? "Telemetry Pipeline Degraded"
+                : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                ? "Mock Telemetry Emulation"
+                : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                ? "Grafana Cloud Telemetry"
+                : requestedMode === "LIVE" && backendType === "GENUINE_STACK"
+                ? "Genuine Local Telemetry"
+                : requestedMode === "SIMULATION"
+                ? "Simulation Mode"
                 : "All Systems Operational"}
             </span>
             {currentStep > 0 && requestedMode === "SIMULATION" && (
