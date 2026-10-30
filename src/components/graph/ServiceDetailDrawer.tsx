@@ -96,7 +96,10 @@ export function ServiceDetailDrawer({
     service.requestRate !== undefined;
 
   return (
-    <div className="absolute top-0 right-0 z-30 h-full w-full max-w-md border-l border-slate-800 bg-slate-900/95 p-6 shadow-2xl backdrop-blur-xl overflow-y-auto animate-in slide-in-from-right duration-200">
+    <div
+      data-testid="service-detail-drawer"
+      className="absolute top-0 right-0 z-30 h-full w-full max-w-md border-l border-slate-800 bg-slate-900/95 p-6 shadow-2xl backdrop-blur-xl overflow-y-auto animate-in slide-in-from-right duration-200"
+    >
       {/* Drawer Header */}
       <div className="flex items-start justify-between pb-4 border-b border-slate-800">
         <div>
@@ -115,6 +118,7 @@ export function ServiceDetailDrawer({
         </div>
         <button
           onClick={onClose}
+          data-testid="close-service-detail-btn"
           className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white transition-colors"
         >
           <X className="h-5 w-5" />

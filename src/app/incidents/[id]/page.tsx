@@ -161,6 +161,7 @@ function IncidentDetailContent({
             <button
               onClick={handleReanalyze}
               disabled={analyzing}
+              data-testid="reanalyze-button"
               className="flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all disabled:opacity-50"
             >
               <RefreshCw className={`h-4 w-4 ${analyzing ? "animate-spin" : ""}`} />
@@ -197,6 +198,7 @@ function IncidentDetailContent({
         </button>
         <button
           onClick={() => setActiveTab("evidence")}
+          data-testid="evidence-timeline-tab"
           className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
             activeTab === "evidence"
               ? "border-blue-500 text-blue-400 font-bold"
@@ -353,7 +355,10 @@ function IncidentDetailContent({
 
       {/* Tab 2: Evidence Timeline */}
       {activeTab === "evidence" && (
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 backdrop-blur-md">
+        <div
+          data-testid="evidence-timeline-panel"
+          className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 backdrop-blur-md"
+        >
           {evidences.length === 0 ? (
             <div className="py-8 text-center text-xs text-slate-400 italic">
               No evidence recorded yet.

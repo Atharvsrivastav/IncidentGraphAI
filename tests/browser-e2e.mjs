@@ -69,17 +69,35 @@ async function captureScreenshot(page, filename) {
 }
 
 async function verifyServerAvailable(url) {
+  let res;
   try {
-    const res = await fetch(`${url}/api/health`);
-    if (!res.ok) {
-      console.warn(`  [Warning] Health endpoint returned status ${res.status}`);
-    }
-    return true;
+    res = await fetch(`${url}/api/health`);
   } catch (err) {
+    throw new Error(`[Server Health Check Failed] Cannot connect to server at ${url}/api/health: ${err.message}`);
+  }
+
+  if (!res.ok) {
+    const errorBody = await res.text().catch(() => '');
     throw new Error(
-      `Cannot connect to Next.js server at ${url}. Ensure the server is running (e.g. 'npm run dev' or 'npm run build && npm start') before running browser tests. Error: ${err.message}`
+      `[Server Health Check Failed] /api/health returned HTTP ${res.status} ${res.statusText}. Body: ${errorBody.slice(0, 300)}`
     );
   }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    throw new Error(`[Server Health Check Failed] /api/health did not return valid JSON: ${err.message}`);
+  }
+
+  if (data.status !== 'healthy') {
+    throw new Error(`[Server Health Check Failed] Server reported non-healthy status: ${JSON.stringify(data)}`);
+  }
+
+  console.log(
+    `  [Health Check Passed] Server is healthy: status=${data.status}, db=${data.database?.status}, services=${data.database?.servicesCount}`
+  );
+  return data;
 }
 
 async function runBrowserSuite() {
@@ -89,11 +107,12 @@ async function runBrowserSuite() {
   console.log(`Browser Executable: ${CHROME_PATH}`);
   console.log(`Target URL: ${BASE_URL}`);
 
-  await verifyServerAvailable(BASE_URL);
+  const serverHealth = await verifyServerAvailable(BASE_URL);
 
   const browser = await chromium.launch({
     executablePath: CHROME_PATH,
     headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   });
 
   const context = await browser.newContext({
@@ -102,9 +121,11 @@ async function runBrowserSuite() {
 
   const page = await context.newPage();
 
+  // Centralized Error & Failure Tracking
   const consoleErrors = [];
   const pageErrors = [];
   const networkFailures = [];
+  const httpErrors = [];
   const sectionResults = [];
 
   let assertionsPassed = 0;
@@ -118,22 +139,53 @@ async function runBrowserSuite() {
     assertionsPassed++;
   }
 
+  // Narrow, documented allowlist for genuinely expected failures
+  const ALLOWLISTED_PATTERNS = [
+    // Standard browser automatic probe for favicon when not explicitly declared
+    (entry) => entry.url?.includes('favicon.ico') && entry.status === 404,
+  ];
+
+  function isAllowlisted(entry) {
+    return ALLOWLISTED_PATTERNS.some((fn) => fn(entry));
+  }
+
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
       const text = msg.text();
-      // Ignore innocuous asset 404s like favicon
       if (!text.includes('favicon.ico')) {
-        consoleErrors.push(`[Console Error]: ${text}`);
+        consoleErrors.push({ text, location: msg.location() });
       }
     }
   });
 
   page.on('pageerror', (err) => {
-    pageErrors.push(`[Page Error]: ${err.message}`);
+    pageErrors.push({ message: err.message, stack: err.stack });
   });
 
   page.on('requestfailed', (req) => {
-    networkFailures.push(`[Network Failure]: ${req.method()} ${req.url()} (${req.failure()?.errorText})`);
+    const entry = {
+      method: req.method(),
+      url: req.url(),
+      errorText: req.failure()?.errorText || 'Unknown failure',
+    };
+    if (!entry.url.includes('favicon.ico')) {
+      networkFailures.push(entry);
+    }
+  });
+
+  page.on('response', (res) => {
+    const status = res.status();
+    if (status >= 400) {
+      const entry = {
+        method: res.request().method(),
+        url: res.url(),
+        status,
+        statusText: res.statusText(),
+      };
+      if (!isAllowlisted(entry)) {
+        httpErrors.push(entry);
+      }
+    }
   });
 
   let createdIncidentId = null;
@@ -149,12 +201,22 @@ async function runBrowserSuite() {
       console.log(`  Page Title: "${pageTitle}"`);
       assert(pageTitle.includes('IncidentGraph'), `Expected page title to contain "IncidentGraph", got "${pageTitle}"`);
 
-      // Check main branding and KPI counters
+      // Check main branding header is visible
       await page.waitForSelector('text=IncidentGraph AI', { timeout: 8000 });
       assert(await page.locator('text=IncidentGraph AI').first().isVisible(), 'Branding header "IncidentGraph AI" must be visible');
 
-      const quickActions = await page.$('text=Quick Actions');
-      console.log(`  Dashboard Quick Actions: ${quickActions ? 'Present' : 'Not found'}`);
+      // Check top navigation links exist and are visible
+      const navServiceMap = page.locator('header a[href="/service-map"], nav a[href="/service-map"]').first();
+      await navServiceMap.waitFor({ state: 'visible', timeout: 5000 });
+      assert(await navServiceMap.isVisible(), 'Header link to /service-map must be visible');
+
+      const navSimulator = page.locator('header a[href="/simulator"], nav a[href="/simulator"]').first();
+      await navSimulator.waitFor({ state: 'visible', timeout: 5000 });
+      assert(await navSimulator.isVisible(), 'Header link to /simulator must be visible');
+
+      const navIncidents = page.locator('header a[href="/incidents"], nav a[href="/incidents"]').first();
+      await navIncidents.waitFor({ state: 'visible', timeout: 5000 });
+      assert(await navIncidents.isVisible(), 'Header link to /incidents must be visible');
 
       await captureScreenshot(page, '01_dashboard_desktop.png');
       sectionResults.push({ name: '1. Overview Dashboard', status: 'passed' });
@@ -177,23 +239,35 @@ async function runBrowserSuite() {
 
       // Test search filter input
       const searchBox = page.locator('input[placeholder*="Search"]');
-      if (await searchBox.isVisible()) {
-        await searchBox.fill('postgres');
-        await page.waitForTimeout(400);
-        console.log('  Search filter filled with "postgres"');
-        await searchBox.fill('');
-        await page.waitForTimeout(300);
-        assert(true, 'Search filter interaction succeeded');
-      }
+      await searchBox.waitFor({ state: 'visible', timeout: 6000 });
+      assert(await searchBox.isVisible(), 'Search input in service-map must be visible');
+      await searchBox.fill('postgres');
+      await page.waitForTimeout(400);
+      console.log('  Search filter filled with "postgres"');
+      await searchBox.fill('');
+      await page.waitForTimeout(300);
 
-      // Click on a node in the graph
-      const postgresNode = page.locator('text=postgres-db').first();
-      if (await postgresNode.isVisible()) {
-        await postgresNode.click();
-        await page.waitForTimeout(500);
-        console.log('  Clicked topology node "postgres-db"');
-        assert(true, 'Clicked topology node "postgres-db"');
-      }
+      // Require PostgreSQL node to exist in deterministic test environment
+      const postgresNode = page.locator('[data-testid="service-node-postgres-db"]').first();
+      await postgresNode.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await postgresNode.isVisible(), 'Service node "postgres-db" must be visible in deterministic test environment');
+
+      // Click node and assert detail drawer opens
+      await postgresNode.click();
+      console.log('  Clicked topology node "postgres-db"');
+
+      const drawer = page.locator('[data-testid="service-detail-drawer"]');
+      await drawer.waitFor({ state: 'visible', timeout: 6000 });
+      assert(await drawer.isVisible(), 'Clicking service node must open service detail drawer');
+      assert(await drawer.locator('h3:has-text("PostgreSQL")').isVisible(), 'Drawer must display PostgreSQL service name');
+      assert(await drawer.locator('text=Observed Telemetry').first().isVisible(), 'Drawer must display Observed Telemetry section');
+
+      // Close drawer and assert it closes
+      const closeDrawerBtn = page.locator('[data-testid="close-service-detail-btn"]');
+      await closeDrawerBtn.click();
+      await page.waitForTimeout(400);
+      assert(!(await drawer.isVisible()), 'Service detail drawer must close after clicking close button');
+      console.log('  Service detail drawer opened and verified successfully');
 
       await captureScreenshot(page, '02_servicemap_desktop.png');
       sectionResults.push({ name: '2. Service Map & Topology', status: 'passed' });
@@ -237,6 +311,7 @@ async function runBrowserSuite() {
       const injectBtn = page.locator('button:has-text("Inject Selected Scenario")');
       await injectBtn.waitFor({ state: 'visible', timeout: 8000 });
       assert(await injectBtn.isVisible(), 'Inject button must be visible');
+      assert(!(await injectBtn.isDisabled()), 'Inject button must be enabled');
 
       const [injectResponse] = await Promise.all([
         page.waitForResponse(
@@ -258,25 +333,30 @@ async function runBrowserSuite() {
 
       // Verify Active Simulation Banner appears at Step 1
       await page.waitForSelector('text=Active Simulation: Step 1', { timeout: 8000 });
-      assert(await page.locator('text=Active Simulation: Step 1').isVisible(), 'Active simulation Step 1 banner must be visible');
+      assert(await page.locator('text=Active Simulation: Step 1').first().isVisible(), 'Active simulation Step 1 banner must be visible');
       console.log('  Verified Active Simulation status banner: Step 1');
 
-      // Click "Advance Step" button
+      // Require Advance Step button to exist, be visible, and be enabled
       const advanceBtn = page.locator('button:has-text("Advance Step")');
-      if (await advanceBtn.isVisible() && !(await advanceBtn.isDisabled())) {
-        const [advanceResponse] = await Promise.all([
-          page.waitForResponse(
-            (res) => res.url().includes('/api/simulations/advance') && res.request().method() === 'POST',
-            { timeout: 10000 }
-          ),
-          advanceBtn.click(),
-        ]);
-        assert(advanceResponse.ok(), `Advance step response must be OK (status ${advanceResponse.status()})`);
-        console.log('  Clicked "Advance Step" button');
-        await page.waitForSelector('text=Active Simulation: Step 2', { timeout: 8000 });
-        assert(await page.locator('text=Active Simulation: Step 2').isVisible(), 'Active simulation Step 2 banner must be visible');
-        console.log('  Verified Active Simulation status banner: Step 2');
-      }
+      await advanceBtn.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await advanceBtn.isVisible(), 'Advance Step button must be visible after scenario injection');
+      assert(!(await advanceBtn.isDisabled()), 'Advance Step button must be enabled after scenario injection');
+
+      const [advanceResponse] = await Promise.all([
+        page.waitForResponse(
+          (res) => res.url().includes('/api/simulations/advance') && res.request().method() === 'POST',
+          { timeout: 10000 }
+        ),
+        advanceBtn.click(),
+      ]);
+      assert(advanceResponse.ok(), `Advance step response must be OK (status ${advanceResponse.status()})`);
+      const advanceData = await advanceResponse.json();
+      assert(advanceData.step === 2, `Advance step response must indicate step 2, got: ${advanceData.step}`);
+      console.log('  Clicked "Advance Step" button and verified API step 2 response');
+
+      await page.waitForSelector('text=Active Simulation: Step 2', { timeout: 8000 });
+      assert(await page.locator('text=Active Simulation: Step 2').first().isVisible(), 'Active simulation Step 2 banner must be visible');
+      console.log('  Verified Active Simulation status banner: Step 2');
 
       await captureScreenshot(page, '03_simulator_injected_desktop.png');
       sectionResults.push({ name: '3. Failure Simulator Injection', status: 'passed' });
@@ -294,9 +374,9 @@ async function runBrowserSuite() {
 
       // Verify incident rows are displayed in the table
       await page.waitForSelector('table tbody tr', { timeout: 8000 });
-      const rowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
-      console.log(`  Incidents table row count: ${rowCount}`);
-      assert(rowCount > 0, `Incidents table must have at least 1 row, found ${rowCount}`);
+      const initialRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
+      console.log(`  Initial incidents table row count: ${initialRowCount}`);
+      assert(initialRowCount > 0, `Incidents table must have at least 1 row, found ${initialRowCount}`);
 
       // Verify the exact created incident link is present in the table
       assert(createdIncidentId !== null, 'createdIncidentId must exist before checking incidents table');
@@ -305,26 +385,35 @@ async function runBrowserSuite() {
       assert(await page.locator(exactLinkSelector).first().isVisible(), `Link for exact incident /incidents/${createdIncidentId} must be visible`);
       console.log(`  Verified exact incident link in table: /incidents/${createdIncidentId}`);
 
-      // Click status filter "IDENTIFIED"
-      const identifiedBtn = await page.$('button:text-is("IDENTIFIED")');
-      if (identifiedBtn) {
-        await identifiedBtn.click();
-        await page.waitForTimeout(300);
-        console.log('  Clicked status filter: "IDENTIFIED"');
-        assert(true, 'Filtered by status IDENTIFIED');
-      }
+      // Require status filter button IDENTIFIED to exist and be visible
+      const identifiedBtn = page.locator('button:text-is("IDENTIFIED")');
+      await identifiedBtn.waitFor({ state: 'visible', timeout: 5000 });
+      assert(await identifiedBtn.isVisible(), 'Status filter button "IDENTIFIED" must be visible');
+      await identifiedBtn.click();
+      await page.waitForTimeout(400);
 
-      // Reset filters via ALL buttons
-      const allButtons = await page.$$('button:text-is("ALL")');
-      for (const btn of allButtons) {
-        await btn.click();
-        await page.waitForTimeout(100);
-      }
-      console.log('  Reset filters via ALL pills');
+      // Verify the actual filtering result: every visible row must have status IDENTIFIED
+      const filteredRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
+      assert(filteredRowCount > 0, `Filtered table should contain at least 1 IDENTIFIED incident, found ${filteredRowCount}`);
+      assert(filteredRowCount <= initialRowCount, `Filtered row count (${filteredRowCount}) must be <= initial count (${initialRowCount})`);
 
-      // Re-confirm exact incident link after filter reset
-      await page.waitForSelector(exactLinkSelector, { timeout: 6000 });
+      const statuses = await page.$$eval('table tbody tr', (rows) =>
+        rows.map((r) => r.querySelector('td:nth-child(3)')?.textContent?.trim() || '')
+      );
+      for (const st of statuses) {
+        assert(st.includes('IDENTIFIED'), `Every visible filtered row must have status IDENTIFIED, got "${st}"`);
+      }
+      console.log(`  Verified IDENTIFIED filter applied correctly (${filteredRowCount} rows match)`);
+
+      // Restore ALL filter and verify initial incident row count returns
+      const allBtn = page.locator('button:text-is("ALL")').last();
+      await allBtn.click();
+      await page.waitForTimeout(300);
+
+      const restoredRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
+      assert(restoredRowCount === initialRowCount, `Restoring ALL should recover initial row count (${initialRowCount}), got ${restoredRowCount}`);
       assert(await page.locator(exactLinkSelector).first().isVisible(), 'Exact incident link confirmed after filter reset');
+      console.log('  Reset filters via ALL pill; verified exact incident link present');
 
       await captureScreenshot(page, '04_incidents_list_desktop.png');
       sectionResults.push({ name: '4. Incidents List & Filtering', status: 'passed' });
@@ -384,34 +473,56 @@ async function runBrowserSuite() {
       assert(candidateCard !== null, 'Root cause candidate card must be rendered in investigation tab');
       console.log('  Verified Ranked Root Causes candidate card rendered');
 
-      // Click "Evidence Timeline" tab
-      const evidenceTabBtn = page.locator('button:has-text("Evidence Timeline")');
-      if (await evidenceTabBtn.isVisible()) {
-        await evidenceTabBtn.click();
-        await page.waitForTimeout(500);
-        console.log('  Switched to "Evidence Timeline" tab');
-        assert(true, 'Switched to Evidence Timeline tab');
-      }
+      // Require Evidence Timeline tab and verify content appears after selection
+      const evidenceTabBtn = page.locator('[data-testid="evidence-timeline-tab"]').first();
+      await evidenceTabBtn.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await evidenceTabBtn.isVisible(), 'Evidence Timeline tab must exist');
+      await evidenceTabBtn.click();
+      await page.waitForTimeout(400);
 
-      // Click "Re-Run DSA Root-Cause Engine" button if visible, asserting POST API response
-      const reanalyzeBtn = page.locator('button:has-text("Re-Run DSA Root-Cause Engine")');
-      if (await reanalyzeBtn.isVisible()) {
-        const [reanalyzeResponse] = await Promise.all([
-          page.waitForResponse(
-            (res) => res.url().includes(`/api/incidents/${createdIncidentId}/analyze`) && res.request().method() === 'POST',
-            { timeout: 10000 }
-          ),
-          reanalyzeBtn.click(),
-        ]);
-        assert(reanalyzeResponse.ok(), `Re-Run DSA Root-Cause Engine POST returned status ${reanalyzeResponse.status()}`);
-        const analyzeData = await reanalyzeResponse.json();
-        assert(analyzeData !== null, 'Re-analysis API returned JSON response');
-        console.log('  Re-Run DSA Root-Cause Engine POST request succeeded');
+      const evidencePanel = page.locator('[data-testid="evidence-timeline-panel"]').first();
+      await evidencePanel.waitFor({ state: 'visible', timeout: 6000 });
+      assert(await evidencePanel.isVisible(), 'Evidence Timeline content panel must appear after clicking Evidence Timeline tab');
+      console.log('  Evidence Timeline tab selected and content panel verified');
 
-        // Verify resulting incident data or visible confirmation after the request
-        await page.waitForTimeout(600);
-        assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), 'Incident header remains confirmed after re-analysis');
-      }
+      // Require Re-Run DSA Root-Cause Engine action
+      const reanalyzeBtn = page.locator('[data-testid="reanalyze-button"]').first();
+      await reanalyzeBtn.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await reanalyzeBtn.isVisible(), 'Re-Run DSA Root-Cause Engine button must be visible');
+
+      const [reanalyzeResponse] = await Promise.all([
+        page.waitForResponse(
+          (res) => res.url().includes(`/api/incidents/${createdIncidentId}/analyze`) && res.request().method() === 'POST',
+          { timeout: 10000 }
+        ),
+        reanalyzeBtn.click(),
+      ]);
+      assert(reanalyzeResponse.ok(), `Re-Run DSA Root-Cause Engine POST returned status ${reanalyzeResponse.status()}`);
+      const analyzeData = await reanalyzeResponse.json();
+
+      // Validate rigorous response schema from analysis API
+      assert(analyzeData && analyzeData.success === true, 'Analysis API response must have success: true');
+      assert(typeof analyzeData.analysis === 'object' && analyzeData.analysis !== null, 'Analysis API response must include analysis object');
+      assert(
+        Array.isArray(analyzeData.analysis.allCandidates) && analyzeData.analysis.allCandidates.length > 0,
+        'Analysis API response must include non-empty allCandidates array'
+      );
+      const topCand = analyzeData.analysis.allCandidates[0];
+      assert(typeof topCand.serviceId === 'string', 'Analysis candidate must contain valid serviceId');
+      assert(typeof topCand.score === 'number', 'Analysis candidate must contain numeric score');
+      assert(typeof topCand.confidence === 'string', 'Analysis candidate must contain confidence rating');
+      console.log(
+        `  Re-Run DSA Root-Cause Engine response validated: candidate=${topCand.serviceId}, score=${topCand.score}, confidence=${topCand.confidence}`
+      );
+
+      // Verify the resulting investigation data reflects the re-analysis operation in the UI
+      await rootCausesTabLocator.first().click();
+      await page.waitForTimeout(500);
+      assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), 'Incident header remains confirmed after re-analysis');
+      assert(
+        (await page.$('text=PostgreSQL')) !== null || (await page.$('text=postgres-db')) !== null,
+        'Root cause candidates remain rendered following re-analysis'
+      );
 
       await captureScreenshot(page, '05_incident_investigation_desktop.png');
       sectionResults.push({ name: '5. Incident Investigation Details', status: 'passed' });
@@ -433,7 +544,7 @@ async function runBrowserSuite() {
       await page.waitForSelector('text=Live Fleet Telemetry', { timeout: 8000 });
       assert(await page.locator('text=Live Fleet Telemetry').first().isVisible(), 'Live Fleet Telemetry section must be visible');
 
-      // Check for restore-eligible services
+      // Check for restore-eligible services (services with status DEGRADED or DOWN)
       await page.waitForTimeout(500);
       const restoreButtons = await page.$$('button:text-is("Restore")');
       let targetRestoreBtn = null;
@@ -475,10 +586,8 @@ async function runBrowserSuite() {
           console.log('  Clicked "Reset Baseline" button');
           await page.waitForTimeout(1000);
         } else {
-          console.log('  Reset Baseline button is disabled');
+          console.log('  Reset Baseline button is disabled in current state (safe)');
         }
-      } else {
-        console.log('  Reset Baseline button protected/hidden in current environment');
       }
 
       await captureScreenshot(page, '06_simulator_restored_desktop.png');
@@ -560,7 +669,6 @@ async function runBrowserSuite() {
           if (await cycleCheckbox.isVisible()) {
             await cycleCheckbox.click();
             await page.waitForTimeout(300);
-            assert(true, 'Toggled DFS test cycle checkbox');
             console.log('  Toggled synthetic test cycle checkbox in DFS tab');
           }
         }
@@ -574,7 +682,7 @@ async function runBrowserSuite() {
     }
 
     // ----------------------------------------------------
-    // TEST 8: Settings Page
+    // TEST 8: Settings Page & Safe Destructive Controls
     // ----------------------------------------------------
     console.log('\n--- 8. Testing Settings Page ---');
     try {
@@ -583,19 +691,22 @@ async function runBrowserSuite() {
       assert(await page.locator('h1:has-text("Settings & Diagnostics")').isVisible(), 'Settings page header must be visible');
       assert(await page.locator('text=System Administration').first().isVisible(), 'System Administration badge must be visible');
 
-      await page.waitForTimeout(500);
+      // Verify diagnostics cards are rendered
+      await page.waitForSelector('text=Database Layer', { timeout: 6000 });
+      assert(await page.locator('text=Database Layer').isVisible(), 'Database Layer diagnostic card must be visible');
 
-      const resetDbBtn = page.locator('button:has-text("Reset Database")');
-      if (await resetDbBtn.isVisible().catch(() => false)) {
-        if (!(await resetDbBtn.isDisabled().catch(() => true))) {
-          await resetDbBtn.click({ timeout: 3000 }).catch(() => null);
-          await page.waitForTimeout(600);
-          console.log('  Interacted with "Reset Database" button');
-          assert(true, 'Interacted with enabled Reset Database button');
-        } else {
-          console.log('  Reset Database button is protected or disabled in this environment (safe)');
-          assert(true, 'Reset Database button is safely protected/disabled');
-        }
+      // Verify safety protections on Reset Database control
+      const resetDbBtn = page.locator('[data-testid="reset-database-button"]');
+      await resetDbBtn.waitFor({ state: 'attached', timeout: 5000 });
+
+      if (serverHealth.environment === 'production') {
+        // In production, reset must be disabled and protected
+        assert(await resetDbBtn.isDisabled(), 'Reset Database button must be disabled in production environment');
+        const badge = page.locator('[data-testid="protected-in-production-badge"]');
+        assert(await badge.isVisible(), 'Protected in Production badge must be visible in production environment');
+        console.log('  Verified Reset Database control is safely protected and disabled in production');
+      } else {
+        console.log('  Reset Database control present in non-production environment');
       }
 
       await captureScreenshot(page, '08_settings_desktop.png');
@@ -650,49 +761,83 @@ async function runBrowserSuite() {
     await browser.close();
   }
 
-  console.log('\n================================================================');
-  console.log('                   BROWSER TEST REPORT SUMMARY                  ');
-  console.log('================================================================');
-
+  // ----------------------------------------------------
+  // FINAL RESULT ACCOUNTING & CLASSIFICATION
+  // ----------------------------------------------------
+  const totalSections = 9;
+  const executedSections = sectionResults.length;
   const passedSections = sectionResults.filter((r) => r.status === 'passed').length;
   const skippedSections = sectionResults.filter((r) => r.status === 'skipped').length;
   const failedSections = sectionResults.filter((r) => r.status === 'failed').length;
-  const totalSections = 9;
 
-  console.log(`Sections Executed:  ${sectionResults.length} / ${totalSections}`);
-  console.log(`Sections Passed:    ${passedSections}`);
-  console.log(`Sections Skipped:   ${skippedSections}`);
-  console.log(`Sections Failed:    ${failedSections}`);
-  console.log(`Assertions Passed:  ${assertionsPassed}`);
-  console.log(`Assertions Failed:  ${assertionsFailed}`);
+  const totalUnallowlistedErrors = consoleErrors.length + pageErrors.length + networkFailures.length + httpErrors.length;
 
+  let finalClassification = 'FAILED';
+  let exitCode = 1;
+
+  if (failedSections === 0 && assertionsFailed === 0 && totalUnallowlistedErrors === 0 && executedSections === totalSections) {
+    if (skippedSections === 0 && passedSections === totalSections) {
+      finalClassification = 'PASS';
+      exitCode = 0;
+    } else if (skippedSections > 0) {
+      finalClassification = 'PASS WITH SKIPS';
+      exitCode = 0;
+    }
+  }
+
+  console.log('\n================================================================');
+  console.log('                   BROWSER TEST REPORT SUMMARY                  ');
+  console.log('================================================================');
+  console.log(`Final Classification:   ${finalClassification}`);
+  console.log(`Sections Executed:      ${executedSections} / ${totalSections}`);
+  console.log(`Sections Passed:        ${passedSections}`);
+  console.log(`Sections Skipped:       ${skippedSections}`);
+  console.log(`Sections Failed:        ${failedSections}`);
+  console.log(`Assertions Passed:      ${assertionsPassed}`);
+  console.log(`Assertions Failed:      ${assertionsFailed}`);
+  console.log(`Browser Console Errors: ${consoleErrors.length}`);
+  console.log(`Page Errors:            ${pageErrors.length}`);
+  console.log(`Network Failures:       ${networkFailures.length}`);
+  console.log(`HTTP Error Responses:   ${httpErrors.length}`);
+  console.log(`Process Exit Code:      ${exitCode}`);
+
+  console.log('\nSection Details:');
   sectionResults.forEach((r) => {
     const symbol = r.status === 'passed' ? '✓' : r.status === 'skipped' ? '⊘' : '✗';
     const detail = r.error ? ` (Error: ${r.error})` : r.skipReason ? ` (Skipped: ${r.skipReason})` : '';
     console.log(`  ${symbol} [${r.status.toUpperCase()}] ${r.name}${detail}`);
   });
 
-  console.log(`\nBrowser Console Errors: ${consoleErrors.length}`);
-  consoleErrors.forEach((e) => console.log(`  ${e}`));
-
-  console.log(`Page Errors: ${pageErrors.length}`);
-  pageErrors.forEach((e) => console.log(`  ${e}`));
-
-  console.log(`Network Failures: ${networkFailures.length}`);
-  networkFailures.forEach((n) => console.log(`  ${n}`));
-
-  const allPassedOrSkipped = (passedSections + skippedSections === totalSections) && failedSections === 0 && assertionsFailed === 0;
-
-  if (allPassedOrSkipped) {
-    console.log(`\n>>> BROWSER SUITE OVERALL RESULT: 100% PASS (${passedSections} passed, ${skippedSections} skipped, 0 failed)`);
-    process.exit(0);
-  } else {
-    console.error(`\n>>> BROWSER SUITE OVERALL RESULT: FAILED (${failedSections} failed, ${assertionsFailed} failed assertions)`);
-    process.exit(1);
+  if (consoleErrors.length > 0) {
+    console.log('\n[Console Errors]:');
+    consoleErrors.forEach((e) => console.log(`  - ${e.text} (${e.location?.url}:${e.location?.lineNumber})`));
   }
+
+  if (pageErrors.length > 0) {
+    console.log('\n[Page Errors]:');
+    pageErrors.forEach((e) => console.log(`  - ${e.message}`));
+  }
+
+  if (networkFailures.length > 0) {
+    console.log('\n[Network Failures]:');
+    networkFailures.forEach((n) => console.log(`  - ${n.method} ${n.url} (${n.errorText})`));
+  }
+
+  if (httpErrors.length > 0) {
+    console.log('\n[HTTP Error Responses (>=400)]:');
+    httpErrors.forEach((h) => console.log(`  - ${h.method} ${h.url} -> ${h.status} ${h.statusText}`));
+  }
+
+  if (exitCode === 0) {
+    console.log(`\n>>> BROWSER SUITE OVERALL RESULT: ${finalClassification}`);
+  } else {
+    console.error(`\n>>> BROWSER SUITE OVERALL RESULT: ${finalClassification}`);
+  }
+
+  process.exit(exitCode);
 }
 
 runBrowserSuite().catch((err) => {
-  console.error('Test run failed:', err);
+  console.error('Fatal execution error:', err);
   process.exit(1);
 });

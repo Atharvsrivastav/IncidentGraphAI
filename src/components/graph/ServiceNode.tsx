@@ -91,6 +91,7 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
 
   return (
     <div
+      data-testid={`service-node-${nodeData.id}`}
       className={`relative min-w-[220px] rounded-xl border p-3 transition-all duration-200 backdrop-blur-md ${statusBg} ${statusBorder} ${selectionBorder} ${rootCauseRing}`}
     >
       {/* React Flow Connection Handles */}
