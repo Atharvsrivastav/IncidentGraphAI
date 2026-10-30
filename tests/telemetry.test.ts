@@ -91,14 +91,17 @@ describe("Phase 2: OpenTelemetry & Real Telemetry Pipeline Tests", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 5. Telemetry Mode Separation (SIMULATION vs REAL)
+  // 5. Telemetry Mode Separation (SIMULATION vs LIVE vs DEGRADED)
   // -------------------------------------------------------------------------
   it("strictly separates Simulation Mode and Real Telemetry Mode", () => {
     const manager = new TelemetryManager();
     expect(manager.getMode()).toBe("SIMULATION");
 
+    manager.setMode("LIVE");
+    expect(manager.getMode()).toBe("LIVE");
+
     manager.setMode("REAL");
-    expect(manager.getMode()).toBe("REAL");
+    expect(["REAL", "LIVE"]).toContain(manager.getMode());
 
     manager.setMode("SIMULATION");
     expect(manager.getMode()).toBe("SIMULATION");
@@ -109,11 +112,11 @@ describe("Phase 2: OpenTelemetry & Real Telemetry Pipeline Tests", () => {
   // -------------------------------------------------------------------------
   it("identifies unknown services reporting telemetry that are absent from configured topology", async () => {
     const manager = new TelemetryManager();
-    manager.setMode("REAL");
+    manager.setMode("LIVE");
 
-    // In real mode when offline, backends return empty / unknown without fabricating fake data
+    // In live mode when offline, backends truthfully report DEGRADED/UNKNOWN without fabricating fake data
     const overview = await manager.getObservedServices();
-    expect(overview.mode).toBe("REAL");
+    expect(["LIVE", "DEGRADED", "REAL"]).toContain(overview.mode);
     expect(overview.unknownServices).toBeDefined();
     for (const obs of overview.observedServices) {
       expect(obs.source).toBe("PROMETHEUS");

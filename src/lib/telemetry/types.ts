@@ -1,4 +1,4 @@
-export type TelemetryMode = "SIMULATION" | "REAL";
+export type TelemetryMode = "SIMULATION" | "LIVE" | "DEGRADED" | "REAL";
 
 export interface BackendHealthStatus {
   prometheusAvailable: boolean;
@@ -11,6 +11,7 @@ export interface BackendHealthStatus {
   backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE";
   details?: string;
   lastChecked: string;
+  lastIngestedAt?: string;
 }
 
 export interface ObservedServiceMetric {

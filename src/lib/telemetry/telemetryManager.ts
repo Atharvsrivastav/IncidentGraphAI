@@ -7,11 +7,16 @@ import {
   ObservedServiceMetric,
   DistributedTrace,
 } from "./types";
+import {
+  NormalizedTelemetryBatch,
+  ProviderDiagnostic,
+} from "./normalization";
 
 export class TelemetryManager {
   private static instance: TelemetryManager;
   private currentMode: TelemetryMode = "SIMULATION";
   private lastHealthCheck: BackendHealthStatus | null = null;
+  private lastIngestedAt: string | null = null;
 
   public static getInstance(): TelemetryManager {
     if (!TelemetryManager.instance) {
@@ -25,8 +30,15 @@ export class TelemetryManager {
   }
 
   public setMode(mode: TelemetryMode): void {
-    this.currentMode = mode;
-    console.log(`[TelemetryManager] Telemetry mode switched to: ${mode}`);
+    if (mode === "REAL") {
+      this.currentMode = "LIVE";
+    } else {
+      this.currentMode = mode;
+    }
+  }
+
+  public getLastIngestedAt(): string | null {
+    return this.lastIngestedAt;
   }
 
   public async getBackendHealth(): Promise<BackendHealthStatus> {
@@ -44,7 +56,7 @@ export class TelemetryManager {
     const isMock = Boolean(promHealth.isMock || jaegerHealth.isMock);
     const isCloud = Boolean(promHealth.isCloud || jaegerHealth.isCloud || cloudConfigured);
 
-    let backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" = "UNAVAILABLE";
+    let backendType: BackendHealthStatus["backendType"] = "UNAVAILABLE";
     if (isAvailable) {
       if (isCloud && !isMock) {
         backendType = "GRAFANA_CLOUD";
@@ -55,28 +67,7 @@ export class TelemetryManager {
       }
     }
 
-    let details = "";
-    if (cloudConfigured) {
-      if (promHealth.available && jaegerHealth.available) {
-        details = "Connected to Grafana Cloud hosted observability stack (Prometheus metrics & Tempo distributed traces over HTTPS).";
-      } else if (promHealth.available) {
-        details = "Grafana Cloud Prometheus metrics connected; Tempo trace backend pending or unreachable.";
-      } else if (jaegerHealth.available) {
-        details = "Grafana Cloud Tempo traces connected; Prometheus metrics backend pending or unreachable.";
-      } else {
-        details = promHealth.error || jaegerHealth.error || "Grafana Cloud configured but unreachable. Check API token and network connection.";
-      }
-    } else if (!promHealth.available && !jaegerHealth.available) {
-      details = "No telemetry backends are connected. Configure Grafana Cloud in .env or run local dev services.";
-    } else if (isMock) {
-      details = "Connected to local mock observability server (MOCK_EMULATION mode for dev/testing). NOT genuine Docker or Grafana Cloud.";
-    } else if (!promHealth.available) {
-      details = "Jaeger tracing backend is connected, but Prometheus metrics backend is unreachable.";
-    } else if (!jaegerHealth.available) {
-      details = "Prometheus metrics backend is connected, but Jaeger tracing backend is unreachable.";
-    } else {
-      details = "Connected to genuine local Prometheus and Jaeger observability stack.";
-    }
+    const details = this.formatHealthDetails(cloudConfigured, isMock, promHealth, jaegerHealth);
 
     const status: BackendHealthStatus = {
       prometheusAvailable: promHealth.available,
@@ -88,11 +79,33 @@ export class TelemetryManager {
       cloudConfigured,
       backendType,
       lastChecked: new Date().toISOString(),
+      lastIngestedAt: this.lastIngestedAt || undefined,
       details,
     };
 
     this.lastHealthCheck = status;
     return status;
+  }
+
+  private formatHealthDetails(
+    cloudConfigured: boolean,
+    isMock: boolean,
+    promHealth: { available: boolean; error?: string },
+    jaegerHealth: { available: boolean; error?: string }
+  ): string {
+    if (cloudConfigured) {
+      if (promHealth.available && jaegerHealth.available) {
+        return "Connected to Grafana Cloud hosted observability stack (Prometheus & Tempo).";
+      }
+      return promHealth.error || jaegerHealth.error || "Grafana Cloud configured but unreachable.";
+    }
+    if (!promHealth.available && !jaegerHealth.available) {
+      return "No telemetry backends are connected. Configure Grafana Cloud in .env or run local dev services.";
+    }
+    if (isMock) {
+      return "Connected to local mock observability server (MOCK_EMULATION).";
+    }
+    return "Connected to genuine local Prometheus and Jaeger observability stack.";
   }
 
   public async getObservedServices(): Promise<{
@@ -101,60 +114,18 @@ export class TelemetryManager {
     observedServices: ObservedServiceMetric[];
     unknownServices: ObservedServiceMetric[];
     lastCollectedAt: string;
+    lastIngestedAt: string | null;
   }> {
     const backendHealth = await this.getBackendHealth();
     const dbServices = await prisma.service.findMany();
-    const topologyIds = new Set(dbServices.map((s) => s.id));
 
-    // If in SIMULATION mode, return simulated states
     if (this.currentMode === "SIMULATION") {
-      const observed = dbServices.map((s) => ({
-        serviceId: s.id,
-        serviceName: s.name,
-        source: "SIMULATION" as const,
-        status: s.status as "HEALTHY" | "DEGRADED" | "DOWN",
-        latencyMs: s.currentLatency,
-        errorRate: s.currentErrorRate,
-        requestRate: s.requestRate,
-        lastObserved: s.updatedAt.toISOString(),
-        traceCount: 0,
-        isStale: false,
-        isKnownInTopology: true,
-      }));
-
-      return {
-        mode: "SIMULATION",
-        backendHealth,
-        observedServices: observed,
-        unknownServices: [],
-        lastCollectedAt: new Date().toISOString(),
-      };
+      return this.buildSimulatedObservedServices(dbServices, backendHealth);
     }
 
-    // In REAL mode: Query actual Prometheus metrics and Jaeger traces
+    // In LIVE / REAL mode:
     if (!backendHealth.prometheusAvailable && !backendHealth.jaegerAvailable) {
-      // Both backends unreachable: Mark as UNKNOWN without fabricating data
-      const unavailable = dbServices.map((s) => ({
-        serviceId: s.id,
-        serviceName: s.name,
-        source: "PROMETHEUS" as const,
-        status: "UNKNOWN" as const,
-        latencyMs: 0,
-        errorRate: 0,
-        requestRate: 0,
-        lastObserved: "N/A (Backends Offline)",
-        traceCount: 0,
-        isStale: true,
-        isKnownInTopology: true,
-      }));
-
-      return {
-        mode: "REAL",
-        backendHealth,
-        observedServices: unavailable,
-        unknownServices: [],
-        lastCollectedAt: new Date().toISOString(),
-      };
+      return this.buildDegradedOfflineObservedServices(dbServices, backendHealth);
     }
 
     const [promMetrics, recentTraces] = await Promise.all([
@@ -162,8 +133,82 @@ export class TelemetryManager {
       jaegerClient.getRecentTraces(undefined, 30),
     ]);
 
-    // Count traces per service
+    if (promMetrics.size > 0 || recentTraces.length > 0) {
+      this.lastIngestedAt = new Date().toISOString();
+    }
+
+    const effectiveMode: TelemetryMode =
+      backendHealth.prometheusAvailable && backendHealth.jaegerAvailable ? "LIVE" : "DEGRADED";
+
+    return this.buildLiveObservedServices(dbServices, backendHealth, effectiveMode, promMetrics, recentTraces);
+  }
+
+  private buildSimulatedObservedServices(
+    dbServices: Array<{ id: string; name: string; status: string; currentLatency: number; currentErrorRate: number; requestRate: number; updatedAt: Date }>,
+    backendHealth: BackendHealthStatus
+  ) {
+    const observed = dbServices.map((s) => ({
+      serviceId: s.id,
+      serviceName: s.name,
+      source: "SIMULATION" as const,
+      status: s.status as "HEALTHY" | "DEGRADED" | "DOWN",
+      latencyMs: s.currentLatency,
+      errorRate: s.currentErrorRate,
+      requestRate: s.requestRate,
+      lastObserved: s.updatedAt.toISOString(),
+      traceCount: 0,
+      isStale: false,
+      isKnownInTopology: true,
+    }));
+
+    return {
+      mode: "SIMULATION" as const,
+      backendHealth,
+      observedServices: observed,
+      unknownServices: [],
+      lastCollectedAt: new Date().toISOString(),
+      lastIngestedAt: this.lastIngestedAt,
+    };
+  }
+
+  private buildDegradedOfflineObservedServices(
+    dbServices: Array<{ id: string; name: string }>,
+    backendHealth: BackendHealthStatus
+  ) {
+    const unavailable = dbServices.map((s) => ({
+      serviceId: s.id,
+      serviceName: s.name,
+      source: "PROMETHEUS" as const,
+      status: "UNKNOWN" as const,
+      latencyMs: 0,
+      errorRate: 0,
+      requestRate: 0,
+      lastObserved: "N/A (Backends Offline)",
+      traceCount: 0,
+      isStale: true,
+      isKnownInTopology: true,
+    }));
+
+    return {
+      mode: "DEGRADED" as const,
+      backendHealth,
+      observedServices: unavailable,
+      unknownServices: [],
+      lastCollectedAt: new Date().toISOString(),
+      lastIngestedAt: this.lastIngestedAt,
+    };
+  }
+
+  private buildLiveObservedServices(
+    dbServices: Array<{ id: string; name: string; baselineLatency: number }>,
+    backendHealth: BackendHealthStatus,
+    effectiveMode: TelemetryMode,
+    promMetrics: Map<string, { latencyMs: number; errorRate: number; requestRate: number }>,
+    recentTraces: DistributedTrace[]
+  ) {
+    const topologyIds = new Set(dbServices.map((s) => s.id));
     const traceCountByService = new Map<string, number>();
+
     for (const trace of recentTraces) {
       for (const svc of trace.servicesInvolved) {
         traceCountByService.set(svc, (traceCountByService.get(svc) || 0) + 1);
@@ -173,13 +218,11 @@ export class TelemetryManager {
     const observedServices: ObservedServiceMetric[] = [];
     const unknownServices: ObservedServiceMetric[] = [];
 
-    // Map database topology services
     for (const svc of dbServices) {
       const metric = promMetrics.get(svc.id) || promMetrics.get(svc.name);
       const traceCount = traceCountByService.get(svc.id) || traceCountByService.get(svc.name) || 0;
 
       if (!metric && traceCount === 0) {
-        // No telemetry observed yet for this service
         observedServices.push({
           serviceId: svc.id,
           serviceName: svc.name,
@@ -200,7 +243,6 @@ export class TelemetryManager {
       const errorRate = metric?.errorRate ?? 0;
       const requestRate = metric?.requestRate ?? 0;
 
-      // Determine health status from real measurements
       let status: "HEALTHY" | "DEGRADED" | "DOWN" = "HEALTHY";
       if (errorRate > 25 || latency > svc.baselineLatency * 4) {
         status = "DOWN";
@@ -223,7 +265,6 @@ export class TelemetryManager {
       });
     }
 
-    // Identify unknown services reporting telemetry that are not in the database topology
     for (const [serviceName, metric] of promMetrics.entries()) {
       if (!topologyIds.has(serviceName)) {
         unknownServices.push({
@@ -243,11 +284,39 @@ export class TelemetryManager {
     }
 
     return {
-      mode: "REAL",
+      mode: effectiveMode,
       backendHealth,
       observedServices,
       unknownServices,
       lastCollectedAt: new Date().toISOString(),
+      lastIngestedAt: this.lastIngestedAt,
+    };
+  }
+
+  public async getNormalizedBatch(): Promise<NormalizedTelemetryBatch> {
+    const health = await this.getBackendHealth();
+    const batchId = `batch-${Date.now()}`;
+    const collectedAt = new Date().toISOString();
+
+    const [promResult, traceResult] = await Promise.all([
+      prometheusClient.queryInstantDetailed("http_request_duration_seconds", "LATENCY_AVG"),
+      jaegerClient.getRecentTracesDetailed(undefined, 25),
+    ]);
+
+    const diagnostics: ProviderDiagnostic[] = [promResult.diagnostic, traceResult.diagnostic];
+
+    let mode: "SIMULATION" | "LIVE" | "DEGRADED" = "SIMULATION";
+    if (this.currentMode === "LIVE" || this.currentMode === "REAL") {
+      mode = health.prometheusAvailable && health.jaegerAvailable ? "LIVE" : "DEGRADED";
+    }
+
+    return {
+      batchId,
+      collectedAt,
+      mode,
+      metrics: promResult.records,
+      spans: traceResult.normalizedSpans,
+      diagnostics,
     };
   }
 

@@ -1,14 +1,14 @@
-# IncidentGraph AI — Real Telemetry Architecture (Phase 2)
+# IncidentGraph AI — Real Telemetry Architecture & Multi-Service RCA
 
-## 1. Executive Summary & Architecture Overview
+## 1. Executive Summary & Telemetry Pipeline
 
-Phase 2 introduces an end-to-end real telemetry pipeline to IncidentGraph AI with support for both **self-hosted local stacks** and **cloud-hosted Grafana Cloud backends** designed for restricted zero-admin environments.
+IncidentGraph AI incorporates a production-minded, read-only telemetry ingestion pipeline capable of consuming actual telemetry from Prometheus/Mimir and Grafana Tempo backends, normalizing disparate schemas into a validated unified structure, connecting evidence to the service dependency graph, and deriving explainable root-cause rankings.
 
-### Complete Architecture Pipeline (Dual-Mode Support)
+### End-to-End Ingestion & RCA Pipeline
 
 ```text
                +-------------------------------------------------------------+
-               |               Sample Microservices System                   |
+               |               Sample Microservices Ecosystem                |
                |                                                             |
                |  +-------------+     W3C TraceContext     +--------------+  |
                |  | API Gateway | -----------------------> | Order Svc    |  |
@@ -26,200 +26,196 @@ Phase 2 introduces an end-to-end real telemetry pipeline to IncidentGraph AI wit
                           v                                       v
                +----------------------+                +----------------------+
                |    Grafana Cloud     |                |     OTel Collector   |
-               |  (Restricted Hosts)  |                |    (Local / Docker)  |
-               |  - OTLP Gateway      |                |  - Ports 4318 / 4317 |
-               |  - Hosted Mimir      |                |  - Prometheus Scrape |
-               |  - Hosted Tempo      |                |  - Jaeger gRPC       |
+               |  - Hosted Mimir      |                |    (Local / Docker)  |
+               |  - Hosted Tempo      |                |  - Prometheus Scrape |
+               |  - OTLP Gateway      |                |  - Jaeger gRPC       |
                +----------+-----------+                +----------+-----------+
                           |                                       |
                           +-------------------+-------------------+
                                               |
                                               v
                +-------------------------------------------------------------+
-               |                      IncidentGraph AI                       |
+               |             IncidentGraph AI Ingestion Pipeline             |
                |                                                             |
-               |  Telemetry Provider Interface:                              |
-               |  - PrometheusClient (Grafana Cloud Mimir / Local PromQL)    |
-               |  - JaegerClient (Grafana Cloud Tempo / Local Jaeger API)    |
-               |  - TelemetryManager (SIMULATION vs REAL mode toggle)        |
+               |  Provider Adapters (Read-Only):                             |
+               |  - PrometheusClient (Instant & range PromQL, timeout-bound) |
+               |  - JaegerClient (Tempo v1/v2 OTLP & search, span tree)      |
                |                                                             |
-               |  Detection & Root-Cause Pipeline:                           |
-               |  - RuleDetector (Latency breach, error rates, cooldowns)    |
-               |  - RealRootCauseEngine (Topology BFS + span bottlenecks)    |
+               |  Normalization Layer (Strict Zod Validation):               |
+               |  - NormalizedMetricRecord (service, metricType, timestamp)  |
+               |  - NormalizedTraceSpan (traceId, spanId, parent, depth)     |
+               |  - NormalizedTelemetryBatch (metrics, spans, diagnostics)   |
                |                                                             |
-               |  Operator Presentation Layer:                               |
-               |  - Real-time Service Map with freshness & cloud badge       |
-               |  - Trace Investigation Waterfall (/traces & /traces/:id)    |
-               |  - Evidence-backed Incident Detail view                     |
+               |  Telemetry Mode Routing (TelemetryManager):                 |
+               |  - SIMULATION: Replayed / generated demonstration data      |
+               |  - LIVE: Successfully retrieved telemetry from backends     |
+               |  - DEGRADED: Configured backends unreachable / partial      |
+               |                                                             |
+               |  Multi-Service Root Cause Engine:                           |
+               |  - DirectedGraph (topological traversal, reverse edges)     |
+               |  - SlidingWindowAnalyzer (temporal anomaly precedence)      |
+               |  - Trace Evidence Correlator (leaf span error & duration)   |
+               |  - PriorityQueue ranking & blast radius BFS calculation     |
                +-------------------------------------------------------------+
 ```
 
 ---
 
-## 2. Sample Microservices Mesh
+## 2. Ingestion Providers & Read-Only Connectivity
 
-The sample microservices system runs independently from the IncidentGraph control plane and models an e-commerce order fulfillment platform.
+### A. Prometheus / Grafana Cloud Metrics Adapter (`PrometheusClient`)
+- **Supported Backends:** Local Prometheus, Docker Compose stack, Grafana Cloud hosted Mimir.
+- **Capabilities:**
+  - Time-bounded queries with configurable timeout (`TELEMETRY_QUERY_TIMEOUT_MS`, default 4000ms).
+  - Retrieves service metrics: Request Rate (`http_requests_total`), Error Rate (`http_request_errors_total`), Average / P95 Latency (`http_request_duration_seconds`), CPU utilization, Memory utilization, Database connection contention.
+  - Safe diagnostics with typed error categorization:
+    - `AUTH_FAILURE` (HTTP 401/403)
+    - `RATE_LIMITED` (HTTP 429)
+    - `TIMEOUT` (AbortController deadline breach)
+    - `UNAVAILABLE` (HTTP 500/502/503/network disconnect)
+    - `MALFORMED_RESPONSE` (invalid payload syntax)
+  - Zero credential exposure: Authorization headers and tokens are never printed in logs, UI responses, or error strings.
 
-### Service Inventory
-
-1. **API Gateway (`gateway/server.ts`, Port 4000):**
-   - Entry point for ingress traffic.
-   - Routes `/api/orders` to Order Service and `/api/inventory/:sku` to Inventory Service.
-   - Creates root spans for ingress calls and injects W3C `traceparent` headers into downstream requests.
-
-2. **Order Service (`order/server.ts`, Port 4001):**
-   - Orchestrates multi-service order processing.
-   - Flow: Validates order $\rightarrow$ reserves stock via Inventory Service $\rightarrow$ authorizes payment via Payment Service $\rightarrow$ writes confirmed order to PostgreSQL.
-   - Propagates trace context across all child HTTP and DB operations.
-
-3. **Payment Service (`payment/server.ts`, Port 4002):**
-   - Simulates card payment authorization with risk assessment.
-   - Supports deterministic, safe local execution (no live payment providers).
-   - Records transaction records into PostgreSQL.
-
-4. **Inventory Service (`inventory/server.ts`, Port 4003):**
-   - Manages stock levels (`ITEM-101`, `ITEM-102`, `ITEM-103`).
-   - Supports SKU lookups and atomic stock reservations in PostgreSQL.
-
-5. **PostgreSQL Client Simulation (`shared/database.ts`):**
-   - Simulates connection pooling, query executions, and schema tables (`orders`, `inventory_items`, `payment_logs`).
-   - Generates dedicated OpenTelemetry DB client spans (`db.system: postgresql`, `db.operation`, `db.statement`).
-   - Exposes dynamic fault injection (`latencyMs`, `failureRate`) for reproducible chaos experiments.
+### B. Grafana Tempo / Distributed Traces Adapter (`JaegerClient`)
+- **Supported Backends:** Local Jaeger, OpenTelemetry Collector trace exporter, Grafana Cloud Tempo (v1 search and v2 OTLP batches).
+- **Capabilities:**
+  - Trace search by service name with bounded query limit.
+  - OTLP batch detail parsing (`batches`, `resourceSpans`, `scopeSpans`) into `DistributedTrace` and `NormalizedTraceSpan[]`.
+  - Span parent-child hierarchy reconstruction and depth assignment.
+  - Error identification (`statusCode === "ERROR"`, status code 2, error tags).
+  - Duration calculation from start/end unix timestamps.
 
 ---
 
-## 3. OpenTelemetry Instrumentation
+## 3. Telemetry Normalization Model
 
-All services utilize the official `@opentelemetry/sdk-node` and `@opentelemetry/api` packages configured via `sample-services/shared/telemetry.ts`.
+All incoming telemetry passes through runtime Zod schema validation defined in `src/lib/telemetry/normalization.ts`:
 
-### Distributed Traces
-- **W3C TraceContext Propagation:** Every outgoing HTTP request calls `injectTraceContext()` to serialize `traceparent: 00-{traceId}-{spanId}-{flags}` headers. Every incoming request calls `extractTraceContext()` to restore span parentage.
-- **Span Hierarchy:**
-  ```text
-  [api-gateway] POST /api/orders (duration: 38ms)
-     └── [order-service] POST /orders (duration: 35ms)
-            ├── [inventory-service] POST /reserve (duration: 10ms)
-            │      └── [sample-postgres] UPDATE inventory_items (duration: 8ms)
-            ├── [payment-service] POST /authorize (duration: 12ms)
-            │      └── [sample-postgres] INSERT INTO payment_logs (duration: 9ms)
-            └── [sample-postgres] INSERT INTO orders (duration: 6ms)
-  ```
-- **Semantic Conventions:** Spans follow OpenTelemetry conventions (`http.method`, `http.status_code`, `http.url`, `db.system`, `db.operation`).
-- **Privacy & Redaction:** Sensitive attributes (credit cards, PII, user passwords) are strictly excluded from span tags.
+1. **`NormalizedMetricRecord`:**
+   - `id`: Unique record identifier
+   - `provider`: `"PROMETHEUS" | "GRAFANA_CLOUD" | "MOCK_EMULATION" | "SIMULATION"`
+   - `serviceName`: String matching topology node or flagged as unmapped
+   - `metricType`: `"REQUEST_RATE" | "ERROR_RATE" | "LATENCY_P95" | "LATENCY_AVG" | "CPU_UTILIZATION" | "MEMORY_UTILIZATION" | "DB_CONNECTION_PRESSURE" | "CUSTOM"`
+   - `metricName`: Underlying query string
+   - `timestamp`: ISO-8601 string
+   - `value`: Number
+   - `unit`: `"ms" | "%" | "req/s" | "connections" | "count"`
+   - `labels`: Key-value attribute dictionary
+   - `hasAnomaly`: Boolean threshold flag
 
-### Metric Instruments
-- `http_requests_total` (Counter): Total incoming HTTP requests partitioned by `service`, `method`, `route`, and `status`.
-- `http_request_errors_total` (Counter): Total HTTP 5xx failures.
-- `http_request_duration_seconds` (Histogram): Request latency distribution across standard Prometheus buckets (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0`).
-- `db_operation_duration_seconds` (Histogram): Database execution latency per table and operation.
+2. **`NormalizedTraceSpan`:**
+   - `traceId`, `spanId`, `parentSpanId`: W3C trace identifiers
+   - `serviceName`, `operationName`: Service and HTTP/DB operation
+   - `startTimeIso`: ISO-8601 start timestamp
+   - `durationMs`: Span execution duration
+   - `statusCode`: `"OK" | "ERROR" | "UNSET"`
+   - `errorMessage`: Optional error string
+   - `attributes`: Typed attributes dictionary
+   - `childSpanIds`: IDs of immediate child spans
+   - `depth`: Tree depth (0 for root)
 
-### Correlated Structured Logging
-Structured JSON logs include active trace identifiers:
-```json
-{
-  "timestamp": "2026-10-12T20:27:14.353Z",
-  "level": "info",
-  "serviceName": "order-service",
-  "traceId": "01b976023356f63fe9e383b691ca1071",
-  "spanId": "4a16b94fbd1f7f64",
-  "message": "Order created and confirmed successfully",
-  "dbDuration": 15
-}
-```
+3. **`NormalizedTelemetryBatch`:**
+   - Contains `batchId`, `collectedAt`, active `mode`, `metrics[]`, `spans[]`, and `diagnostics[]`.
 
 ---
 
-## 4. OpenTelemetry Collector & Observability Backends
+## 4. Truthful Telemetry Modes & State Management
 
-### Collector Configuration (`docker/otel-collector-config.yaml`)
-- **Receivers:**
-  - OTLP gRPC on `0.0.0.0:4317`
-  - OTLP HTTP on `0.0.0.0:4318`
-- **Processors:**
-  - `memory_limiter`: Prevents OOM by dropping or throttling traffic if Collector usage exceeds 80% (limit: 512MiB).
-  - `batch`: Aggregates spans and metric samples into 200ms or 8192-item batches.
-- **Exporters:**
-  - `prometheus`: Serves metric scrape endpoint on `0.0.0.0:8889`.
-  - `otlp/jaeger`: Pushes trace spans via gRPC to Jaeger `jaeger:4317`.
+The `TelemetryManager` enforces three distinct modes:
 
-### Observability Backends
-- **Prometheus (`docker/prometheus.yml`, Port 9090):**
-  - Scrapes OTel Collector on `otel-collector:8889` every 5 seconds.
-  - Exposes standard PromQL API at `http://localhost:9090/api/v1/query`.
-- **Jaeger (Port 16686 / 4317):**
-  - Ingests distributed traces from Collector.
-  - Exposes trace query API at `http://localhost:16686/api/traces`.
-- **Host Fallback (`sample-services/mock-observability.ts`):**
-  - For environments without Docker, a lightweight zero-dependency Node.js server serves genuine OTLP HTTP (4318), Prometheus PromQL (9090), and Jaeger traces (16686) so the pipeline runs identically.
+| Mode | Condition | Behavior |
+|---|---|---|
+| **`SIMULATION`** | Explicitly set by operator or default demo state. | Telemetry is generated or replayed from deterministic database scenarios. No external network requests are dispatched. |
+| **`LIVE`** | Configured backends are healthy and successfully responding. | Real metrics and traces are ingested. `lastIngestedAt` timestamp is updated on each successful collection cycle. |
+| **`DEGRADED`** | Live mode is requested, but backends are unreachable, return errors, or lack credentials. | Telemetry status is reported as `UNKNOWN` or degraded. **Never silently falls back to simulation data while claiming to be live.** |
+
+### Mode Transition Rules
+- Missing credentials never imply live mode.
+- A passing health probe alone does not imply successful ingestion; ingestion must yield verified metric/trace samples.
+- The legacy `"REAL"` mode identifier is preserved as an alias mapping to `"LIVE"` for backward API compatibility.
 
 ---
 
-## 5. Dual-Mode Telemetry Architecture
+## 5. Multi-Service Incident Validation Scenario
 
-IncidentGraph AI maintains a strict separation between simulated and real telemetry.
+The deterministic multi-service incident scenario (`src/lib/telemetry/multiServiceIncident.ts`) provides a reproducible benchmark topology:
 
 ```text
-                           +----------------------+
-                           |   Operator Toggle    |
-                           +----------+-----------+
-                                      |
-                     +----------------+----------------+
-                     |                                 |
-                     v                                 v
-        [SIMULATION MODE]                       [REAL TELEMETRY MODE]
-        - Driven by SQLite seed data            - Driven by Prometheus & Jaeger
-        - Deterministic failure steps           - Real OTel metrics & traces
-        - In-memory cascade simulator           - Offline states if backend down
-        - Synthetic scenarios                   - Discovers unmapped services
+API Gateway (Tier 1)
+       │ (SYNC_HTTP, timeout: 2000ms)
+       ▼
+Order Service (Tier 2)
+       │ (SYNC_HTTP, timeout: 2000ms)
+       ▼
+Payment Service (Tier 3)
+       │ (DATABASE_CONN, timeout: 1500ms)
+       ▼
+PostgreSQL Database (Tier 4)
 ```
 
-### Telemetry Provider Interface (`src/lib/telemetry/telemetryManager.ts`)
-- `getMode()` / `setMode('SIMULATION' | 'REAL')`
-- `getRealTelemetryOverview()`: Fetches Prometheus health, rate, and latency metrics; falls back gracefully with explicit `isBackendAvailable: false` if backends are unreachable.
-- `getTraces(options)`: Fetches traces from Jaeger, reconstructs parent-child trees, and identifies root-cause candidates based on span error status.
-- `getTraceById(traceId)`: Fetches trace details and produces waterfall tree nodes for UI inspection.
+### Incident Timeline Phases
+1. **Healthy Baseline (Steps 1–3):** All services report nominal latencies (DB: 12ms, Payment: 45ms, Order: 35ms, Gateway: 15ms) and 0% errors. Traces succeed in <50ms.
+2. **Fault Onset at PostgreSQL (Step 4):** Database connection contention causes DB query latency to surge to 1850ms. Dependent services remain temporarily within baseline before downstream buffers fill.
+3. **Cascading Propagation (Step 5):** Payment Service stalls waiting for DB (latency 1950ms, 14% errors). Order Service checkout requests timeout waiting for Payment (latency 2100ms, 22% errors).
+4. **Peak Blast Radius (Step 6):** API Gateway breaches timeout threshold (latency 2250ms, 32% errors, HTTP 504 Gateway Timeout). Failure trace waterfall captures the full failure chain from Gateway down to the PostgreSQL lock contention span.
+5. **Recovery Period (Steps 7–8):** DB pool contention clears (latency returns to 12ms), and upstream services recover sequentially.
+
+### Root-Cause Ranking & Evidence Attribution
+- **Derivation:** The `RootCauseEngine` derives `postgres-db` as the #1 candidate using temporal onset precedence (step 4 vs 5/6) and deepest dependency position.
+- **Blast Radius:** Correctly computes affected dependents count (3 services impacted upstream).
+- **Inconclusive Handling:** When fed telemetry with healthy baselines or no detectable anomalies, the engine returns `isConclusive: false` and `topRootCause: null`.
 
 ---
 
-## 6. Real Incident Detection & Anti-Flapping
+## 6. Supported Environment Variables
 
-The `RuleDetector` (`src/lib/detection/ruleDetector.ts`) analyzes normalized live telemetry against configurable SRE thresholds:
+All telemetry provider credentials remain strictly server-side:
 
-1. **Elevated Error Rate:** Triggers when `errorRate > 0.05` (5% error rate).
-2. **Excessive Latency:** Triggers when `p95LatencyMs > 500ms` or `p99LatencyMs > 1000ms`.
-3. **Repeated Downstream Timeouts:** Triggers on observed HTTP 504 Gateway Timeouts.
-4. **Anti-Flapping Cooldown:**
-   - Enforces a 60-second cooldown per `serviceId:ruleName` key.
-   - Prevents duplicate incidents from flooding the dashboard during a sustained incident.
-   - Auto-resolves incidents when observed metrics return below thresholds for more than 2 consecutive check intervals.
+| Variable Name | Required For | Description |
+|---|---|---|
+| `GRAFANA_CLOUD_PROMETHEUS_URL` | Grafana Cloud | HTTPS PromQL endpoint (e.g. `https://prometheus-prod-....grafana.net/api/prom`) |
+| `GRAFANA_CLOUD_PROMETHEUS_USER` | Grafana Cloud | Numeric instance ID / username |
+| `GRAFANA_CLOUD_PROMETHEUS_TOKEN` | Grafana Cloud | Read-only Grafana Cloud API token with `metrics:read` scope |
+| `GRAFANA_CLOUD_TEMPO_URL` | Grafana Cloud | HTTPS Tempo endpoint (e.g. `https://tempo-prod-....grafana.net`) |
+| `GRAFANA_CLOUD_TEMPO_USER` | Grafana Cloud | Numeric instance ID / username |
+| `GRAFANA_CLOUD_TEMPO_TOKEN` | Grafana Cloud | Read-only Grafana Cloud API token with `traces:read` scope |
+| `PROMETHEUS_URL` | Local Dev | Self-hosted Prometheus base URL (default: `http://localhost:9090`) |
+| `JAEGER_URL` | Local Dev | Self-hosted Jaeger UI/API base URL (default: `http://localhost:16686`) |
+| `TELEMETRY_QUERY_TIMEOUT_MS` | Optional | Query timeout limit in milliseconds (default: `4000`) |
 
----
-
-## 7. Evidence-Based Root Cause Analysis
-
-The `RealRootCauseEngine` (`src/lib/algorithms/realRootCauseEngine.ts`) discovers originating failures using observed runtime telemetry, graph topology, and span traces—**without ever reading internal test scenario metadata**.
-
-### Scoring Algorithm
-$$Score(S) = W_{health} \cdot S_{health} + W_{latency} \cdot S_{latency} + W_{error} \cdot S_{error} + W_{trace} \cdot S_{trace} + W_{depth} \cdot S_{depth} - Penalties$$
-
-- **$S_{trace}$ (Span Bottleneck Score):** If distributed trace waterfall analysis indicates that an innermost downstream span (e.g., PostgreSQL query) failed or consumed $>80\%$ of total trace duration, the corresponding service is prioritized.
-- **$S_{depth}$ (Topological Precedence):** In dependency chain $A \rightarrow B \rightarrow C$, Service $C$ is deepest. If both $A$ and $C$ exhibit errors, $C$ receives higher priority because $A$'s error is likely a cascading symptom of $C$'s failure.
-- **Zero Scenario Leakage:** The engine evaluates only:
-  1. Observed error counts & latency deltas.
-  2. Span hierarchy and duration distribution.
-  3. Topological reachability in the service graph.
+> [!IMPORTANT]
+> Never commit actual tokens or credentials to source control. Ingestion requires only read permissions (`metrics:read` and `traces:read`).
 
 ---
 
-## 8. Failure Experiments & Recovery
+## 7. Verification & Testing
 
-Four controlled experiments demonstrate observable failure and automated recovery:
+The telemetry suite includes deterministic mocked provider tests, normalization validation, multi-service incident evaluations, and mode transitions that run without external network dependencies:
 
-| Scenario ID | Injected Fault | Primary Service Affected | Dependent Impact | Observable Evidence |
-|---|---|---|---|---|
-| `db-slowdown` | 800ms query latency on Postgres | `sample-postgres` | Order Service, Gateway | Gateway latency $>850$ms, DB spans $>800$ms |
-| `downstream-timeout` | 1500ms latency on Inventory | `inventory-service` | Order Service | Order Service HTTP 504 timeouts |
-| `payment-errors` | 100% failure rate on Payment | `payment-service` | Order Service | Payment 500 Internal Error, Order cancellation |
-| `baseline` | 0ms added delay, 0% errors | None | Fleet healthy | All services return HTTP 200, latency $<50$ms |
+```bash
+# Run the dedicated live telemetry test suite
+npx vitest run tests/live-telemetry.test.ts
 
-Faults are triggered via `POST /api/experiments/trigger` and restored cleanly via the same endpoint with `scenario: "baseline"`.
+# Run the complete test suite (98 tests across 8 suites)
+npm test
+
+# Run the algorithmic benchmark suite (22 tests)
+npm run test:benchmark
+
+# Verify TypeScript type safety
+npx tsc --noEmit
+
+# Verify linting
+npm run lint
+
+# Verify production build
+npm run build
+```
+
+---
+
+## 8. Known Limitations & Scope Boundaries
+
+1. **Read-Only Ingestion:** IncidentGraph AI does not modify, write to, or configure external Grafana Cloud or Prometheus dashboards. It strictly reads telemetry through standardized PromQL and trace query APIs.
+2. **Clock Drift:** When correlating timestamps across disparate microservices in live mode, systems must synchronize clocks via NTP; large clock skew (>500ms) may affect sliding window temporal precedence calculations.
+3. **External Infrastructure Dependency:** Full end-to-end live testing with real Grafana Cloud endpoints requires valid user-supplied credentials. When credentials are not supplied, the application operates deterministically in simulation mode or safely reports degraded status without crashing or fabricating data.
