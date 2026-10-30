@@ -7,14 +7,44 @@
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Neon Database](https://img.shields.io/badge/Neon-PostgreSQL%20Serverless-00E599?logo=postgresql&logoColor=white)](https://neon.tech/)
-[![Tests](https://img.shields.io/badge/Vitest-76%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Vitest-81%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Benchmark](https://img.shields.io/badge/Benchmark-117%2F117%20Passed-blueviolet)](docs/ROOT_CAUSE_BENCHMARK.md)
+[![Recruiter Demo](https://img.shields.io/badge/Recruiter%20Demo-3%20Min%20Walkthrough-success)](docs/RECRUITER_DEMO.md)
 
 > **Intelligent, explainable incident investigation and root-cause analysis for distributed microservice architectures using directed graphs, deterministic algorithms, OpenTelemetry, Grafana Cloud, and evidence-grounded AI synthesis.**
 >
-> 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)
->
-> ⚡ **Quick Walkthrough**: Click `1-Click Guided Demo` on the homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
+> 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)  
+> 🎬 **Recruiter Demo Video (1080p MP4)**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4)  
+> 📑 **Recruiter Click-by-Click Guide**: [`docs/RECRUITER_DEMO.md`](docs/RECRUITER_DEMO.md)  
+> 🎙️ **Professional Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md)  
+> 🏛️ **Architecture Deep-Dive**: [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md)  
+> ⚡ **Quick Test**: Click `1-Click Guided Demo` on the live homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
+
+---
+
+## 📸 Recruiter-Ready 16:9 Screenshot Tour
+
+All screenshots below are captured from the active running application at 1920x1080 resolution:
+
+### 1. Operations Overview Dashboard
+The central command center displaying fleet health status, active incidents, telemetry breach timelines, and MTTR performance metrics:
+![IncidentGraph AI Overview Dashboard](docs/screenshots/01_hero_dashboard.png)
+
+### 2. Interactive Service Dependency Map (DAG)
+Dynamic topology map powered by React Flow (`@xyflow/react`). Color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), and real-time inspection drawers:
+![Service Dependency Map](docs/screenshots/02_service_dependency_map.png)
+
+### 3. Deterministic Failure Simulator (Active Fault Injection)
+Injects realistic failure scenarios (e.g., PostgreSQL connection pool exhaustion) and models multi-step cascading failure propagation along dependency edges:
+![Failure Simulator Active Fault](docs/screenshots/03_failure_simulation.png)
+
+### 4. Incident Investigation & Root-Cause Ranking
+Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas:
+![Incident Investigation and Root Cause](docs/screenshots/04_root_cause_diagnosis.png)
+
+### 5. Evidence-Grounded AI Investigation & Replay
+Deterministic AI investigation brief with verified impact, ranked hypotheses with supporting evidence IDs, read-only diagnostic checks, and safe remediation options:
+![AI Investigation and Replay](docs/screenshots/05_ai_replay_investigation.png)
 
 ---
 
