@@ -1,5 +1,5 @@
 import { prisma } from "../db/prisma";
-import { prometheusClient } from "./prometheusClient";
+import { prometheusClient, ServiceMetricsSummary } from "./prometheusClient";
 import { jaegerClient } from "./jaegerClient";
 import {
   TelemetryMode,
@@ -9,6 +9,7 @@ import {
 } from "./types";
 import {
   NormalizedTelemetryBatch,
+  NormalizedMetricRecord,
   ProviderDiagnostic,
 } from "./normalization";
 
@@ -41,30 +42,44 @@ export class TelemetryManager {
     return this.lastIngestedAt;
   }
 
-  public async getBackendHealth(): Promise<BackendHealthStatus> {
+  public async getBackendHealth(forceProbe: boolean = false): Promise<BackendHealthStatus> {
     const cloudConfigured = Boolean(
       (process.env.GRAFANA_CLOUD_OTLP_ENDPOINT && process.env.GRAFANA_CLOUD_OTLP_ENDPOINT.trim().length > 0) ||
       (process.env.GRAFANA_CLOUD_PROMETHEUS_URL && process.env.GRAFANA_CLOUD_PROMETHEUS_URL.trim().length > 0)
     );
+
+    if (this.currentMode === "SIMULATION" && !forceProbe) {
+      const status: BackendHealthStatus = {
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: prometheusClient.getBaseUrl(),
+        jaegerUrl: jaegerClient.getBaseUrl(),
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured,
+        backendType: "SIMULATION",
+        lastChecked: new Date().toISOString(),
+        lastIngestedAt: this.lastIngestedAt || undefined,
+        details: "Simulation mode active. Live network telemetry probes are disabled.",
+      };
+      this.lastHealthCheck = status;
+      return status;
+    }
 
     const [promHealth, jaegerHealth] = await Promise.all([
       prometheusClient.checkHealth(),
       jaegerClient.checkHealth(),
     ]);
 
-    const isAvailable = promHealth.available || jaegerHealth.available;
     const isMock = Boolean(promHealth.isMock || jaegerHealth.isMock);
     const isCloud = Boolean(promHealth.isCloud || jaegerHealth.isCloud || cloudConfigured);
 
     let backendType: BackendHealthStatus["backendType"] = "UNAVAILABLE";
-    if (isAvailable) {
-      if (isCloud && !isMock) {
-        backendType = "GRAFANA_CLOUD";
-      } else if (isMock) {
-        backendType = "MOCK_EMULATION";
-      } else {
-        backendType = "GENUINE_STACK";
-      }
+    if (promHealth.available && jaegerHealth.available) {
+      backendType = isCloud && !isMock ? "GRAFANA_CLOUD" : isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
+    } else if (promHealth.available || jaegerHealth.available) {
+      // Partial availability
+      backendType = isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
     }
 
     const details = this.formatHealthDetails(cloudConfigured, isMock, promHealth, jaegerHealth);
@@ -102,6 +117,12 @@ export class TelemetryManager {
     if (!promHealth.available && !jaegerHealth.available) {
       return "No telemetry backends are connected. Configure Grafana Cloud in .env or run local dev services.";
     }
+    if (promHealth.available && !jaegerHealth.available) {
+      return `Prometheus connected, but Tempo/Jaeger is offline (${jaegerHealth.error || "unreachable"}).`;
+    }
+    if (!promHealth.available && jaegerHealth.available) {
+      return `Tempo/Jaeger connected, but Prometheus is offline (${promHealth.error || "unreachable"}).`;
+    }
     if (isMock) {
       return "Connected to local mock observability server (MOCK_EMULATION).";
     }
@@ -116,31 +137,44 @@ export class TelemetryManager {
     lastCollectedAt: string;
     lastIngestedAt: string | null;
   }> {
-    const backendHealth = await this.getBackendHealth();
     const dbServices = await prisma.service.findMany();
 
+    // 1. Strict Simulation Isolation: zero network requests
     if (this.currentMode === "SIMULATION") {
-      return this.buildSimulatedObservedServices(dbServices, backendHealth);
+      const mockHealth: BackendHealthStatus = {
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: prometheusClient.getBaseUrl(),
+        jaegerUrl: jaegerClient.getBaseUrl(),
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "SIMULATION",
+        lastChecked: new Date().toISOString(),
+        details: "Simulation mode active. Zero external network telemetry probes are issued.",
+      };
+      return this.buildSimulatedObservedServices(dbServices, mockHealth);
     }
 
-    // In LIVE / REAL mode:
+    // 2. LIVE / REAL mode collection
+    const backendHealth = await this.getBackendHealth(true);
+
     if (!backendHealth.prometheusAvailable && !backendHealth.jaegerAvailable) {
       return this.buildDegradedOfflineObservedServices(dbServices, backendHealth);
     }
 
-    // Query both Prometheus and Jaeger with diagnostics
-    const [promDiagnosticRes, traceDetailed, promMetrics] = await Promise.all([
-      prometheusClient.queryInstantDetailed("rate(http_requests_total[1m])", "REQUEST_RATE"),
+    // Query both Prometheus and Jaeger with comprehensive diagnostics
+    const [promMetricsDetailed, traceDetailed] = await Promise.all([
+      prometheusClient.getServiceMetricsDetailed(),
       jaegerClient.getRecentTracesDetailed(undefined, 30),
-      prometheusClient.getServiceMetrics(),
     ]);
 
-    const promSuccess = promDiagnosticRes.success && promDiagnosticRes.diagnostic.status === "OK";
-    const tempoSuccess = traceDetailed.success && traceDetailed.diagnostic.status === "OK";
-    const hasData = promMetrics.size > 0 || traceDetailed.traces.length > 0;
+    const promSuccess = promMetricsDetailed.success && promMetricsDetailed.metrics.size > 0;
+    const tempoSuccess = traceDetailed.success && traceDetailed.traces.length > 0;
+    const hasData = promSuccess || tempoSuccess;
 
-    // Truthful mode decision: requires BOTH providers to succeed and return real non-empty series
-    const isTrulyLive = promSuccess && tempoSuccess && hasData;
+    // Truthful mode decision: requires BOTH backends to be connected, queries to succeed, and verified data returned
+    const isTrulyLive = backendHealth.prometheusAvailable && backendHealth.jaegerAvailable && promSuccess && tempoSuccess;
     const effectiveMode: TelemetryMode = isTrulyLive ? "LIVE" : "DEGRADED";
 
     if (isTrulyLive) {
@@ -151,7 +185,7 @@ export class TelemetryManager {
       dbServices,
       backendHealth,
       effectiveMode,
-      promMetrics,
+      promMetricsDetailed.metrics,
       traceDetailed.traces,
       hasData
     );
@@ -161,7 +195,7 @@ export class TelemetryManager {
     dbServices: Array<{ id: string; name: string; status: string; currentLatency: number; currentErrorRate: number; requestRate: number; updatedAt: Date }>,
     backendHealth: BackendHealthStatus
   ) {
-    const observed = dbServices.map((s) => ({
+    const observed: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
       source: "SIMULATION" as const,
@@ -189,7 +223,7 @@ export class TelemetryManager {
     dbServices: Array<{ id: string; name: string }>,
     backendHealth: BackendHealthStatus
   ) {
-    const unavailable = dbServices.map((s) => ({
+    const unavailable: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
       source: "PROMETHEUS" as const,
@@ -217,7 +251,7 @@ export class TelemetryManager {
     dbServices: Array<{ id: string; name: string; baselineLatency: number }>,
     backendHealth: BackendHealthStatus,
     effectiveMode: TelemetryMode,
-    promMetrics: Map<string, { latencyMs: number; errorRate: number; requestRate: number }>,
+    promMetrics: Map<string, ServiceMetricsSummary>,
     recentTraces: DistributedTrace[],
     hasTelemetryData: boolean
   ) {
@@ -271,6 +305,8 @@ export class TelemetryManager {
         source: "PROMETHEUS",
         status,
         latencyMs: latency,
+        latencyP95Ms: metric?.latencyP95Ms,
+        hasValidP95: metric?.hasValidP95,
         errorRate,
         requestRate,
         lastObserved: new Date().toISOString(),
@@ -288,6 +324,8 @@ export class TelemetryManager {
           source: "PROMETHEUS",
           status: metric.errorRate > 5 ? "DEGRADED" : "HEALTHY",
           latencyMs: metric.latencyMs,
+          latencyP95Ms: metric.latencyP95Ms,
+          hasValidP95: metric.hasValidP95,
           errorRate: metric.errorRate,
           requestRate: metric.requestRate,
           lastObserved: new Date().toISOString(),
@@ -308,45 +346,139 @@ export class TelemetryManager {
     };
   }
 
+  /**
+   * Retrieves a normalized telemetry batch.
+   * In SIMULATION mode: builds deterministic simulation batch with zero network requests.
+   * In LIVE mode: runs bounded range queries and distributed trace queries, verifying evidence and truthfulness.
+   */
   public async getNormalizedBatch(): Promise<NormalizedTelemetryBatch> {
     const batchId = `batch-${Date.now()}`;
     const collectedAt = new Date().toISOString();
 
-    const [promResult, traceResult] = await Promise.all([
-      prometheusClient.queryInstantDetailed("rate(http_requests_total[1m])", "REQUEST_RATE"),
+    // 1. Strict Simulation Isolation: zero network calls
+    if (this.currentMode === "SIMULATION") {
+      const dbServices = await prisma.service.findMany();
+      return this.buildSimulatedBatch(dbServices, batchId, collectedAt);
+    }
+
+    // 2. LIVE / REAL mode: verify health, range history, snapshots, and traces
+    const backendHealth = await this.getBackendHealth(true);
+
+    const [promDetailed, promHistoryDetailed, traceResult] = await Promise.all([
+      prometheusClient.getServiceMetricsDetailed(),
+      prometheusClient.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 }),
       jaegerClient.getRecentTracesDetailed(undefined, 25),
     ]);
 
-    const diagnostics: ProviderDiagnostic[] = [promResult.diagnostic, traceResult.diagnostic];
+    const diagnostics: ProviderDiagnostic[] = [
+      ...promDetailed.diagnostics,
+      ...promHistoryDetailed.diagnostics,
+      traceResult.diagnostic,
+    ];
 
-    const promOk = promResult.success && promResult.diagnostic.status === "OK";
-    const tempoOk = traceResult.success && traceResult.diagnostic.status === "OK";
-    const hasData = promResult.records.length > 0 || traceResult.normalizedSpans.length > 0;
+    const promConnected = backendHealth.prometheusAvailable;
+    const promSnapshotOk = promDetailed.success && promDetailed.metrics.size > 0;
+    const promRangeOk = promHistoryDetailed.success && promHistoryDetailed.records.length > 0;
+    const promOk = promConnected && promSnapshotOk && promRangeOk;
 
-    let mode: "SIMULATION" | "LIVE" | "DEGRADED" = "SIMULATION";
-    if (this.currentMode === "LIVE" || this.currentMode === "REAL") {
-      const isTrulyLive = promOk && tempoOk && hasData;
-      mode = isTrulyLive ? "LIVE" : "DEGRADED";
-      if (isTrulyLive) {
-        this.lastIngestedAt = new Date().toISOString();
-      }
+    const tempoConnected = backendHealth.jaegerAvailable;
+    const tempoOk = tempoConnected && traceResult.success && traceResult.traces.length > 0 && traceResult.normalizedSpans.length > 0;
+
+    const isTrulyLive = promOk && tempoOk;
+    const mode: "LIVE" | "DEGRADED" = isTrulyLive ? "LIVE" : "DEGRADED";
+
+    if (isTrulyLive) {
+      this.lastIngestedAt = new Date().toISOString();
     }
 
     return {
       batchId,
       collectedAt,
       mode,
-      metrics: promResult.records,
+      metrics: promHistoryDetailed.records.length > 0 ? promHistoryDetailed.records : [],
       spans: traceResult.normalizedSpans,
       diagnostics,
     };
   }
 
+  private buildSimulatedBatch(
+    dbServices: Array<{ id: string; name: string; currentLatency: number; currentErrorRate: number; requestRate: number; updatedAt: Date }>,
+    batchId: string,
+    collectedAt: string
+  ): NormalizedTelemetryBatch {
+    const metrics: NormalizedMetricRecord[] = [];
+
+    for (const s of dbServices) {
+      metrics.push({
+        id: `sim-metric-req-${s.id}-${Date.now()}`,
+        provider: "SIMULATION",
+        serviceName: s.name,
+        metricType: "REQUEST_RATE",
+        metricName: "http_requests_total (simulated)",
+        timestamp: s.updatedAt.toISOString(),
+        value: s.requestRate,
+        unit: "req/s",
+        labels: { env: "simulation", source: "scenario" },
+        hasAnomaly: false,
+      });
+      metrics.push({
+        id: `sim-metric-err-${s.id}-${Date.now()}`,
+        provider: "SIMULATION",
+        serviceName: s.name,
+        metricType: "ERROR_RATE",
+        metricName: "http_request_errors_total (simulated)",
+        timestamp: s.updatedAt.toISOString(),
+        value: s.currentErrorRate,
+        unit: "%",
+        labels: { env: "simulation", source: "scenario" },
+        hasAnomaly: s.currentErrorRate > 5,
+      });
+      metrics.push({
+        id: `sim-metric-lat-${s.id}-${Date.now()}`,
+        provider: "SIMULATION",
+        serviceName: s.name,
+        metricType: "LATENCY_AVG",
+        metricName: "http_request_duration_seconds (simulated)",
+        timestamp: s.updatedAt.toISOString(),
+        value: s.currentLatency,
+        unit: "ms",
+        labels: { env: "simulation", source: "scenario" },
+        hasAnomaly: s.currentLatency > 100,
+      });
+    }
+
+    const diagnostics: ProviderDiagnostic[] = [
+      {
+        provider: "SIMULATION",
+        endpoint: "in-memory-simulation",
+        status: "OK",
+        message: "Simulation mode active. Telemetry derived deterministically from scenario database without network requests.",
+        latencyMs: 0,
+        timestamp: collectedAt,
+      },
+    ];
+
+    return {
+      batchId,
+      collectedAt,
+      mode: "SIMULATION",
+      metrics,
+      spans: [],
+      diagnostics,
+    };
+  }
+
   public async getRecentTraces(serviceId?: string, limit: number = 20): Promise<DistributedTrace[]> {
+    if (this.currentMode === "SIMULATION") {
+      return [];
+    }
     return await jaegerClient.getRecentTraces(serviceId, limit);
   }
 
   public async getTraceDetail(traceId: string): Promise<DistributedTrace | null> {
+    if (this.currentMode === "SIMULATION") {
+      return null;
+    }
     return await jaegerClient.getTraceById(traceId);
   }
 }

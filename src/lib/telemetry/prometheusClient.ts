@@ -24,6 +24,38 @@ export interface PrometheusRangeOptions {
   metricType?: NormalizedMetricRecord["metricType"];
 }
 
+export interface ServiceMetricsSummary {
+  serviceName: string;
+  latencyMs: number;
+  latencyP95Ms?: number;
+  hasValidP95: boolean;
+  errorRate: number; // 0 - 100%
+  requestRate: number; // req/sec
+  instanceCount: number;
+}
+
+export interface ServiceHistoryPoint {
+  timestamp: string;
+  latencyMs: number;
+  latencyP95Ms?: number;
+  errorRate: number;
+  requestRate: number;
+}
+
+export interface ServiceMetricsDetailedResult {
+  success: boolean;
+  metrics: Map<string, ServiceMetricsSummary>;
+  diagnostics: ProviderDiagnostic[];
+  p95Supported: boolean;
+}
+
+export interface ServiceMetricsHistoryResult {
+  success: boolean;
+  historyByService: Map<string, ServiceHistoryPoint[]>;
+  records: NormalizedMetricRecord[];
+  diagnostics: ProviderDiagnostic[];
+}
+
 interface RawPromResult {
   metric?: Record<string, string>;
   value?: [number, string];
@@ -273,7 +305,7 @@ export class PrometheusClient {
       };
     } catch (err: unknown) {
       const latencyMs = Date.now() - start;
-      const isTimeout = latencyMs >= this.timeoutMs || (err instanceof Error && err.name === "AbortError");
+      const isTimeout = latencyMs >= this.timeoutMs || controller.signal.aborted || (err instanceof Error && err.name === "AbortError");
       const errorCode: TelemetryErrorCode = isTimeout ? "TIMEOUT" : "UNAVAILABLE";
       return this.createFailureResult(latencyMs, nowIso, errorCode, isTimeout ? `Range query timed out after ${this.timeoutMs}ms` : "Network request failed");
     } finally {
@@ -282,8 +314,8 @@ export class PrometheusClient {
   }
 
   private validateRangeParams(startSec: number, endSec: number, stepSec: number): string | null {
-    if (isNaN(startSec) || isNaN(endSec) || isNaN(stepSec)) {
-      return "Range query parameters (start, end, step) must be valid numbers";
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || !Number.isFinite(stepSec)) {
+      return "Range query parameters (start, end, step) must be finite numbers";
     }
     if (startSec >= endSec) {
       return `Invalid time range: start (${startSec}) must be strictly less than end (${endSec})`;
@@ -295,7 +327,8 @@ export class PrometheusClient {
     if (endSec - startSec > maxLookbackSec) {
       return `Time range exceeds maximum permitted lookback of 24 hours (${endSec - startSec}s > ${maxLookbackSec}s)`;
     }
-    const pointCount = Math.floor((endSec - startSec) / stepSec);
+    // Prometheus range query with inclusive endpoints: floor((end - start) / step) + 1 points
+    const pointCount = Math.floor((endSec - startSec) / stepSec) + 1;
     if (pointCount > 11000) {
       return `Query exceeds standard point limit of 11,000 points (requested ${pointCount} points)`;
     }
@@ -431,65 +464,258 @@ export class PrometheusClient {
   }
 
   /**
-   * Evaluates service-level metrics with correct Prometheus counter and histogram mathematics:
-   * - Request Rate: rate(http_requests_total[1m]) in req/s.
-   * - Error Rate: (rate(http_request_errors_total[1m]) / rate(http_requests_total[1m])) * 100 in %.
-   * - Latency: rate(duration_sum[1m]) / rate(duration_count[1m]) converted to ms.
+   * Evaluates service-level metrics with strict PromQL semantics and multi-instance aggregation:
+   * 1. Request Rate: sum by (service) (rate(http_requests_total[1m]))
+   * 2. Error Rate: sum by (service) (rate(http_request_errors_total[1m]))
+   * 3. Average Latency: sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))
+   * 4. P95 Latency: histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))
+   *
+   * Zero fallbacks to cumulative counters.
+   * Multi-instance series are summed across instances before percentage / latency calculations.
    */
-  public async getServiceMetrics(): Promise<Map<string, { latencyMs: number; errorRate: number; requestRate: number }>> {
-    const results = new Map<string, { latencyMs: number; errorRate: number; requestRate: number }>();
+  public async getServiceMetricsDetailed(): Promise<ServiceMetricsDetailedResult> {
+    const diagnostics: ProviderDiagnostic[] = [];
 
-    // 1. Ingest rate-windowed requests (req/sec)
-    const requestRes = await this.queryInstantDetailed("rate(http_requests_total[1m])", "REQUEST_RATE");
-    const fallbackRequests = requestRes.records.length > 0
-      ? requestRes
-      : await this.queryInstantDetailed("http_requests_total", "REQUEST_RATE");
+    // Execute the 4 required PromQL queries in parallel
+    const [requestRes, errorRes, latencyAvgRes, p95Res] = await Promise.all([
+      this.queryInstantDetailed("sum by (service) (rate(http_requests_total[1m]))", "REQUEST_RATE"),
+      this.queryInstantDetailed("sum by (service) (rate(http_request_errors_total[1m]))", "ERROR_RATE"),
+      this.queryInstantDetailed(
+        "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
+        "LATENCY_AVG"
+      ),
+      this.queryInstantDetailed(
+        "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))",
+        "LATENCY_P95"
+      ),
+    ]);
 
-    // 2. Ingest rate-windowed error count (errors/sec)
-    const errorRes = await this.queryInstantDetailed("rate(http_request_errors_total[1m])", "ERROR_RATE");
-    const fallbackErrors = errorRes.records.length > 0
-      ? errorRes
-      : await this.queryInstantDetailed("http_request_errors_total", "ERROR_RATE");
+    diagnostics.push(requestRes.diagnostic, errorRes.diagnostic, latencyAvgRes.diagnostic, p95Res.diagnostic);
 
-    // 3. Ingest average latency from histogram sum/count in ms
-    const latencyHistogramRes = await this.queryInstantDetailed(
-      "rate(http_request_duration_seconds_sum[1m]) / rate(http_request_duration_seconds_count[1m])",
-      "LATENCY_AVG"
-    );
-    const latencyDetailed = latencyHistogramRes.records.length > 0
-      ? latencyHistogramRes
-      : await this.queryInstantDetailed("http_request_duration_seconds", "LATENCY_AVG");
-
-    // Build raw request rate map
-    const requestRates = new Map<string, number>();
-    for (const r of fallbackRequests.records) {
-      requestRates.set(r.serviceName, Math.max(0, r.value));
-      const existing = results.get(r.serviceName) || { latencyMs: 0, errorRate: 0, requestRate: 0 };
-      existing.requestRate = Math.round(r.value);
-      results.set(r.serviceName, existing);
+    // If request rate query failed, report failure and do NOT substitute raw counters
+    if (!requestRes.success) {
+      return {
+        success: false,
+        metrics: new Map(),
+        diagnostics,
+        p95Supported: false,
+      };
     }
 
-    // Compute error percentage: (errorRate / requestRate) * 100
-    for (const e of fallbackErrors.records) {
-      const existing = results.get(e.serviceName) || { latencyMs: 0, errorRate: 0, requestRate: 0 };
-      const reqRate = requestRates.get(e.serviceName) || 0;
-      if (reqRate > 0) {
-        const errorPercent = (e.value / reqRate) * 100;
-        existing.errorRate = Number(Math.min(100, Math.max(0, errorPercent)).toFixed(2));
-      } else {
-        existing.errorRate = 0.0;
+    // 1. Accumulate request rates across instances per service
+    const requestRatesByService = new Map<string, { totalRate: number; instanceCount: number }>();
+    for (const r of requestRes.records) {
+      const existing = requestRatesByService.get(r.serviceName) || { totalRate: 0, instanceCount: 0 };
+      existing.totalRate += Math.max(0, r.value);
+      existing.instanceCount += 1;
+      requestRatesByService.set(r.serviceName, existing);
+    }
+
+    // 2. Accumulate error counter rates across instances per service
+    const errorRatesByService = new Map<string, number>();
+    if (errorRes.success) {
+      for (const e of errorRes.records) {
+        const current = errorRatesByService.get(e.serviceName) || 0;
+        errorRatesByService.set(e.serviceName, current + Math.max(0, e.value));
       }
-      results.set(e.serviceName, existing);
     }
 
-    // Set latency (converted to ms)
-    for (const l of latencyDetailed.records) {
-      const existing = results.get(l.serviceName) || { latencyMs: 0, errorRate: 0, requestRate: 0 };
-      existing.latencyMs = Math.round(l.value);
-      results.set(l.serviceName, existing);
+    // 3. Accumulate average latencies across instances per service
+    const latencyAvgByService = new Map<string, { sumMs: number; count: number }>();
+    if (latencyAvgRes.success) {
+      for (const l of latencyAvgRes.records) {
+        const existing = latencyAvgByService.get(l.serviceName) || { sumMs: 0, count: 0 };
+        existing.sumMs += Math.max(0, l.value);
+        existing.count += 1;
+        latencyAvgByService.set(l.serviceName, existing);
+      }
     }
 
-    return results;
+    // 4. Map P95 latencies per service
+    const p95ByService = new Map<string, number>();
+    let p95Supported = false;
+    if (p95Res.success && p95Res.records.length > 0) {
+      p95Supported = true;
+      for (const p of p95Res.records) {
+        if (!isNaN(p.value) && p.value > 0) {
+          const current = p95ByService.get(p.serviceName);
+          p95ByService.set(p.serviceName, current !== undefined ? Math.max(current, p.value) : p.value);
+        }
+      }
+    }
+
+    const results = new Map<string, ServiceMetricsSummary>();
+    const allServices = new Set([
+      ...requestRatesByService.keys(),
+      ...errorRatesByService.keys(),
+      ...latencyAvgByService.keys(),
+    ]);
+
+    for (const svc of allServices) {
+      const reqData = requestRatesByService.get(svc) || { totalRate: 0, instanceCount: 0 };
+      const errRate = errorRatesByService.get(svc) || 0;
+      const latData = latencyAvgByService.get(svc) || { sumMs: 0, count: 0 };
+      const p95Val = p95ByService.get(svc);
+
+      const requestRate = Math.round(reqData.totalRate);
+
+      // Safe error rate percentage: (errorRate / requestRate) * 100
+      let errorRate = 0;
+      if (reqData.totalRate > 0) {
+        errorRate = Number(Math.min(100, Math.max(0, (errRate / reqData.totalRate) * 100)).toFixed(2));
+      }
+
+      // Latency is in milliseconds (converted from seconds exactly once)
+      let latencyMs = 0;
+      if (latData.count > 0) {
+        latencyMs = Math.round(latData.sumMs / latData.count);
+      }
+
+      const hasValidP95 = p95Val !== undefined && !isNaN(p95Val) && p95Val > 0;
+
+      results.set(svc, {
+        serviceName: svc,
+        requestRate,
+        errorRate,
+        latencyMs,
+        latencyP95Ms: hasValidP95 ? Math.round(p95Val!) : undefined,
+        hasValidP95,
+        instanceCount: reqData.instanceCount || 1,
+      });
+    }
+
+    return {
+      success: true,
+      metrics: results,
+      diagnostics,
+      p95Supported,
+    };
+  }
+
+  public async getServiceMetrics(): Promise<Map<string, ServiceMetricsSummary>> {
+    const detailed = await this.getServiceMetricsDetailed();
+    return detailed.metrics;
+  }
+
+  /**
+   * Collects bounded range history using Prometheus /api/v1/query_range across all 4 key metric queries.
+   * Preserves timestamps, validates parameter bounds, and correlates historical series per service.
+   */
+  public async getServiceMetricsHistory(options?: {
+    lookbackSec?: number;
+    stepSec?: number;
+  }): Promise<ServiceMetricsHistoryResult> {
+    const lookbackSec = options?.lookbackSec ?? 300; // default 5 minutes
+    const stepSec = options?.stepSec ?? 60; // default 60s
+    const nowSec = Math.floor(Date.now() / 1000);
+    const startSec = nowSec - lookbackSec;
+    const endSec = nowSec;
+
+    const [reqRange, errRange, latRange, p95Range] = await Promise.all([
+      this.queryRange({
+        query: "sum by (service) (rate(http_requests_total[1m]))",
+        startSec,
+        endSec,
+        stepSec,
+        metricType: "REQUEST_RATE",
+      }),
+      this.queryRange({
+        query: "sum by (service) (rate(http_request_errors_total[1m]))",
+        startSec,
+        endSec,
+        stepSec,
+        metricType: "ERROR_RATE",
+      }),
+      this.queryRange({
+        query: "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
+        startSec,
+        endSec,
+        stepSec,
+        metricType: "LATENCY_AVG",
+      }),
+      this.queryRange({
+        query: "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))",
+        startSec,
+        endSec,
+        stepSec,
+        metricType: "LATENCY_P95",
+      }),
+    ]);
+
+    const diagnostics = [reqRange.diagnostic, errRange.diagnostic, latRange.diagnostic, p95Range.diagnostic];
+    const allRecords: NormalizedMetricRecord[] = [
+      ...reqRange.records,
+      ...errRange.records,
+      ...latRange.records,
+      ...p95Range.records,
+    ];
+
+    if (!reqRange.success) {
+      return {
+        success: false,
+        historyByService: new Map(),
+        records: allRecords,
+        diagnostics,
+      };
+    }
+
+    // Group historical points by service and timestamp
+    const historyMap = new Map<string, Map<string, ServiceHistoryPoint>>();
+
+    const getOrCreatePoint = (service: string, timestamp: string): ServiceHistoryPoint => {
+      let svcMap = historyMap.get(service);
+      if (!svcMap) {
+        svcMap = new Map();
+        historyMap.set(service, svcMap);
+      }
+      let pt = svcMap.get(timestamp);
+      if (!pt) {
+        pt = { timestamp, latencyMs: 0, errorRate: 0, requestRate: 0 };
+        svcMap.set(timestamp, pt);
+      }
+      return pt;
+    };
+
+    for (const r of reqRange.records) {
+      const pt = getOrCreatePoint(r.serviceName, r.timestamp);
+      pt.requestRate = Math.round(r.value);
+    }
+
+    for (const e of errRange.records) {
+      const pt = getOrCreatePoint(e.serviceName, e.timestamp);
+      if (pt.requestRate > 0) {
+        pt.errorRate = Number(Math.min(100, Math.max(0, (e.value / pt.requestRate) * 100)).toFixed(2));
+      } else {
+        pt.errorRate = 0;
+      }
+    }
+
+    for (const l of latRange.records) {
+      const pt = getOrCreatePoint(l.serviceName, l.timestamp);
+      pt.latencyMs = Math.round(l.value);
+    }
+
+    for (const p of p95Range.records) {
+      const pt = getOrCreatePoint(p.serviceName, p.timestamp);
+      if (!isNaN(p.value) && p.value > 0) {
+        pt.latencyP95Ms = Math.round(p.value);
+      }
+    }
+
+    const historyByService = new Map<string, ServiceHistoryPoint[]>();
+    for (const [svc, ptsMap] of historyMap.entries()) {
+      const sortedPts = Array.from(ptsMap.values()).sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+      historyByService.set(svc, sortedPts);
+    }
+
+    return {
+      success: true,
+      historyByService,
+      records: allRecords,
+      diagnostics,
+    };
   }
 }
 

@@ -18,6 +18,7 @@ import {
 } from "../src/lib/telemetry/multiServiceIncident";
 import { RootCauseEngine } from "../src/lib/algorithms/rootCauseEngine";
 import { TelemetryPoint } from "../src/lib/algorithms/types";
+import { evaluateMockPromQl } from "../sample-services/mock-observability";
 
 describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
   const originalFetch = global.fetch;
@@ -163,6 +164,283 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(zeroTrafficMetrics?.latencyMs).toBe(0);
     });
 
+    it("never falls back to raw cumulative counter totals when rate query fails or returns empty", async () => {
+      const queriedUrls: string[] = [];
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        queriedUrls.push(decoded);
+        // Rate query returns empty result or fails
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [] },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const detailed = await client.getServiceMetricsDetailed();
+
+      // When rate query returns empty, metrics must remain empty (no raw counter fallback)
+      expect(detailed.metrics.size).toBe(0);
+      // Ensure raw cumulative counters were NEVER queried as substitutes
+      for (const u of queriedUrls) {
+        expect(u).not.toMatch(/[?&]query=http_requests_total(?:&|$)/);
+        expect(u).not.toMatch(/[?&]query=http_request_errors_total(?:&|$)/);
+      }
+    });
+
+    it("correctly aggregates multi-instance series per service and computes weighted error percentage", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  { metric: { service: "order-service", instance: "order-1" }, value: [1730000000, "150.0"] },
+                  { metric: { service: "order-service", instance: "order-2" }, value: [1730000000, "100.0"] },
+                  { metric: { service: "payment-service", instance: "pay-1" }, value: [1730000000, "80.0"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("rate(http_request_errors_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  { metric: { service: "order-service", instance: "order-1" }, value: [1730000000, "3.0"] },
+                  { metric: { service: "order-service", instance: "order-2" }, value: [1730000000, "4.0"] },
+                  { metric: { service: "payment-service", instance: "pay-1" }, value: [1730000000, "0.0"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("duration_seconds_sum")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  { metric: { service: "order-service", instance: "order-1" }, value: [1730000000, "0.040"] },
+                  { metric: { service: "order-service", instance: "order-2" }, value: [1730000000, "0.060"] },
+                  { metric: { service: "payment-service", instance: "pay-1" }, value: [1730000000, "0.020"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const detailed = await client.getServiceMetricsDetailed();
+
+      expect(detailed.success).toBe(true);
+      const orderMetrics = detailed.metrics.get("order-service");
+      expect(orderMetrics).toBeDefined();
+      // Total request rate across instances: 150 + 100 = 250 req/s
+      expect(orderMetrics?.requestRate).toBe(250);
+      // Total error rate across instances: ( (3.0 + 4.0) / 250 ) * 100 = (7.0 / 250) * 100 = 2.8%
+      expect(orderMetrics?.errorRate).toBe(2.8);
+      // Latency average across 2 instances: (40ms + 60ms) / 2 = 50ms
+      expect(orderMetrics?.latencyMs).toBe(50);
+      expect(orderMetrics?.instanceCount).toBe(2);
+
+      const payMetrics = detailed.metrics.get("payment-service");
+      expect(payMetrics).toBeDefined();
+      expect(payMetrics?.requestRate).toBe(80);
+      expect(payMetrics?.errorRate).toBe(0);
+      expect(payMetrics?.latencyMs).toBe(20);
+      expect(payMetrics?.instanceCount).toBe(1);
+    });
+
+    it("calculates P95 histogram quantile and distinguishes it from average latency", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "200.0"] }] },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("duration_seconds_sum")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "0.035"] }] }, // 35ms average
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("histogram_quantile(0.95")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "0.085"] }] }, // 85ms P95
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const detailed = await client.getServiceMetricsDetailed();
+
+      expect(detailed.success).toBe(true);
+      expect(detailed.p95Supported).toBe(true);
+
+      const orderMetrics = detailed.metrics.get("order-service");
+      expect(orderMetrics).toBeDefined();
+      expect(orderMetrics?.latencyMs).toBe(35); // Average
+      expect(orderMetrics?.latencyP95Ms).toBe(85); // P95
+      expect(orderMetrics?.hasValidP95).toBe(true);
+      expect(orderMetrics?.latencyP95Ms).not.toBe(orderMetrics?.latencyMs);
+    });
+
+    it("reports hasValidP95: false when histogram bucket data is missing without fabricating numbers", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "200.0"] }] },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("duration_seconds_sum")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "0.035"] }] },
+            }),
+          } as unknown as Response);
+        }
+        // P95 histogram query returns empty (no histogram buckets in TSDB)
+        if (decoded.includes("histogram_quantile(0.95")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({ status: "success", data: { result: [] } }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const detailed = await client.getServiceMetricsDetailed();
+
+      const orderMetrics = detailed.metrics.get("order-service");
+      expect(orderMetrics).toBeDefined();
+      expect(orderMetrics?.hasValidP95).toBe(false);
+      expect(orderMetrics?.latencyP95Ms).toBeUndefined();
+      expect(detailed.p95Supported).toBe(false);
+    });
+
+    it("integrates bounded range queries into getServiceMetricsHistory preserving matrix timestamps", async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const startSec = nowSec - 300;
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("/api/v1/query_range")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [
+                  {
+                    metric: { service: "order-service" },
+                    values: [
+                      [startSec, "100.0"],
+                      [startSec + 60, "120.0"],
+                      [startSec + 120, "140.0"],
+                    ],
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(true);
+      expect(history.records.length).toBeGreaterThan(0);
+      // Verify preserved ISO timestamp matches Unix epoch seconds
+      expect(history.records[0].timestamp).toBe(new Date(startSec * 1000).toISOString());
+      expect(history.records[1].timestamp).toBe(new Date((startSec + 60) * 1000).toISOString());
+    });
+
     it("executes bounded Prometheus range queries (/api/v1/query_range) and normalizes matrix points", async () => {
       const nowSec = Math.floor(Date.now() / 1000);
       const startSec = nowSec - 300; // 5 min ago
@@ -247,15 +525,26 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(excessiveLookback.success).toBe(false);
       expect(excessiveLookback.diagnostic.message).toContain("exceeds maximum permitted lookback");
 
-      // 4. Excessive point count > 11,000 points
-      const excessivePoints = await client.queryRange({
+      // 4. Excessive point count: inclusive endpoints floor((end - start)/step) + 1 <= 11000
+      // startSec = 0, endSec = 11000, stepSec = 1 -> floor(11000/1) + 1 = 11,001 points > 11,000 limit
+      const boundaryExcessive = await client.queryRange({
         query: "up",
         startSec: 0,
-        endSec: 12000,
-        stepSec: 1, // 12,000 points > 11,000 limit
+        endSec: 11000,
+        stepSec: 1,
       });
-      expect(excessivePoints.success).toBe(false);
-      expect(excessivePoints.diagnostic.message).toContain("exceeds standard point limit");
+      expect(boundaryExcessive.success).toBe(false);
+      expect(boundaryExcessive.diagnostic.message).toContain("exceeds standard point limit");
+
+      // 5. Non-finite values
+      const nonFinite = await client.queryRange({
+        query: "up",
+        startSec: NaN,
+        endSec: 1000,
+        stepSec: 10,
+      });
+      expect(nonFinite.success).toBe(false);
+      expect(nonFinite.diagnostic.message).toContain("must be finite numbers");
     });
 
     it("enforces timeout covering response-body parsing rather than headers alone", async () => {
@@ -936,6 +1225,229 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(batch.mode).toBe("DEGRADED");
       expect(batch.metrics.length).toBe(0);
       expect(batch.spans.length).toBe(0);
+    });
+
+    it("transitions to DEGRADED when Tempo fails but Prometheus succeeds", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        // Prometheus succeeds
+        if (decoded.includes(":9090") || decoded.includes("/api/prom") || decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "vector",
+                result: [{ metric: { service: "order-service" }, value: [1730000000, "150.0"] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        // Tempo / Jaeger fails with 503
+        if (decoded.includes(":3200") || decoded.includes(":16686") || decoded.includes("/api/traces")) {
+          return Promise.resolve({
+            ok: false,
+            status: 503,
+            statusText: "Service Unavailable",
+            text: async () => "Tempo distributor unreachable",
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      const batch = await manager.getNormalizedBatch();
+      expect(batch.mode).toBe("DEGRADED");
+      const tempoDiag = batch.diagnostics.find((d) => d.provider === "TEMPO");
+      expect(tempoDiag?.status).toBe("ERROR");
+      expect(manager.getLastIngestedAt()).toBeNull();
+    });
+
+    it("strictly isolates SIMULATION mode and executes zero external network requests across all telemetry entry points", async () => {
+      const fetchSpy = vi.spyOn(global, "fetch");
+
+      const manager = new TelemetryManager();
+      manager.setMode("SIMULATION");
+
+      // 1. Normalized Batch
+      const batch = await manager.getNormalizedBatch();
+      expect(batch.mode).toBe("SIMULATION");
+      expect(batch.metrics.length).toBeGreaterThan(0);
+      for (const m of batch.metrics) {
+        expect(m.provider).toBe("SIMULATION");
+      }
+
+      // 2. Observed Services
+      const overview = await manager.getObservedServices();
+      expect(overview.mode).toBe("SIMULATION");
+      for (const s of overview.observedServices) {
+        expect(s.source).toBe("SIMULATION");
+      }
+
+      // 3. Recent Traces
+      const traces = await manager.getRecentTraces();
+      expect(traces).toEqual([]);
+
+      // 4. Trace Detail
+      const detail = await manager.getTraceDetail("trace-sim-001");
+      expect(detail).toBeNull();
+
+      // STRICT ISOLATION PROOF: Zero network calls made
+      expect(fetchSpy).not.toHaveBeenCalled();
+      // lastIngestedAt is NOT updated in simulation
+      expect(manager.getLastIngestedAt()).toBeNull();
+    });
+
+    it("only updates lastIngestedAt timestamp after fully validated LIVE collection", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      // Initial state is null
+      expect(manager.getLastIngestedAt()).toBeNull();
+
+      // Degraded run (offline backends)
+      global.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+      await manager.getNormalizedBatch();
+      expect(manager.getLastIngestedAt()).toBeNull();
+
+      // Verified LIVE run
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "150.0"] }] },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("/api/v1/query_range")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "order-service" }, values: [[1730000000, "150.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("/api/traces") || decoded.includes("/api/search")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              traces: [
+                {
+                  traceID: "tr-live-verified",
+                  rootServiceName: "order-service",
+                  durationMs: 45,
+                  spanSet: {
+                    spans: [
+                      {
+                        spanID: "sp-1",
+                        operationName: "POST /order",
+                        startTime: 1730000000000,
+                        duration: 45000,
+                        tags: [],
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const liveBatch = await manager.getNormalizedBatch();
+      expect(liveBatch.mode).toBe("LIVE");
+      expect(manager.getLastIngestedAt()).not.toBeNull();
+      const lastIngested = new Date(manager.getLastIngestedAt()!).getTime();
+      expect(Number.isFinite(lastIngested)).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 6. Mock Observability Server & PromQL Evaluation Suite
+  // =========================================================================
+  describe("Mock Observability Server & PromQL Evaluation", () => {
+    it("evaluates supported PromQL expressions deterministically and rejects unsupported queries", () => {
+      const nowSec = 1730000000;
+
+      // 1. Health checks
+      const upPoints = evaluateMockPromQl("up", nowSec);
+      expect(upPoints).not.toBeNull();
+      expect(upPoints!.length).toBeGreaterThan(0);
+      expect(upPoints![0].value[1]).toBe("1");
+      expect(upPoints![0].metric["instance"]).toBeDefined();
+
+      const vecPoints = evaluateMockPromQl("vector(1)", nowSec);
+      expect(vecPoints).toEqual([{ metric: {}, value: [nowSec, "1"] }]);
+
+      // 2. Request rates
+      const ratePoints = evaluateMockPromQl("sum by (service) (rate(http_requests_total[1m]))", nowSec);
+      expect(ratePoints).not.toBeNull();
+      expect(ratePoints!.length).toBeGreaterThan(0);
+      expect(ratePoints![0].metric["service"]).toBeDefined();
+
+      // 3. Error rates
+      const errPoints = evaluateMockPromQl("sum by (service) (rate(http_request_errors_total[1m]))", nowSec);
+      expect(errPoints).not.toBeNull();
+      expect(errPoints!.length).toBeGreaterThan(0);
+
+      // 4. Histogram sum/count latency
+      const latPoints = evaluateMockPromQl(
+        "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
+        nowSec
+      );
+      expect(latPoints).not.toBeNull();
+      expect(latPoints!.length).toBeGreaterThan(0);
+      expect(parseFloat(latPoints![0].value[1])).toBeGreaterThan(0);
+
+      // 5. P95 Histogram Quantile
+      const p95Points = evaluateMockPromQl(
+        "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))",
+        nowSec
+      );
+      expect(p95Points).not.toBeNull();
+      expect(p95Points!.length).toBeGreaterThan(0);
+      expect(parseFloat(p95Points![0].value[1])).toBeGreaterThan(0);
+
+      // 6. Histogram buckets with le labels
+      const bucketPoints = evaluateMockPromQl(
+        "sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))",
+        nowSec
+      );
+      expect(bucketPoints).not.toBeNull();
+      expect(bucketPoints!.length).toBeGreaterThan(0);
+      expect(bucketPoints![0].metric["le"]).toBeDefined();
+
+      // 7. Unsupported expressions return null (mock server responds 400 Bad Request)
+      const unsupported = evaluateMockPromQl("unknown_metric{foo='bar'}", nowSec);
+      expect(unsupported).toBeNull();
     });
   });
 });

@@ -160,6 +160,125 @@ export function startOtlpReceiver(port: number = 4318): http.Server {
   return server;
 }
 
+export interface MockSeriesPoint {
+  metric: Record<string, string>;
+  value: [number, string];
+}
+
+export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoint[] | null {
+  const q = query.trim();
+  const rawServices = obsStore.getObservedServices();
+  const services = rawServices.length > 0 ? rawServices : ["api-gateway", "order-service", "payment-service", "inventory-service"];
+
+  // 1. Health checks
+  if (q === "up") {
+    const points: MockSeriesPoint[] = [];
+    for (const s of services) {
+      points.push({ metric: { service: s, instance: `${s}-inst-1` }, value: [nowSec, "1"] });
+      points.push({ metric: { service: s, instance: `${s}-inst-2` }, value: [nowSec, "1"] });
+    }
+    return points;
+  }
+  if (q === "vector(1)") {
+    return [{ metric: {}, value: [nowSec, "1"] }];
+  }
+
+  // 2. Request rate
+  if (q === "sum by (service) (rate(http_requests_total[1m]))") {
+    return services.map((s) => {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const rate = Math.max(stats.requestCount * 10, 100);
+      return { metric: { service: s }, value: [nowSec, String(rate.toFixed(1))] };
+    });
+  }
+  if (q === "rate(http_requests_total[1m])") {
+    const points: MockSeriesPoint[] = [];
+    for (const s of services) {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const totalRate = Math.max(stats.requestCount * 10, 100);
+      const halfRate = (totalRate / 2).toFixed(1);
+      points.push({ metric: { service: s, instance: `${s}-inst-1` }, value: [nowSec, halfRate] });
+      points.push({ metric: { service: s, instance: `${s}-inst-2` }, value: [nowSec, halfRate] });
+    }
+    return points;
+  }
+
+  // 3. Error rate
+  if (q === "sum by (service) (rate(http_request_errors_total[1m]))") {
+    return services.map((s) => {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const rate = stats.errorCount * 2;
+      return { metric: { service: s }, value: [nowSec, String(rate.toFixed(1))] };
+    });
+  }
+  if (q === "rate(http_request_errors_total[1m])") {
+    const points: MockSeriesPoint[] = [];
+    for (const s of services) {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const totalRate = stats.errorCount * 2;
+      const halfRate = (totalRate / 2).toFixed(1);
+      points.push({ metric: { service: s, instance: `${s}-inst-1` }, value: [nowSec, halfRate] });
+      points.push({ metric: { service: s, instance: `${s}-inst-2` }, value: [nowSec, halfRate] });
+    }
+    return points;
+  }
+
+  // 4. Histogram sum/count average latency
+  if (
+    q === "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))" ||
+    q === "rate(http_request_duration_seconds_sum[1m]) / rate(http_request_duration_seconds_count[1m])"
+  ) {
+    return services.map((s) => {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const latencySec = (stats.avgLatency || 35) / 1000;
+      return { metric: { service: s }, value: [nowSec, String(latencySec.toFixed(4))] };
+    });
+  }
+
+  if (q === "sum by (service) (rate(http_request_duration_seconds_sum[1m]))") {
+    return services.map((s) => {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const sumSec = ((stats.avgLatency || 35) / 1000) * 100;
+      return { metric: { service: s }, value: [nowSec, String(sumSec.toFixed(4))] };
+    });
+  }
+
+  if (q === "sum by (service) (rate(http_request_duration_seconds_count[1m]))") {
+    return services.map((s) => {
+      return { metric: { service: s }, value: [nowSec, "100.0"] };
+    });
+  }
+
+  // 5. P95 Histogram Quantile
+  if (q === "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))") {
+    return services.map((s) => {
+      const stats = obsStore.getMetricsSummary(s, 15);
+      const p95Sec = (stats.p95Latency || 55) / 1000;
+      return { metric: { service: s }, value: [nowSec, String(p95Sec.toFixed(4))] };
+    });
+  }
+
+  // 6. Histogram buckets
+  if (
+    q === "sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))" ||
+    q === "rate(http_request_duration_seconds_bucket[1m])"
+  ) {
+    const buckets = ["0.010", "0.025", "0.050", "0.100", "0.250", "0.500", "1.000", "+Inf"];
+    const points: MockSeriesPoint[] = [];
+    for (const s of services) {
+      let cumulative = 10;
+      for (const le of buckets) {
+        cumulative += 15;
+        points.push({ metric: { service: s, le }, value: [nowSec, String(cumulative)] });
+      }
+    }
+    return points;
+  }
+
+  // Unsupported expression
+  return null;
+}
+
 // ----------------------------------------------------------------------
 // 2. Prometheus Query API Server (Port 9090)
 // Supports /api/v1/query and /api/v1/query_range
@@ -190,26 +309,17 @@ export function startPrometheusServer(port: number = 9090): http.Server {
 
     if (url.pathname === "/api/v1/query") {
       const query = url.searchParams.get("query") || "";
-      const result = [];
+      const nowSec = Math.floor(Date.now() / 1000);
+      const evaluated = evaluateMockPromQl(query, nowSec);
 
-      for (const service of obsStore.getObservedServices()) {
-        const stats = obsStore.getMetricsSummary(service, 15);
-        if (query.includes("http_request_duration_seconds") || query.includes("latency")) {
-          result.push({
-            metric: { service, job: "otel-collector", instance: `${service}:4000` },
-            value: [Date.now() / 1000, String(stats.p95Latency / 1000)], // in seconds
-          });
-        } else if (query.includes("error")) {
-          result.push({
-            metric: { service, job: "otel-collector", instance: `${service}:4000` },
-            value: [Date.now() / 1000, String(stats.errorRate)],
-          });
-        } else {
-          result.push({
-            metric: { service, job: "otel-collector", instance: `${service}:4000` },
-            value: [Date.now() / 1000, String(stats.requestCount)],
-          });
-        }
+      if (!evaluated) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "error",
+          errorType: "bad_data",
+          error: `Unsupported PromQL expression in mock observability server: ${query}`,
+        }));
+        return;
       }
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -217,7 +327,56 @@ export function startPrometheusServer(port: number = 9090): http.Server {
         status: "success",
         data: {
           resultType: "vector",
-          result,
+          result: evaluated,
+        },
+      }));
+      return;
+    }
+
+    if (url.pathname === "/api/v1/query_range") {
+      const query = url.searchParams.get("query") || "";
+      const startSec = Number(url.searchParams.get("start"));
+      const endSec = Number(url.searchParams.get("end"));
+      const stepSec = Number(url.searchParams.get("step"));
+
+      if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || !Number.isFinite(stepSec) || startSec >= endSec || stepSec <= 0) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "error",
+          errorType: "bad_data",
+          error: "Invalid range query parameters (start, end, step)",
+        }));
+        return;
+      }
+
+      const evaluated = evaluateMockPromQl(query, endSec);
+      if (!evaluated) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "error",
+          errorType: "bad_data",
+          error: `Unsupported PromQL expression in mock observability server: ${query}`,
+        }));
+        return;
+      }
+
+      const matrixResult = evaluated.map((item) => {
+        const values: Array<[number, string]> = [];
+        for (let t = startSec; t <= endSec; t += stepSec) {
+          values.push([t, item.value[1]]);
+        }
+        return {
+          metric: item.metric,
+          values,
+        };
+      });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "success",
+        data: {
+          resultType: "matrix",
+          result: matrixResult,
         },
       }));
       return;

@@ -13,7 +13,7 @@ export const TelemetryErrorCodeSchema = z.enum([
 export type TelemetryErrorCode = z.infer<typeof TelemetryErrorCodeSchema>;
 
 export interface ProviderDiagnostic {
-  provider: "PROMETHEUS" | "TEMPO" | "OTLP" | "SIMULATED";
+  provider: "PROMETHEUS" | "TEMPO" | "OTLP" | "SIMULATED" | "SIMULATION";
   endpoint: string;
   status: "OK" | "ERROR";
   errorCode?: TelemetryErrorCode;
@@ -75,7 +75,7 @@ export const NormalizedTelemetryBatchSchema = z.object({
   spans: z.array(NormalizedTraceSpanSchema),
   diagnostics: z.array(
     z.object({
-      provider: z.enum(["PROMETHEUS", "TEMPO", "OTLP", "SIMULATED"]),
+      provider: z.enum(["PROMETHEUS", "TEMPO", "OTLP", "SIMULATED", "SIMULATION"]),
       endpoint: z.string(),
       status: z.enum(["OK", "ERROR"]),
       errorCode: TelemetryErrorCodeSchema.optional(),

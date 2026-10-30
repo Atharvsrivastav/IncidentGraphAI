@@ -8,7 +8,7 @@ export interface BackendHealthStatus {
   isMockBackend: boolean;
   isCloudBackend: boolean;
   cloudConfigured: boolean;
-  backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE";
+  backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" | "SIMULATION";
   details?: string;
   lastChecked: string;
   lastIngestedAt?: string;
@@ -20,6 +20,8 @@ export interface ObservedServiceMetric {
   source: "PROMETHEUS" | "JAEGER" | "SIMULATION";
   status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
   latencyMs: number;
+  latencyP95Ms?: number;
+  hasValidP95?: boolean;
   errorRate: number; // 0 - 100 percentage
   requestRate: number; // req/sec
   lastObserved: string;
