@@ -13,31 +13,166 @@ export interface StoredSpan {
   attributes: Record<string, unknown>;
 }
 
-export interface ServiceMetricRecord {
+export interface StoredObservation {
   serviceName: string;
-  timestamp: number;
+  instance: string;
+  timestampMs: number;
   latencyMs: number;
-  errorCount: number;
+  isError: boolean;
   requestCount: number;
+}
+
+export interface HistogramBucketCount {
+  le: string;
+  bound: number;
+  count: number;
+}
+
+export const PROMETHEUS_LATENCY_BUCKETS = [
+  0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.250, 0.500, 0.750, 1.000, 2.500, 5.000, 10.000, Infinity,
+];
+export const PROMETHEUS_LE_STRINGS = [
+  "0.005", "0.010", "0.025", "0.050", "0.075", "0.100", "0.250", "0.500", "0.750", "1.000", "2.500", "5.000", "10.000", "+Inf",
+];
+
+export function computeHistogramBuckets(latenciesSec: number[]): HistogramBucketCount[] {
+  const sorted = [...latenciesSec].sort((a, b) => a - b);
+  const total = sorted.length;
+  const result: HistogramBucketCount[] = [];
+
+  for (let i = 0; i < PROMETHEUS_LATENCY_BUCKETS.length; i++) {
+    const bound = PROMETHEUS_LATENCY_BUCKETS[i];
+    const le = PROMETHEUS_LE_STRINGS[i];
+    if (bound === Infinity) {
+      result.push({ le, bound, count: total });
+    } else {
+      let count = 0;
+      for (const lat of sorted) {
+        if (lat <= bound) count++;
+        else break;
+      }
+      result.push({ le, bound, count });
+    }
+  }
+  return result;
+}
+
+export function calculateHistogramQuantile(q: number, buckets: HistogramBucketCount[]): number {
+  if (buckets.length === 0) return 0;
+  const infBucket = buckets.find((b) => b.bound === Infinity) || buckets[buckets.length - 1];
+  const totalCount = infBucket.count;
+  if (totalCount === 0) return 0;
+
+  const rank = q * totalCount;
+
+  let bucketIdx = 0;
+  while (bucketIdx < buckets.length && buckets[bucketIdx].count < rank) {
+    bucketIdx++;
+  }
+  if (bucketIdx >= buckets.length) {
+    bucketIdx = buckets.length - 1;
+  }
+
+  const current = buckets[bucketIdx];
+  const prevCount = bucketIdx === 0 ? 0 : buckets[bucketIdx - 1].count;
+  const prevBound = bucketIdx === 0 ? 0 : buckets[bucketIdx - 1].bound;
+  const currentBound = current.bound;
+
+  if (currentBound === Infinity) {
+    return prevBound;
+  }
+  if (current.count === prevCount) {
+    return prevBound;
+  }
+
+  const fraction = (rank - prevCount) / (current.count - prevCount);
+  const interpolated = prevBound + (currentBound - prevBound) * fraction;
+  return Number(interpolated.toFixed(4));
 }
 
 class ObservabilityStore {
   private spans: StoredSpan[] = [];
-  private metrics: ServiceMetricRecord[] = [];
+  private observations: StoredObservation[] = [];
+
+  constructor() {
+    this.seedBaselineObservations();
+  }
+
+  public seedBaselineObservations() {
+    this.observations = [];
+    const nowMs = Date.now();
+    const services = ["api-gateway", "order-service", "payment-service", "inventory-service"];
+
+    // Seed 15 minutes of varying historical observations (now - 15m to now)
+    // Every 15 seconds, generate observations for both inst-1 and inst-2
+    for (let offsetSec = 900; offsetSec >= 0; offsetSec -= 15) {
+      const tsMs = nowMs - offsetSec * 1000;
+
+      for (const s of services) {
+        // Vary latency and errors over time to produce realistic time-series variation:
+        // Earlier traffic (offset 900-500s): calm, baseline latency ~25ms, 0 errors
+        // Middle traffic (offset 500-200s): rising load, latency ~60ms
+        // Recent traffic (offset 200-0s): spike, latency ~140ms for payment, error surge
+        const isRecent = offsetSec < 240;
+        const isMiddle = offsetSec >= 240 && offsetSec < 600;
+
+        let baseLatency = 25;
+        let isError = false;
+
+        if (s === "payment-service") {
+          baseLatency = isRecent ? 140 : (isMiddle ? 65 : 30);
+          isError = isRecent && (offsetSec % 30 === 0);
+        } else if (s === "order-service") {
+          baseLatency = isRecent ? 95 : (isMiddle ? 45 : 28);
+          isError = isRecent && (offsetSec % 45 === 0);
+        } else if (s === "api-gateway") {
+          baseLatency = isRecent ? 110 : 35;
+          isError = isRecent && (offsetSec % 60 === 0);
+        } else {
+          baseLatency = isMiddle ? 40 : 20;
+        }
+
+        // Add instance 1
+        this.observations.push({
+          serviceName: s,
+          instance: `${s}-inst-1`,
+          timestampMs: tsMs,
+          latencyMs: baseLatency + (offsetSec % 7),
+          isError,
+          requestCount: 5 + (offsetSec % 3),
+        });
+
+        // Add instance 2
+        this.observations.push({
+          serviceName: s,
+          instance: `${s}-inst-2`,
+          timestampMs: tsMs,
+          latencyMs: baseLatency + (offsetSec % 5) + 2,
+          isError,
+          requestCount: 4 + (offsetSec % 4),
+        });
+      }
+    }
+  }
+
+  public addObservation(obs: StoredObservation) {
+    this.observations.push(obs);
+    if (this.observations.length > 20000) this.observations.shift();
+  }
 
   public addSpan(span: StoredSpan) {
     this.spans.unshift(span);
     if (this.spans.length > 2000) this.spans.pop();
 
-    // Derive metric aggregation point from real span
-    this.metrics.push({
+    this.observations.push({
       serviceName: span.serviceName,
-      timestamp: Date.now(),
+      instance: (span.attributes?.["service.instance.id"] as string) || `${span.serviceName}-inst-1`,
+      timestampMs: Math.round(span.startTimeUnixNano / 1e6) || Date.now(),
       latencyMs: span.durationMs,
-      errorCount: span.status.code === 2 ? 1 : 0,
+      isError: span.status.code === 2,
       requestCount: 1,
     });
-    if (this.metrics.length > 5000) this.metrics.shift();
+    if (this.observations.length > 20000) this.observations.shift();
   }
 
   public getSpans(serviceName?: string, limit: number = 50): StoredSpan[] {
@@ -49,20 +184,29 @@ class ObservabilityStore {
     return this.spans.filter((s) => s.traceId === traceId);
   }
 
+  public getObservations(serviceName?: string, startMs?: number, endMs?: number): StoredObservation[] {
+    return this.observations.filter((o) => {
+      if (serviceName && o.serviceName !== serviceName) return false;
+      if (startMs !== undefined && o.timestampMs < startMs) return false;
+      if (endMs !== undefined && o.timestampMs > endMs) return false;
+      return true;
+    });
+  }
+
   public getMetricsSummary(serviceName: string, lookbackMinutes: number = 15) {
     const cutoff = Date.now() - lookbackMinutes * 60 * 1000;
-    const filtered = this.metrics.filter((m) => m.serviceName === serviceName && m.timestamp >= cutoff);
+    const filtered = this.observations.filter((m) => m.serviceName === serviceName && m.timestampMs >= cutoff);
     if (filtered.length === 0) {
       return { requestCount: 0, errorCount: 0, avgLatency: 0, p95Latency: 0, errorRate: 0 };
     }
 
-    const totalRequests = filtered.length;
-    const totalErrors = filtered.reduce((acc, m) => acc + m.errorCount, 0);
-    const latencies = filtered.map((m) => m.latencyMs).sort((a, b) => a - b);
-    const avgLatency = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length);
-    const p95Index = Math.floor(latencies.length * 0.95);
-    const p95Latency = latencies[p95Index] || latencies[latencies.length - 1];
-    const errorRate = Number(((totalErrors / totalRequests) * 100).toFixed(2));
+    const totalRequests = filtered.reduce((acc, m) => acc + m.requestCount, 0);
+    const totalErrors = filtered.filter((m) => m.isError).reduce((acc, m) => acc + m.requestCount, 0);
+    const latenciesSec = filtered.map((m) => m.latencyMs / 1000);
+    const avgLatency = Math.round(filtered.reduce((acc, m) => acc + m.latencyMs, 0) / filtered.length);
+    const buckets = computeHistogramBuckets(latenciesSec);
+    const p95Latency = Math.round(calculateHistogramQuantile(0.95, buckets) * 1000);
+    const errorRate = totalRequests > 0 ? Number(((totalErrors / totalRequests) * 100).toFixed(2)) : 0;
 
     return {
       requestCount: totalRequests,
@@ -75,6 +219,9 @@ class ObservabilityStore {
 
   public getObservedServices(): string[] {
     const set = new Set<string>();
+    for (const o of this.observations) {
+      if (o.serviceName) set.add(o.serviceName);
+    }
     for (const s of this.spans) {
       if (s.serviceName) set.add(s.serviceName);
     }
@@ -83,7 +230,7 @@ class ObservabilityStore {
 
   public clear() {
     this.spans = [];
-    this.metrics = [];
+    this.observations = [];
   }
 }
 
@@ -165,10 +312,25 @@ export interface MockSeriesPoint {
   value: [number, string];
 }
 
+export interface MockMatrixPoint {
+  metric: Record<string, string>;
+  values: Array<[number, string]>;
+}
+
 export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoint[] | null {
   const q = query.trim();
   const rawServices = obsStore.getObservedServices();
-  const services = rawServices.length > 0 ? rawServices : ["api-gateway", "order-service", "payment-service", "inventory-service"];
+  if (rawServices.length === 0) return [];
+
+  const services = rawServices;
+  const wStart = (nowSec - 60) * 1000;
+  const wEnd = nowSec * 1000;
+  const windowSec = 60;
+
+  const getObs = (s: string) => {
+    const inWin = obsStore.getObservations(s, wStart, wEnd);
+    return inWin.length > 0 ? inWin : obsStore.getObservations(s);
+  };
 
   // 1. Health checks
   if (q === "up") {
@@ -186,19 +348,21 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
   // 2. Request rate
   if (q === "sum by (service) (rate(http_requests_total[1m]))") {
     return services.map((s) => {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const rate = Math.max(stats.requestCount * 10, 100);
-      return { metric: { service: s }, value: [nowSec, String(rate.toFixed(1))] };
+      const obs = getObs(s);
+      const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+      const rate = totalReq / windowSec;
+      return { metric: { service: s }, value: [nowSec, String(Number(rate.toFixed(2)))] };
     });
   }
   if (q === "rate(http_requests_total[1m])") {
     const points: MockSeriesPoint[] = [];
     for (const s of services) {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const totalRate = Math.max(stats.requestCount * 10, 100);
-      const halfRate = (totalRate / 2).toFixed(1);
-      points.push({ metric: { service: s, instance: `${s}-inst-1` }, value: [nowSec, halfRate] });
-      points.push({ metric: { service: s, instance: `${s}-inst-2` }, value: [nowSec, halfRate] });
+      for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
+        const obs = getObs(s).filter((o) => o.instance === inst);
+        const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+        const rate = totalReq / windowSec;
+        points.push({ metric: { service: s, instance: inst }, value: [nowSec, String(Number(rate.toFixed(2)))] });
+      }
     }
     return points;
   }
@@ -206,19 +370,21 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
   // 3. Error rate
   if (q === "sum by (service) (rate(http_request_errors_total[1m]))") {
     return services.map((s) => {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const rate = stats.errorCount * 2;
-      return { metric: { service: s }, value: [nowSec, String(rate.toFixed(1))] };
+      const obs = getObs(s);
+      const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
+      const rate = errReq / windowSec;
+      return { metric: { service: s }, value: [nowSec, String(Number(rate.toFixed(2)))] };
     });
   }
   if (q === "rate(http_request_errors_total[1m])") {
     const points: MockSeriesPoint[] = [];
     for (const s of services) {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const totalRate = stats.errorCount * 2;
-      const halfRate = (totalRate / 2).toFixed(1);
-      points.push({ metric: { service: s, instance: `${s}-inst-1` }, value: [nowSec, halfRate] });
-      points.push({ metric: { service: s, instance: `${s}-inst-2` }, value: [nowSec, halfRate] });
+      for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
+        const obs = getObs(s).filter((o) => o.instance === inst);
+        const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
+        const rate = errReq / windowSec;
+        points.push({ metric: { service: s, instance: inst }, value: [nowSec, String(Number(rate.toFixed(2)))] });
+      }
     }
     return points;
   }
@@ -229,32 +395,48 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
     q === "rate(http_request_duration_seconds_sum[1m]) / rate(http_request_duration_seconds_count[1m])"
   ) {
     return services.map((s) => {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const latencySec = (stats.avgLatency || 35) / 1000;
-      return { metric: { service: s }, value: [nowSec, String(latencySec.toFixed(4))] };
+      const obs = getObs(s);
+      const latObs = obs.filter((o) => o.latencyMs > 0);
+      const totalReq = latObs.reduce((sum, o) => sum + o.requestCount, 0);
+      const totalLatencyMs = latObs.reduce((sum, o) => sum + o.latencyMs * o.requestCount, 0);
+      const avgLatencySec = totalReq > 0 ? totalLatencyMs / totalReq / 1000 : 0;
+      return { metric: { service: s }, value: [nowSec, String(Number(avgLatencySec.toFixed(4)))] };
     });
   }
 
   if (q === "sum by (service) (rate(http_request_duration_seconds_sum[1m]))") {
     return services.map((s) => {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const sumSec = ((stats.avgLatency || 35) / 1000) * 100;
-      return { metric: { service: s }, value: [nowSec, String(sumSec.toFixed(4))] };
+      const obs = getObs(s);
+      const latObs = obs.filter((o) => o.latencyMs > 0);
+      const sumSec = latObs.reduce((sum, o) => sum + (o.latencyMs / 1000) * o.requestCount, 0) / windowSec;
+      return { metric: { service: s }, value: [nowSec, String(Number(sumSec.toFixed(4)))] };
     });
   }
 
   if (q === "sum by (service) (rate(http_request_duration_seconds_count[1m]))") {
     return services.map((s) => {
-      return { metric: { service: s }, value: [nowSec, "100.0"] };
+      const obs = getObs(s);
+      const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+      const rate = totalReq / windowSec;
+      return { metric: { service: s }, value: [nowSec, String(Number(rate.toFixed(2)))] };
     });
   }
 
   // 5. P95 Histogram Quantile
   if (q === "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))") {
     return services.map((s) => {
-      const stats = obsStore.getMetricsSummary(s, 15);
-      const p95Sec = (stats.p95Latency || 55) / 1000;
-      return { metric: { service: s }, value: [nowSec, String(p95Sec.toFixed(4))] };
+      const obs = getObs(s);
+      const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
+      const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
+      const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
+      const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
+      const aggBuckets: HistogramBucketCount[] = b1.map((bucket, idx) => ({
+        le: bucket.le,
+        bound: bucket.bound,
+        count: bucket.count + (b2[idx]?.count || 0),
+      }));
+      const p95Sec = calculateHistogramQuantile(0.95, aggBuckets);
+      return { metric: { service: s }, value: [nowSec, String(Number(p95Sec.toFixed(4)))] };
     });
   }
 
@@ -263,16 +445,208 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
     q === "sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))" ||
     q === "rate(http_request_duration_seconds_bucket[1m])"
   ) {
-    const buckets = ["0.010", "0.025", "0.050", "0.100", "0.250", "0.500", "1.000", "+Inf"];
     const points: MockSeriesPoint[] = [];
     for (const s of services) {
-      let cumulative = 10;
-      for (const le of buckets) {
-        cumulative += 15;
-        points.push({ metric: { service: s, le }, value: [nowSec, String(cumulative)] });
+      const obs = getObs(s);
+      const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
+      const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
+      const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
+      const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
+      for (let idx = 0; idx < b1.length; idx++) {
+        const count = b1[idx].count + (b2[idx]?.count || 0);
+        points.push({ metric: { service: s, le: b1[idx].le }, value: [nowSec, String(count)] });
       }
     }
     return points;
+  }
+
+  // Unsupported expression
+  return null;
+}
+
+export function evaluateMockPromQlRange(
+  query: string,
+  startSec: number,
+  endSec: number,
+  stepSec: number
+): MockMatrixPoint[] | null {
+  const q = query.trim();
+  const rawServices = obsStore.getObservedServices();
+  if (rawServices.length === 0) return [];
+
+  // Check if there are any observations in the requested time range
+  const observationsInRange = obsStore.getObservations(undefined, startSec * 1000, endSec * 1000);
+  if (observationsInRange.length === 0) {
+    // If there is insufficient stored history in the range, represent that honestly
+    return [];
+  }
+
+  const services = rawServices;
+  const timestamps: number[] = [];
+  for (let t = startSec; t <= endSec; t += stepSec) {
+    timestamps.push(t);
+  }
+
+  // 1. Health checks
+  if (q === "up") {
+    const results: MockMatrixPoint[] = [];
+    for (const s of services) {
+      results.push({
+        metric: { service: s, instance: `${s}-inst-1` },
+        values: timestamps.map((t) => [t, "1"]),
+      });
+      results.push({
+        metric: { service: s, instance: `${s}-inst-2` },
+        values: timestamps.map((t) => [t, "1"]),
+      });
+    }
+    return results;
+  }
+  if (q === "vector(1)") {
+    return [{ metric: {}, values: timestamps.map((t) => [t, "1"]) }];
+  }
+
+  // 2. Request rate
+  if (q === "sum by (service) (rate(http_requests_total[1m]))") {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+        const rate = totalReq / stepSec;
+        return [t, String(Number(rate.toFixed(2)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+  if (q === "rate(http_requests_total[1m])") {
+    const results: MockMatrixPoint[] = [];
+    for (const s of services) {
+      for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
+        const values: Array<[number, string]> = timestamps.map((t) => {
+          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000).filter((o) => o.instance === inst);
+          const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+          const rate = totalReq / stepSec;
+          return [t, String(Number(rate.toFixed(2)))];
+        });
+        results.push({ metric: { service: s, instance: inst }, values });
+      }
+    }
+    return results;
+  }
+
+  // 3. Error rate
+  if (q === "sum by (service) (rate(http_request_errors_total[1m]))") {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
+        const rate = errReq / stepSec;
+        return [t, String(Number(rate.toFixed(2)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+  if (q === "rate(http_request_errors_total[1m])") {
+    const results: MockMatrixPoint[] = [];
+    for (const s of services) {
+      for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
+        const values: Array<[number, string]> = timestamps.map((t) => {
+          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000).filter((o) => o.instance === inst);
+          const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
+          const rate = errReq / stepSec;
+          return [t, String(Number(rate.toFixed(2)))];
+        });
+        results.push({ metric: { service: s, instance: inst }, values });
+      }
+    }
+    return results;
+  }
+
+  // 4. Histogram sum/count average latency
+  if (
+    q === "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))" ||
+    q === "rate(http_request_duration_seconds_sum[1m]) / rate(http_request_duration_seconds_count[1m])"
+  ) {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const latObs = obs.filter((o) => o.latencyMs > 0);
+        const totalReq = latObs.reduce((sum, o) => sum + o.requestCount, 0);
+        const totalLatencyMs = latObs.reduce((sum, o) => sum + o.latencyMs * o.requestCount, 0);
+        const avgLatencySec = totalReq > 0 ? totalLatencyMs / totalReq / 1000 : 0;
+        return [t, String(Number(avgLatencySec.toFixed(4)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+
+  if (q === "sum by (service) (rate(http_request_duration_seconds_sum[1m]))") {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const latObs = obs.filter((o) => o.latencyMs > 0);
+        const sumSec = latObs.reduce((sum, o) => sum + (o.latencyMs / 1000) * o.requestCount, 0) / stepSec;
+        return [t, String(Number(sumSec.toFixed(4)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+
+  if (q === "sum by (service) (rate(http_request_duration_seconds_count[1m]))") {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
+        const rate = totalReq / stepSec;
+        return [t, String(Number(rate.toFixed(2)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+
+  // 5. P95 Histogram Quantile
+  if (q === "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))") {
+    return services.map((s) => {
+      const values: Array<[number, string]> = timestamps.map((t) => {
+        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
+        const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
+        const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
+        const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
+        const aggBuckets: HistogramBucketCount[] = b1.map((bucket, idx) => ({
+          le: bucket.le,
+          bound: bucket.bound,
+          count: bucket.count + (b2[idx]?.count || 0),
+        }));
+        const p95Sec = calculateHistogramQuantile(0.95, aggBuckets);
+        return [t, String(Number(p95Sec.toFixed(4)))];
+      });
+      return { metric: { service: s }, values };
+    });
+  }
+
+  // 6. Histogram buckets
+  if (
+    q === "sum by (le, service) (rate(http_request_duration_seconds_bucket[1m]))" ||
+    q === "rate(http_request_duration_seconds_bucket[1m])"
+  ) {
+    const results: MockMatrixPoint[] = [];
+    for (const s of services) {
+      for (const le of PROMETHEUS_LE_STRINGS) {
+        const values: Array<[number, string]> = timestamps.map((t) => {
+          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+          const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
+          const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
+          const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
+          const b2 = computeHistogramBuckets(inst2Obs.map((o) => o.latencyMs / 1000));
+          const count1 = b1.find((b) => b.le === le)?.count || 0;
+          const count2 = b2.find((b) => b.le === le)?.count || 0;
+          return [t, String(count1 + count2)];
+        });
+        results.push({ metric: { service: s, le }, values });
+      }
+    }
+    return results;
   }
 
   // Unsupported expression
@@ -349,8 +723,8 @@ export function startPrometheusServer(port: number = 9090): http.Server {
         return;
       }
 
-      const evaluated = evaluateMockPromQl(query, endSec);
-      if (!evaluated) {
+      const matrixResult = evaluateMockPromQlRange(query, startSec, endSec, stepSec);
+      if (matrixResult === null) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           status: "error",
@@ -359,17 +733,6 @@ export function startPrometheusServer(port: number = 9090): http.Server {
         }));
         return;
       }
-
-      const matrixResult = evaluated.map((item) => {
-        const values: Array<[number, string]> = [];
-        for (let t = startSec; t <= endSec; t += stepSec) {
-          values.push([t, item.value[1]]);
-        }
-        return {
-          metric: item.metric,
-          values,
-        };
-      });
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({

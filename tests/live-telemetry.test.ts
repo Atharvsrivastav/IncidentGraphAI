@@ -18,7 +18,14 @@ import {
 } from "../src/lib/telemetry/multiServiceIncident";
 import { RootCauseEngine } from "../src/lib/algorithms/rootCauseEngine";
 import { TelemetryPoint } from "../src/lib/algorithms/types";
-import { evaluateMockPromQl } from "../sample-services/mock-observability";
+import {
+  obsStore,
+  evaluateMockPromQl,
+  evaluateMockPromQlRange,
+  computeHistogramBuckets,
+  calculateHistogramQuantile,
+  PROMETHEUS_LE_STRINGS,
+} from "../sample-services/mock-observability";
 import { ensureDatabaseSeeded } from "../src/lib/db/ensure-seeded";
 
 describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
@@ -1450,6 +1457,628 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       // 7. Unsupported expressions return null (mock server responds 400 Bad Request)
       const unsupported = evaluateMockPromQl("unknown_metric{foo='bar'}", nowSec);
       expect(unsupported).toBeNull();
+    });
+  });
+
+  // =========================================================================
+  // 10. Prometheus Data Integrity & Regression Suite
+  // =========================================================================
+  describe("Prometheus Data Integrity & Regression Suite", () => {
+    it("reports failure when request-rate succeeds but error-rate query fails", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "vector",
+                result: [{ metric: { service: "order-service" }, value: [1730000000, "100.0"] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            headers: new Headers(),
+            json: async () => ({ status: "error", error: "Internal server error" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const res = await client.getServiceMetricsDetailed();
+
+      expect(res.success).toBe(false);
+      expect(res.metrics.size).toBe(0);
+      const errDiag = res.diagnostics.find((d) => d.errorCode === "UNAVAILABLE" || d.status === "ERROR");
+      expect(errDiag).toBeDefined();
+    });
+
+    it("reports failure when request-rate succeeds but average-latency query fails", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_request_duration_seconds_sum")) {
+          return Promise.resolve({
+            ok: false,
+            status: 503,
+            headers: new Headers(),
+            json: async () => ({ status: "error", error: "Service unavailable" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "vector",
+              result: [{ metric: { service: "order-service" }, value: [1730000000, "50.0"] }],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const res = await client.getServiceMetricsDetailed();
+
+      expect(res.success).toBe(false);
+      expect(res.metrics.size).toBe(0);
+    });
+
+    it("fails range request history when request-rate succeeds but error-range query fails", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            headers: new Headers(),
+            json: async () => ({ status: "error", error: "TSDB storage failure" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [
+                {
+                  metric: { service: "payment-service" },
+                  values: [[1730000000, "150.0"]],
+                },
+              ],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(false);
+      expect(history.historyByService.size).toBe(0);
+    });
+
+    it("fails range request history when request-rate succeeds but latency-range query fails", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_request_duration_seconds")) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            headers: new Headers(),
+            json: async () => ({ status: "error", error: "Latency range failure" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [
+                {
+                  metric: { service: "payment-service" },
+                  values: [[1730000000, "150.0"]],
+                },
+              ],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(false);
+    });
+
+    it("distinguishes P95 provider failure from unsupported histogram buckets", async () => {
+      // Case 1: P95 HTTP Request fails (e.g. 500) -> overall success is false
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("histogram_quantile")) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            headers: new Headers(),
+            json: async () => ({ status: "error", error: "Histogram engine error" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "vector",
+              result: [{ metric: { service: "order-service" }, value: [1730000000, "10.0"] }],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const failRes = await client.getServiceMetricsDetailed();
+      expect(failRes.success).toBe(false);
+
+      // Case 2: P95 query succeeds (200 OK) but returns no matching series (buckets genuinely absent)
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("histogram_quantile")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { resultType: "vector", result: [] },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "vector",
+              result: [{ metric: { service: "order-service" }, value: [1730000000, "10.0"] }],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const unsuppRes = await client.getServiceMetricsDetailed();
+      expect(unsuppRes.success).toBe(true);
+      expect(unsuppRes.p95Supported).toBe(false);
+      const svcMetrics = unsuppRes.metrics.get("order-service");
+      expect(svcMetrics?.hasValidP95).toBe(false);
+      expect(svcMetrics?.latencyP95Ms).toBeUndefined();
+    });
+
+    it("calculates normalized ERROR_RATE percentage records with % unit and keeps ERROR_THROUGHPUT distinct", async () => {
+      const startSec = 1730000000;
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [
+                  {
+                    metric: { service: "payment-service" },
+                    values: [[startSec, "50.0"]], // 50 req/s
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [
+                  {
+                    metric: { service: "payment-service" },
+                    values: [[startSec, "5.0"]], // 5 errors/s
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [
+                {
+                  metric: { service: "payment-service" },
+                  values: [[startSec, "0.035"]],
+                },
+              ],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(true);
+
+      // Verify raw throughput has unit errors/s and metricType ERROR_THROUGHPUT
+      const rawThroughput = history.records.find((r) => r.metricType === "ERROR_THROUGHPUT");
+      expect(rawThroughput).toBeDefined();
+      expect(rawThroughput?.unit).toBe("errors/s");
+      expect(rawThroughput?.value).toBe(5);
+
+      // Verify calculated ERROR_RATE has unit % and calculated percentage 10%
+      const errorRate = history.records.find((r) => r.metricType === "ERROR_RATE");
+      expect(errorRate).toBeDefined();
+      expect(errorRate?.unit).toBe("%");
+      expect(errorRate?.value).toBe(10); // (5 / 50) * 100 = 10%
+
+      // Verify history point errorRate
+      const pt = history.historyByService.get("payment-service")![0];
+      expect(pt.errorRate).toBe(10);
+      expect(pt.requestRate).toBe(50);
+    });
+
+    it("preserves fractional request rates without rounding before division (0.4 req/s and 0.1 errors/s produces 25%)", async () => {
+      const startSec = 1730000000;
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [
+                  {
+                    metric: { service: "low-vol-service" },
+                    values: [[startSec, "0.4"]], // 0.4 req/s (Math.round would have turned this into 0!)
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [
+                  {
+                    metric: { service: "low-vol-service" },
+                    values: [[startSec, "0.1"]], // 0.1 errors/s
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(true);
+      const pt = history.historyByService.get("low-vol-service")![0];
+      expect(pt.requestRate).toBe(0.4);
+      expect(pt.errorRate).toBe(25); // (0.1 / 0.4) * 100 = 25%
+
+      const calcRec = history.records.find((r) => r.metricType === "ERROR_RATE" && r.serviceName === "low-vol-service");
+      expect(calcRec?.value).toBe(25);
+      expect(calcRec?.unit).toBe("%");
+    });
+
+    it("safely handles zero request rate producing 0% without NaN or Infinity", async () => {
+      const startSec = 1730000000;
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "idle-service" }, values: [[startSec, "0.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "idle-service" }, values: [[startSec, "0.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      expect(history.success).toBe(true);
+      const pt = history.historyByService.get("idle-service")![0];
+      expect(pt.errorRate).toBe(0);
+      expect(Number.isFinite(pt.errorRate)).toBe(true);
+    });
+
+    it("verifies mock range history changes across windows rather than repeating a single snapshot", () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const startSec = nowSec - 600; // 10 minutes ago
+      const endSec = nowSec;
+      const stepSec = 60; // 1 minute steps
+
+      const rangeResult = evaluateMockPromQlRange(
+        "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
+        startSec,
+        endSec,
+        stepSec
+      );
+
+      expect(rangeResult).not.toBeNull();
+      expect(rangeResult!.length).toBeGreaterThan(0);
+
+      const paymentSeries = rangeResult!.find((s) => s.metric["service"] === "payment-service");
+      expect(paymentSeries).toBeDefined();
+      expect(paymentSeries!.values.length).toBeGreaterThan(1);
+
+      // Verify that points across time are NOT all identical
+      const firstVal = parseFloat(paymentSeries!.values[0][1]);
+      const lastVal = parseFloat(paymentSeries!.values[paymentSeries!.values.length - 1][1]);
+      // Baseline was ~30ms while recent traffic spiked to ~140ms
+      expect(firstVal).not.toBe(lastVal);
+      expect(lastVal).toBeGreaterThan(firstVal);
+    });
+
+    it("computes cumulative, monotonically non-decreasing histogram buckets with +Inf containing all observations", () => {
+      const latenciesSec = [0.015, 0.045, 0.080, 0.120, 0.350, 0.900, 1.500];
+      const buckets = computeHistogramBuckets(latenciesSec);
+
+      expect(buckets.length).toBe(PROMETHEUS_LE_STRINGS.length);
+
+      // Check monotonicity
+      for (let i = 0; i < buckets.length - 1; i++) {
+        expect(buckets[i].count).toBeLessThanOrEqual(buckets[i + 1].count);
+      }
+
+      // Check +Inf bucket contains all observations
+      const infBucket = buckets.find((b) => b.le === "+Inf");
+      expect(infBucket?.count).toBe(latenciesSec.length);
+    });
+
+    it("guarantees mock P95 calculation is mathematically consistent with its bucket distribution", () => {
+      const latenciesSec = [0.010, 0.020, 0.030, 0.040, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100];
+      const buckets = computeHistogramBuckets(latenciesSec);
+      const p95 = calculateHistogramQuantile(0.95, buckets);
+
+      // 95th percentile of 10 items is between item 9 (0.09) and 10 (0.10)
+      expect(p95).toBeGreaterThanOrEqual(0.09);
+      expect(p95).toBeLessThanOrEqual(0.10);
+
+      // Empty bucket distribution produces 0
+      const emptyP95 = calculateHistogramQuantile(0.95, []);
+      expect(emptyP95).toBe(0);
+    });
+
+    it("aggregates bucket counts across multiple instances before computing P95", () => {
+      // Instance 1: fast requests [10ms, 15ms]
+      const inst1Latencies = [0.010, 0.015];
+      // Instance 2: slower requests [60ms, 85ms]
+      const inst2Latencies = [0.060, 0.085];
+
+      const b1 = computeHistogramBuckets(inst1Latencies);
+      const b2 = computeHistogramBuckets(inst2Latencies);
+
+      // Aggregate buckets across instances
+      const aggregatedBuckets = b1.map((b, idx) => ({
+        le: b.le,
+        bound: b.bound,
+        count: b.count + b2[idx].count,
+      }));
+
+      const infBucket = aggregatedBuckets.find((b) => b.le === "+Inf");
+      expect(infBucket?.count).toBe(4);
+
+      const combinedP95 = calculateHistogramQuantile(0.95, aggregatedBuckets);
+      // P95 of combined distribution [10ms, 15ms, 60ms, 85ms] is near the 85ms boundary
+      expect(combinedP95).toBeGreaterThan(0.060);
+      expect(combinedP95).toBeLessThanOrEqual(0.100);
+    });
+
+    it("truthfully returns empty history when observation store is cleared without fabricating synthetic trends", () => {
+      obsStore.clear();
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const rangeResult = evaluateMockPromQlRange(
+        "sum by (service) (rate(http_requests_total[1m]))",
+        nowSec - 300,
+        nowSec,
+        60
+      );
+
+      expect(rangeResult).toEqual([]);
+
+      const instantResult = evaluateMockPromQl(
+        "sum by (service) (rate(http_requests_total[1m]))",
+        nowSec
+      );
+      expect(instantResult).toEqual([]);
+
+      // Restore baseline observations for subsequent runs
+      obsStore.seedBaselineObservations();
+    });
+
+    it("ensures downstream RootCauseEngine consumes normalized ERROR_RATE percentage records rather than raw errors/second", async () => {
+      // In a low-volume incident, request rate is 0.4 req/s and error throughput is 0.1 errors/s
+      // If raw error throughput (0.1) were used as errorRate (%), it would equal 0.1%, matching baseline error rate (0.1%), masking the outage.
+      // With normalized ERROR_RATE (25%), the RootCauseEngine detects the massive 250x error rate spike.
+      const startSec = 1730000000;
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "payment-service" }, values: [[startSec, "0.4"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "payment-service" }, values: [[startSec, "0.1"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const history = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      const rawThroughput = history.records.find((r) => r.serviceName === "payment-service" && r.metricType === "ERROR_THROUGHPUT");
+      const normalizedErrorRate = history.records.find((r) => r.serviceName === "payment-service" && r.metricType === "ERROR_RATE");
+
+      expect(rawThroughput?.value).toBe(0.1);
+      expect(rawThroughput?.unit).toBe("errors/s");
+
+      expect(normalizedErrorRate?.value).toBe(25);
+      expect(normalizedErrorRate?.unit).toBe("%");
+
+      // Build graph and root cause engine input using the normalized percentage
+      const graph = createMultiServiceGraph();
+      const node = graph.getNode("payment-service")!;
+
+      // Verify that passing raw error throughput (0.1) does not exceed baseline (0.1%)
+      expect(rawThroughput!.value <= node.baselineErrorRate).toBe(true);
+
+      // Verify that passing normalized error percentage (25%) exceeds baseline (0.1%) by 250x
+      expect(normalizedErrorRate!.value > node.baselineErrorRate).toBe(true);
+
+      const rcaEngine = new RootCauseEngine(3);
+      const sampleWithNormalizedPct: TelemetryPoint = {
+        serviceId: "payment-service",
+        simulationStep: 1,
+        timestamp: new Date(startSec * 1000).toISOString(),
+        latency: 45,
+        errorRate: normalizedErrorRate!.value, // 25%
+        requestCount: 0.4,
+        healthStatus: "DEGRADED",
+      };
+
+      const states = new Map([
+        ["payment-service", { status: "DEGRADED" as const, latency: 45, errorRate: normalizedErrorRate!.value }],
+      ]);
+
+      const result = rcaEngine.analyzeIncident({
+        incidentId: "test-rca-integrity",
+        graph,
+        telemetrySamples: [sampleWithNormalizedPct],
+        currentServiceStates: states,
+      });
+
+      expect(result.isConclusive).toBe(true);
+      expect(result.topRootCause).toBeDefined();
+      expect(result.topRootCause?.serviceId).toBe("payment-service");
+      expect(result.topRootCause?.supportingEvidence.some((e) => e.type === "TELEMETRY_SPIKE" || e.description.includes("error"))).toBe(true);
     });
   });
 });

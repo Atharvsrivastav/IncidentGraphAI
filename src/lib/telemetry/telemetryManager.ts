@@ -192,7 +192,8 @@ export class TelemetryManager {
       effectiveMode,
       promMetricsDetailed.metrics,
       traceDetailed.traces,
-      hasData
+      hasData,
+      promMetricsDetailed.success
     );
   }
 
@@ -258,7 +259,8 @@ export class TelemetryManager {
     effectiveMode: TelemetryMode,
     promMetrics: Map<string, ServiceMetricsSummary>,
     recentTraces: DistributedTrace[],
-    hasTelemetryData: boolean
+    hasTelemetryData: boolean,
+    promQuerySuccess: boolean = true
   ) {
     const topologyIds = new Set(dbServices.map((s) => s.id));
     const traceCountByService = new Map<string, number>();
@@ -277,6 +279,10 @@ export class TelemetryManager {
       const traceCount = traceCountByService.get(svc.id) || traceCountByService.get(svc.name) || 0;
 
       if (!metric && traceCount === 0) {
+        let lastObserved = hasTelemetryData ? "No observations received" : "Empty query response (No series matching)";
+        if (!promQuerySuccess) {
+          lastObserved = "Prometheus query failed (Incomplete or failed metric telemetry)";
+        }
         observedServices.push({
           serviceId: svc.id,
           serviceName: svc.name,
@@ -285,7 +291,7 @@ export class TelemetryManager {
           latencyMs: 0,
           errorRate: 0,
           requestRate: 0,
-          lastObserved: hasTelemetryData ? "No observations received" : "Empty query response (No series matching)",
+          lastObserved,
           traceCount: 0,
           isStale: true,
           isKnownInTopology: true,

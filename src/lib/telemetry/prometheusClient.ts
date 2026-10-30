@@ -425,6 +425,8 @@ export class PrometheusClient {
         return "%";
       case "REQUEST_RATE":
         return "req/s";
+      case "ERROR_THROUGHPUT":
+        return "errors/s";
       case "DB_CONNECTION_PRESSURE":
         return "connections";
       default:
@@ -479,7 +481,7 @@ export class PrometheusClient {
     // Execute the 4 required PromQL queries in parallel
     const [requestRes, errorRes, latencyAvgRes, p95Res] = await Promise.all([
       this.queryInstantDetailed("sum by (service) (rate(http_requests_total[1m]))", "REQUEST_RATE"),
-      this.queryInstantDetailed("sum by (service) (rate(http_request_errors_total[1m]))", "ERROR_RATE"),
+      this.queryInstantDetailed("sum by (service) (rate(http_request_errors_total[1m]))", "ERROR_THROUGHPUT"),
       this.queryInstantDetailed(
         "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
         "LATENCY_AVG"
@@ -492,8 +494,10 @@ export class PrometheusClient {
 
     diagnostics.push(requestRes.diagnostic, errorRes.diagnostic, latencyAvgRes.diagnostic, p95Res.diagnostic);
 
-    // If request rate query failed, report failure and do NOT substitute raw counters
-    if (!requestRes.success) {
+    // If any required query failed, report failure and do NOT substitute raw counters or pretend healthy
+    // Treat P95 availability separately only when the provider genuinely does not expose histogram buckets (p95Res.success is true but records is empty)
+    // A failed P95 HTTP request (p95Res.success is false) must not silently become an unsupported-but-healthy result.
+    if (!requestRes.success || !errorRes.success || !latencyAvgRes.success || !p95Res.success) {
       return {
         success: false,
         metrics: new Map(),
@@ -513,28 +517,24 @@ export class PrometheusClient {
 
     // 2. Accumulate error counter rates across instances per service
     const errorRatesByService = new Map<string, number>();
-    if (errorRes.success) {
-      for (const e of errorRes.records) {
-        const current = errorRatesByService.get(e.serviceName) || 0;
-        errorRatesByService.set(e.serviceName, current + Math.max(0, e.value));
-      }
+    for (const e of errorRes.records) {
+      const current = errorRatesByService.get(e.serviceName) || 0;
+      errorRatesByService.set(e.serviceName, current + Math.max(0, e.value));
     }
 
     // 3. Accumulate average latencies across instances per service
     const latencyAvgByService = new Map<string, { sumMs: number; count: number }>();
-    if (latencyAvgRes.success) {
-      for (const l of latencyAvgRes.records) {
-        const existing = latencyAvgByService.get(l.serviceName) || { sumMs: 0, count: 0 };
-        existing.sumMs += Math.max(0, l.value);
-        existing.count += 1;
-        latencyAvgByService.set(l.serviceName, existing);
-      }
+    for (const l of latencyAvgRes.records) {
+      const existing = latencyAvgByService.get(l.serviceName) || { sumMs: 0, count: 0 };
+      existing.sumMs += Math.max(0, l.value);
+      existing.count += 1;
+      latencyAvgByService.set(l.serviceName, existing);
     }
 
     // 4. Map P95 latencies per service
     const p95ByService = new Map<string, number>();
     let p95Supported = false;
-    if (p95Res.success && p95Res.records.length > 0) {
+    if (p95Res.records.length > 0) {
       p95Supported = true;
       for (const p of p95Res.records) {
         if (!isNaN(p.value) && p.value > 0) {
@@ -557,18 +557,22 @@ export class PrometheusClient {
       const latData = latencyAvgByService.get(svc) || { sumMs: 0, count: 0 };
       const p95Val = p95ByService.get(svc);
 
-      const requestRate = Math.round(reqData.totalRate);
+      // Retain full numeric precision internally - do NOT round before division
+      const requestRate = reqData.totalRate;
 
       // Safe error rate percentage: (errorRate / requestRate) * 100
       let errorRate = 0;
       if (reqData.totalRate > 0) {
-        errorRate = Number(Math.min(100, Math.max(0, (errRate / reqData.totalRate) * 100)).toFixed(2));
+        const rawPct = (errRate / reqData.totalRate) * 100;
+        if (Number.isFinite(rawPct)) {
+          errorRate = Number(Math.min(100, Math.max(0, rawPct)).toFixed(2));
+        }
       }
 
       // Latency is in milliseconds (converted from seconds exactly once)
       let latencyMs = 0;
       if (latData.count > 0) {
-        latencyMs = Math.round(latData.sumMs / latData.count);
+        latencyMs = Number((latData.sumMs / latData.count).toFixed(2));
       }
 
       const hasValidP95 = p95Val !== undefined && !isNaN(p95Val) && p95Val > 0;
@@ -578,7 +582,7 @@ export class PrometheusClient {
         requestRate,
         errorRate,
         latencyMs,
-        latencyP95Ms: hasValidP95 ? Math.round(p95Val!) : undefined,
+        latencyP95Ms: hasValidP95 ? Number(p95Val!.toFixed(2)) : undefined,
         hasValidP95,
         instanceCount: reqData.instanceCount || 1,
       });
@@ -624,7 +628,7 @@ export class PrometheusClient {
         startSec,
         endSec,
         stepSec,
-        metricType: "ERROR_RATE",
+        metricType: "ERROR_THROUGHPUT",
       }),
       this.queryRange({
         query: "sum by (service) (rate(http_request_duration_seconds_sum[1m])) / sum by (service) (rate(http_request_duration_seconds_count[1m]))",
@@ -643,18 +647,19 @@ export class PrometheusClient {
     ]);
 
     const diagnostics = [reqRange.diagnostic, errRange.diagnostic, latRange.diagnostic, p95Range.diagnostic];
-    const allRecords: NormalizedMetricRecord[] = [
-      ...reqRange.records,
-      ...errRange.records,
-      ...latRange.records,
-      ...p95Range.records,
-    ];
 
-    if (!reqRange.success) {
+    // Track success independently for every required query.
+    // If any required range query fails, return success: false and preserve diagnostics.
+    if (!reqRange.success || !errRange.success || !latRange.success || !p95Range.success) {
       return {
         success: false,
         historyByService: new Map(),
-        records: allRecords,
+        records: [
+          ...reqRange.records,
+          ...errRange.records,
+          ...latRange.records,
+          ...p95Range.records,
+        ],
         diagnostics,
       };
     }
@@ -676,31 +681,92 @@ export class PrometheusClient {
       return pt;
     };
 
+    // 1. Request rate with full numeric precision (no premature Math.round)
     for (const r of reqRange.records) {
       const pt = getOrCreatePoint(r.serviceName, r.timestamp);
-      pt.requestRate = Math.round(r.value);
+      pt.requestRate = r.value;
     }
 
+    // 2. Error rate percentage calculated from throughput and request volume without rounding request rate
     for (const e of errRange.records) {
       const pt = getOrCreatePoint(e.serviceName, e.timestamp);
-      if (pt.requestRate > 0) {
-        pt.errorRate = Number(Math.min(100, Math.max(0, (e.value / pt.requestRate) * 100)).toFixed(2));
+      if (pt.requestRate > 0 && e.value > 0) {
+        const rawPct = (e.value / pt.requestRate) * 100;
+        pt.errorRate = Number.isFinite(rawPct)
+          ? Number(Math.min(100, Math.max(0, rawPct)).toFixed(2))
+          : 0;
       } else {
         pt.errorRate = 0;
       }
     }
 
+    // 3. Average latency
     for (const l of latRange.records) {
       const pt = getOrCreatePoint(l.serviceName, l.timestamp);
-      pt.latencyMs = Math.round(l.value);
+      pt.latencyMs = Number(l.value.toFixed(2));
     }
 
+    // 4. P95 latency
     for (const p of p95Range.records) {
       const pt = getOrCreatePoint(p.serviceName, p.timestamp);
       if (!isNaN(p.value) && p.value > 0) {
-        pt.latencyP95Ms = Math.round(p.value);
+        pt.latencyP95Ms = Number(p.value.toFixed(2));
       }
     }
+
+    // 5. Generate normalized ERROR_RATE percentage records matching by (serviceName, timestamp)
+    const reqByServiceTime = new Map<string, NormalizedMetricRecord>();
+    for (const r of reqRange.records) {
+      reqByServiceTime.set(`${r.serviceName}::${r.timestamp}`, r);
+    }
+    const errByServiceTime = new Map<string, NormalizedMetricRecord>();
+    for (const e of errRange.records) {
+      errByServiceTime.set(`${e.serviceName}::${e.timestamp}`, e);
+    }
+
+    const allKeys = new Set([...reqByServiceTime.keys(), ...errByServiceTime.keys()]);
+    const calculatedErrorRateRecords: NormalizedMetricRecord[] = [];
+
+    for (const key of allKeys) {
+      const reqRec = reqByServiceTime.get(key);
+      const errRec = errByServiceTime.get(key);
+      const [serviceName, timestamp] = key.split("::");
+
+      const reqPerSec = reqRec ? reqRec.value : 0;
+      const errPerSec = errRec ? errRec.value : 0;
+
+      let errorPercentage = 0;
+      if (reqPerSec > 0 && errPerSec > 0) {
+        const rawPct = (errPerSec / reqPerSec) * 100;
+        if (Number.isFinite(rawPct)) {
+          errorPercentage = Number(Math.min(100, Math.max(0, rawPct)).toFixed(2));
+        }
+      }
+
+      const provider = reqRec?.provider || errRec?.provider || (this.isCloud ? "GRAFANA_CLOUD" : "PROMETHEUS");
+      const labels = { ...(reqRec?.labels || {}), ...(errRec?.labels || {}) };
+
+      calculatedErrorRateRecords.push({
+        id: `prom-calc-error-rate-${serviceName}-${timestamp}`,
+        provider,
+        serviceName,
+        metricType: "ERROR_RATE",
+        metricName: "http_request_error_percentage",
+        timestamp,
+        value: errorPercentage,
+        unit: "%",
+        labels,
+        hasAnomaly: errorPercentage > 5,
+      });
+    }
+
+    const allRecords: NormalizedMetricRecord[] = [
+      ...reqRange.records,
+      ...errRange.records,
+      ...calculatedErrorRateRecords,
+      ...latRange.records,
+      ...p95Range.records,
+    ];
 
     const historyByService = new Map<string, ServiceHistoryPoint[]>();
     for (const [svc, ptsMap] of historyMap.entries()) {

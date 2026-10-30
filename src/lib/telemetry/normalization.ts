@@ -26,6 +26,7 @@ export interface ProviderDiagnostic {
 export const MetricTypeSchema = z.enum([
   "REQUEST_RATE",
   "ERROR_RATE",
+  "ERROR_THROUGHPUT",
   "LATENCY_P95",
   "LATENCY_AVG",
   "CPU_UTILIZATION",
