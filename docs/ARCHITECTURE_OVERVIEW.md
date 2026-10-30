@@ -44,8 +44,8 @@ Microservices and their synchronous/asynchronous relationships are modeled as a 
 - **Vertices ($V$)**: Individual microservices, each with operational metadata (Tier 1 Edge, Tier 2 Core, Tier 3 Storage), baseline latencies, and moving error rates.
 - **Edges ($E$)**: Dependency calls (e.g. `order-service` $\rightarrow$ `postgres-db`) annotated with communication protocol (`SYNC_HTTP`, `ASYNC_QUEUE`, `DATABASE_CONN`), timeout thresholds, and criticality tiers.
 - **Algorithmic Traversals**:
-  - **BFS Blast-Radius Search**: Propagates failure probabilities from any degraded node through downstream dependents, computing reachability and cumulative impact scores.
-  - **DFS Cycle Detection**: Implements Tarjan's strongly connected components algorithm to detect and warn against circular dependency loops in microservice topology.
+  - **BFS Blast-Radius Search**: Traverses downstream dependency edges from degraded services to compute graph reachability, blast radius, and topological impact scores.
+  - **DFS Cycle Detection**: Implements 3-color DFS (WHITE/GRAY/BLACK recursion stack tracking) to detect circular dependency cycles in microservice topology and prevent infinite traversal loops.
 
 ### B. Dual-Mode Observability & Ingestion Pipeline
 IncidentGraph AI supports both live cloud telemetry and deterministic simulation replay:
@@ -55,7 +55,7 @@ IncidentGraph AI supports both live cloud telemetry and deterministic simulation
    - Query engine fetches Prometheus instant vectors via PromQL and parses Tempo trace span hierarchies.
    - *Public Production Status*: In the public deployment on Vercel, the application reports `mode: SIMULATION` while Grafana Cloud Prometheus and Tempo probes are verified active. Live autonomous stream ingestion is inactive in public production to prevent third-party egress charges.
 2. **Deterministic Fault Simulator (Simulation Mode)**:
-   - Built-in simulation engine featuring 7 real-world failure scenarios (e.g., PostgreSQL connection pool exhaustion, JWT rotation outage, 3rd-party payment gateway timeout).
+   - Built-in simulation engine featuring 7 real-world failure scenarios (`database-slowdown`, `database-outage`, `payment-failure`, `inventory-timeout`, `auth-failure`, `gateway-errors`, `network-latency`).
    - Generates deterministic telemetry updates along dependency edges, allowing controlled stepping ($t_0 \rightarrow t_1 \rightarrow t_2$) to inspect cascade dynamics without incurring cloud compute costs.
 
 ### C. Deterministic DSA Root-Cause Ranking Engine
@@ -66,7 +66,13 @@ $$\text{Score}(v) = w_1 \cdot Z_{\text{latency}}(v) + w_2 \cdot Z_{\text{error}}
 - **Statistical Z-Score**: Measures how many standard deviations current latency and error rates depart from baseline.
 - **Topological Depth Weighting**: Rewards upstream deep storage/infrastructure nodes (Tier 3) over shallow edge reverse proxies (Tier 1).
 - **Temporal Precedence Sorting**: Compares anomaly timestamps; services that degraded earliest in the cascade receive higher ranking weights. Scores represent relative heuristic weights rather than statistically calibrated probabilities.
-- **Synthetic Benchmark Evaluation**: Evaluated on the documented synthetic test suite (117 test cases across 7 cascading failure archetypes), the ranking algorithm achieved 100% top-candidate recall in <350ms execution time. These metrics evaluate deterministic synthetic scenarios rather than arbitrary production incidents; see [Root-Cause Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md) for full experimental setup.
+- **Synthetic Benchmark Evaluation**: Evaluated on the documented synthetic test suite (117 test cases across 5 topology families—distinct from the 7 interactive failure scenarios in the simulator), the ranking algorithm achieved 100% top-candidate recall in <350ms execution time. These metrics evaluate deterministic synthetic scenarios rather than arbitrary production incidents; see [Root-Cause Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md) for full experimental setup.
+
+> [!NOTE]
+> **Clarification of Counts — 7 Simulator Scenarios vs. 5 Benchmark Topology Families**:
+> - **7 Simulator Failure Scenarios**: The interactive simulator provides 7 concrete failure scenarios injected into the primary 7-node microservice graph (`database-slowdown`, `database-outage`, `payment-failure`, `inventory-timeout`, `auth-failure`, `gateway-errors`, and `network-latency`).
+> - **5 Benchmark Topology Families**: The algorithmic robustness benchmark evaluates 117 reproducible test cases generated across 5 structural graph architectures (Canonical E-Commerce, Linear Pipeline, Microservices Mesh, Hub-and-Spoke, and Cyclic Graph).
+> Both counts are accurate: 7 refers to the user-injectable failure scenarios in the application simulator, while 5 refers to the topology families evaluated in the 117-scenario benchmark suite.
 
 ### D. Evidence-Grounded AI Investigator
 When AI triage is invoked, strict reliability boundaries are enforced:

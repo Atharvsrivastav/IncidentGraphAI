@@ -2,8 +2,8 @@
 
 > **Tone**: Confident, articulate, senior engineer / staff SRE.  
 > **Pacing**: Steady, deliberate (~130–140 words per minute).  
-> **Total Duration**: ~3 minutes (180 seconds).  
-> **Accompanying Video**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4` *(Silent 1080p Screen Recording Walkthrough, 95s, no audio track. This script serves as the companion narration transcript for live presentation or voiceover recording).*
+> **Voiceover Script Duration**: ~3 minutes (approximately 180 seconds when read aloud at natural speaking pace).  
+> **Accompanying Video Recording**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4` *(95-second silent 1080p screen recording walkthrough; contains no embedded audio or narration. This script serves as the separate companion narration transcript for live presentations or voiceover recording).*
 
 ---
 

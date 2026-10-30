@@ -14,8 +14,8 @@
 > **Intelligent, explainable incident investigation and root-cause analysis for distributed microservice architectures using directed graphs, deterministic algorithms, OpenTelemetry, Grafana Cloud, and evidence-grounded AI synthesis.**
 >
 > 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)  
-> 🎬 **Recruiter Demo Video**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4) *(Silent 1080p Screen Recording Walkthrough, 1m 35s)*  
-> 🎙️ **Companion Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md) *(Timed narration script for live presentation)*  
+> 🎬 **Recruiter Demo Video**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4) *(95-second silent 1080p screen recording walkthrough; contains no audio stream or narration)*  
+> 🎙️ **Companion Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md) *(Separate approximately 3-minute narration transcript for spoken presentation)*  
 > 📑 **Recruiter Click-by-Click Guide**: [`docs/RECRUITER_DEMO.md`](docs/RECRUITER_DEMO.md)  
 > 🏛️ **Architecture Deep-Dive**: [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md)  
 > ⚡ **Quick Test**: Click `1-Click Guided Demo` on the live homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
@@ -468,7 +468,7 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 | Check | Command | Description | Status |
 |---|---|---|---|
 | **Unit & Integration Tests** | `npm test` | Runs 81 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **81 / 81 Passing (100%)** |
-| **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology archetypes (results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Synthetic Scenarios Passing (100% Top-3 Hit Rate)** |
+| **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology families (distinct from the 7 interactive failure scenarios in the simulator; results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Synthetic Scenarios Passing (100% Top-3 Hit Rate)** |
 | **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |

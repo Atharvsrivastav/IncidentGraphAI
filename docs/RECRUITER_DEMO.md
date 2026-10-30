@@ -3,9 +3,9 @@
 > **Live Production URL**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)  
 > **Source Repository**: [https://github.com/Atharvsrivastav/IncidentGraphAI](https://github.com/Atharvsrivastav/IncidentGraphAI)  
 > **Target Audience**: Senior Engineering Recruiters, Staff SRE / Platform Engineering Hiring Managers  
-> **Demo Duration**: ~3 minutes (Companion reading / walkthrough); Screen Recording: 95 seconds  
-> **Recording Artifact**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4` *(Silent 1080p Screen Recording Walkthrough, 25fps, H.264, no audio track)*  
-> **Companion Voiceover Script**: `docs/DEMO_VOICEOVER.md` *(Timed transcript for spoken presentation)*
+> **Demo Duration & Formats**: 95-second silent screen recording (MP4 video, no audio track) paired with a separate ~3-minute companion narration script (Markdown transcript for live presentations or voiceover recording)  
+> **Recording Artifact**: `docs/recordings/incident_graph_ai_recruiter_demo.mp4` *(95-second silent 1080p screen recording walkthrough; contains no audio stream or narration)*  
+> **Companion Voiceover Script**: `docs/DEMO_VOICEOVER.md` *(Separate approximately 3-minute narration transcript for spoken presentation)*
 
 ---
 
@@ -124,7 +124,7 @@ IncidentGraph AI combines **directed graph algorithms (BFS blast-radius traversa
 | Product Feature | Technical Implementation | Relevant Senior Engineering Competencies |
 | :--- | :--- | :--- |
 | **Topological Service Map** | Directed dependency graph, custom SVG canvas, zoom/pan navigation | **Distributed Systems Architecture**, Graph Data Structures, Frontend Systems |
-| **Cascade Blast-Radius Traversal** | Breadth-First Search (BFS) with depth-weighted latency propagation | **DSA Algorithms & Complexity**, Graph Theory, Microservice Fault Isolation |
+| **Cascade Blast-Radius Traversal** | Breadth-First Search (BFS) computing graph reachability, blast radius, and topological impact scores | **DSA Algorithms & Complexity**, Graph Theory, Microservice Fault Isolation |
 | **Root-Cause Ranking Engine** | Min/Max Binary Heap Priority Queue, Z-score anomaly scoring, Temporal precedence sorting | **Applied Algorithm Design**, SRE Root-Cause Analysis, Anomaly Detection |
 | **OpenTelemetry Integration** | OpenTelemetry Node SDK, OTLP HTTP trace/metric exporters, Prometheus PromQL querying | **Modern Observability Standards**, SRE Best Practices, Distributed Tracing |
 | **Grafana Cloud Probes** | Hosted Tempo traces, PromQL instant metric normalization, multi-tenant HTTP headers | **Cloud Infrastructure**, SaaS Monitoring, Third-Party Telemetry Pipelines |
