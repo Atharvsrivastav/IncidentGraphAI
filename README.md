@@ -87,27 +87,27 @@ The central command center displaying fleet health status, active incidents, tel
 Dynamic topology map powered by React Flow (`@xyflow/react`). Color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), and real-time inspection drawers:
 ![Service Dependency Map](docs/screenshots/02_servicemap_desktop.png)
 
-### Deterministic Failure Simulator (Active Fault Injection)
-Injects realistic failure scenarios (e.g., PostgreSQL disk latency, Auth key verification timeouts) and models multi-step cascading failure propagation along dependency edges:
+### 3. Deterministic Failure Simulator (Active Fault Injection)
+Injects realistic failure scenarios (e.g., PostgreSQL disk latency, Auth key verification timeouts) and models multi-step cascading failure propagation along dependency edges using deterministic simulator-generated telemetry:
 ![Failure Simulator Active Fault](docs/screenshots/03_simulator_injected_desktop.png)
 
-### Incident Investigation & Root-Cause Ranking
+### 4. Incident Investigation & Root-Cause Ranking
 Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas:
 ![Incident Investigation and Root Cause](docs/screenshots/05_incident_investigation_desktop.png)
 
-### Trace Investigation Waterfall
+### 5. Trace Investigation Waterfall
 Interactive distributed trace timeline inspecting multi-hop span latencies, W3C trace IDs, and database bottlenecks:
 ![Trace Investigation Waterfall](docs/screenshots/13_trace_waterfall_desktop.png)
 
-### Real Cloud Telemetry Mode (Grafana Cloud Active)
-Live microservices mesh connected to Grafana Cloud with active Prometheus Mimir and Tempo distributed tracing badges:
+### 6. Real Cloud Telemetry Mode (Grafana Cloud Integration)
+Supported real cloud mode: microservices mesh exporting directly to Grafana Cloud OTLP with verified Prometheus Mimir and Tempo probes (verified via `npm run test:cloud`; note that the public production web app reports `mode: SIMULATION` to avoid third-party cloud egress charges):
 ![Real Cloud Telemetry Mode](docs/screenshots/14_real_cloud_telemetry_desktop.png)
 
-### Interactive DSA Lab
+### 7. Interactive DSA Lab
 Live visual laboratory demonstrating how the core computer science algorithms run under the hood with step-by-step execution metrics:
 ![Interactive DSA Lab](docs/screenshots/07_dsalab_desktop.png)
 
-### Fleet Recovery & Baseline Reset
+### 8. Fleet Recovery & Baseline Reset
 Simulator restoration view showing automatic fleet health recovery, edge metric stabilization, and incident resolution:
 ![Fleet Recovery View](docs/screenshots/06_simulator_restored_desktop.png)
 
@@ -467,8 +467,8 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 
 | Check | Command | Description | Status |
 |---|---|---|---|
-| **Unit & Integration Tests** | `npm test` | Runs 76 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **76 / 76 Passing (100%)** |
-| **Robustness Benchmark** | `npm run benchmark` | Evaluates 117 synthetic chaos scenarios across 5 topology archetypes with zero non-conclusive verdicts on definitive failures | **117 / 117 Passing (100% Top-3 Hit Rate)** |
+| **Unit & Integration Tests** | `npm test` | Runs 81 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **81 / 81 Passing (100%)** |
+| **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology archetypes (results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Synthetic Scenarios Passing (100% Top-3 Hit Rate)** |
 | **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |
