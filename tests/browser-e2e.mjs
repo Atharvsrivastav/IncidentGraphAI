@@ -278,20 +278,51 @@ async function runBrowserSuite() {
     try {
       await page.goto(`${BASE_URL}/simulator`, { waitUntil: 'domcontentloaded' });
 
-      // Clean baseline first if reset button is available in main content
-      const resetBaselineBtn = page.locator('main button:has-text("Reset Baseline")');
-      if (await resetBaselineBtn.isVisible().catch(() => false)) {
-        if (!(await resetBaselineBtn.isDisabled())) {
-          await Promise.all([
-            page.waitForResponse(
-              (res) => res.url().includes('/api/simulations/reset') && res.request().method() === 'POST',
-              { timeout: 8000 }
-            ).catch(() => null),
-            resetBaselineBtn.click(),
-          ]);
-          console.log('  Clean baseline confirmed via main Reset Baseline button');
-          await page.waitForTimeout(600);
-        }
+      // Clean baseline first if reset button is available in main content without swallowing errors
+      const resetBaselineBtn = page.locator('main [data-testid="reset-baseline-btn"], main button:has-text("Reset Baseline")');
+      const stateBeforeRes = await fetch(`${BASE_URL}/api/simulations/state`);
+      assert(stateBeforeRes.ok, `GET /api/simulations/state failed with status ${stateBeforeRes.status}`);
+      const stateBeforeData = await stateBeforeRes.json();
+      const canReset = stateBeforeData.canReset;
+
+      if (canReset) {
+        // When reset is available in non-production environments
+        await resetBaselineBtn.waitFor({ state: 'visible', timeout: 8000 });
+        assert(await resetBaselineBtn.isVisible(), 'Reset Baseline button must be visible when canReset is true');
+        assert(!(await resetBaselineBtn.isDisabled()), 'Reset Baseline button must be enabled when canReset is true');
+
+        const [resetResponse] = await Promise.all([
+          page.waitForResponse(
+            (res) => res.url().includes('/api/simulations/reset') && res.request().method() === 'POST',
+            { timeout: 10000 }
+          ),
+          resetBaselineBtn.click(),
+        ]);
+        assert(resetResponse.ok(), `POST /api/simulations/reset failed with status ${resetResponse.status()}`);
+        console.log('  Clean baseline confirmed via main Reset Baseline button');
+        await page.waitForTimeout(600);
+
+        const stateVerifyRes = await fetch(`${BASE_URL}/api/simulations/state`);
+        assert(stateVerifyRes.ok, 'Failed to fetch simulation state after baseline reset');
+        const stateVerifyData = await stateVerifyRes.json();
+        assert(
+          stateVerifyData.state?.status === 'IDLE' || stateVerifyData.state?.currentStep === 0,
+          `Expected simulation state to be reset (IDLE or step 0), got: ${JSON.stringify(stateVerifyData.state)}`
+        );
+        console.log('  Verified clean baseline state confirmed via simulation state API');
+      } else {
+        // When reset is intentionally unavailable in production environments
+        assert(
+          serverHealth.environment === 'production' || process.env.NODE_ENV === 'production',
+          `canReset is false but environment is not production: server=${serverHealth.environment}`
+        );
+        assert(
+          !(await resetBaselineBtn.isVisible()),
+          'Reset Baseline button must NOT be rendered when canReset is false in production'
+        );
+        console.log(
+          `  Reset Baseline intentionally unavailable: documented production protection condition verified (canReset=false, environment="${serverHealth.environment}")`
+        );
       }
 
       // Select the PostgreSQL scenario card
@@ -581,10 +612,32 @@ async function runBrowserSuite() {
       await page.waitForTimeout(400);
       assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), 'Incident header remains confirmed after re-analysis');
 
-      // Assert that the returned analysis candidates are reflected in the rendered UI
+      // Capture actual rendered card IDs in DOM order using data-testid="root-cause-candidate-*" elements
+      await page.waitForSelector('[data-testid^="root-cause-candidate-"]', { timeout: 8000 });
+      const candidateCardLocators = page.locator('[data-testid^="root-cause-candidate-"]');
+      const actualCardCount = await candidateCardLocators.count();
+      assert(
+        actualCardCount === expectedServiceIds.length,
+        `Rendered candidate cards count (${actualCardCount}) must match analysis candidates count (${expectedServiceIds.length})`
+      );
+
+      const actualCandidateIds = await page.$$eval('[data-testid^="root-cause-candidate-"]', (els) =>
+        els.map((el) => {
+          const testId = el.getAttribute('data-testid') || '';
+          return testId.replace('root-cause-candidate-', '');
+        })
+      );
+
+      // Compare the two ordered arrays exactly
+      assert(
+        JSON.stringify(actualCandidateIds) === JSON.stringify(expectedServiceIds),
+        `Rendered candidate cards DOM order must exactly match analysis candidate sequence.\nExpected: ${JSON.stringify(expectedServiceIds)}\nActual:   ${JSON.stringify(actualCandidateIds)}`
+      );
+      console.log(`  Verified exact RCA candidate DOM order sequence: [${actualCandidateIds.join(', ')}]`);
+
+      // Continue verifying individual candidate ranks and scores
       for (const cand of returnedCandidates) {
         const candidateCard = page.locator(`[data-testid="root-cause-candidate-${cand.serviceId}"]`).first();
-        await candidateCard.waitFor({ state: 'visible', timeout: 6000 });
         assert(await candidateCard.isVisible(), `Rendered candidate card for service "${cand.serviceId}" must be visible`);
 
         // Verify ranking order where the interface displays it
@@ -599,7 +652,7 @@ async function runBrowserSuite() {
         const scoreText = await scoreLocator.textContent();
         assert(scoreText?.includes(`${cand.score}`), `Candidate "${cand.serviceId}" expected score ${cand.score}, got "${scoreText}"`);
       }
-      console.log(`  Rendered UI verified: reflected ${returnedCandidates.length} analysis candidates in exact rank order: ${expectedServiceIds.join(', ')}`);
+      console.log(`  Rendered UI verified: reflected ${returnedCandidates.length} analysis candidates in exact rank order with matching scores: ${expectedServiceIds.join(', ')}`);
 
       await captureScreenshot(page, '05_incident_investigation_desktop.png');
       sectionResults.push({ name: '5. Incident Investigation Details', status: 'passed' });
@@ -695,34 +748,45 @@ async function runBrowserSuite() {
 
       // Check simulator baseline reset control without swallowing errors
       const resetBaselineBtn = page.locator('[data-testid="reset-baseline-btn"]');
-      const isResetBaselineVisible = await resetBaselineBtn.isVisible();
+      const simStateRes = await fetch(`${BASE_URL}/api/simulations/state`);
+      assert(simStateRes.ok, `GET /api/simulations/state failed with status ${simStateRes.status}`);
+      const simStateData = await simStateRes.json();
 
-      if (isResetBaselineVisible) {
-        const isResetDisabled = await resetBaselineBtn.isDisabled();
-        if (!isResetDisabled) {
-          const [resetResponse] = await Promise.all([
-            page.waitForResponse(
-              (res) => res.url().includes('/api/simulations/reset') && res.request().method() === 'POST',
-              { timeout: 10000 }
-            ),
-            resetBaselineBtn.click(),
-          ]);
-          assert(resetResponse.ok(), `POST /api/simulations/reset failed with status ${resetResponse.status()}`);
-          await page.waitForTimeout(1000);
+      if (simStateData.canReset) {
+        await resetBaselineBtn.waitFor({ state: 'visible', timeout: 8000 });
+        assert(await resetBaselineBtn.isVisible(), 'Reset Baseline button must be visible when canReset is true');
+        assert(!(await resetBaselineBtn.isDisabled()), 'Reset Baseline button must be enabled when canReset is true');
 
-          const stateRes = await fetch(`${BASE_URL}/api/simulations/state`);
-          assert(stateRes.ok, 'Failed to fetch simulation state after baseline reset');
-          const stateData = await stateRes.json();
-          assert(
-            stateData.state?.status === 'IDLE' || stateData.state?.currentStep === 0,
-            `Expected simulation state to be reset (IDLE or step 0), got: ${JSON.stringify(stateData.state)}`
-          );
-          console.log('  Reset Baseline executed and verified: baseline state restored successfully');
-        } else {
-          console.log('  Reset Baseline control is disabled in current simulator state');
-        }
+        const [resetResponse] = await Promise.all([
+          page.waitForResponse(
+            (res) => res.url().includes('/api/simulations/reset') && res.request().method() === 'POST',
+            { timeout: 10000 }
+          ),
+          resetBaselineBtn.click(),
+        ]);
+        assert(resetResponse.ok(), `POST /api/simulations/reset failed with status ${resetResponse.status()}`);
+        await page.waitForTimeout(1000);
+
+        const stateRes = await fetch(`${BASE_URL}/api/simulations/state`);
+        assert(stateRes.ok, 'Failed to fetch simulation state after baseline reset');
+        const stateData = await stateRes.json();
+        assert(
+          stateData.state?.status === 'IDLE' || stateData.state?.currentStep === 0,
+          `Expected simulation state to be reset (IDLE or step 0), got: ${JSON.stringify(stateData.state)}`
+        );
+        console.log('  Reset Baseline executed and verified: baseline state restored successfully');
       } else {
-        console.log('  Reset Baseline control unavailable: protected/hidden in production environment (!canReset)');
+        assert(
+          serverHealth.environment === 'production' || process.env.NODE_ENV === 'production',
+          `canReset is false in Section 6 but environment is not production: server=${serverHealth.environment}`
+        );
+        assert(
+          !(await resetBaselineBtn.isVisible()),
+          'Reset Baseline button must NOT be rendered when canReset is false in production'
+        );
+        console.log(
+          `  Reset Baseline control intentionally unavailable: documented production protection condition verified (!canReset, environment="${serverHealth.environment}")`
+        );
       }
 
       await captureScreenshot(page, '06_simulator_restored_desktop.png');

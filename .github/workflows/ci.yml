@@ -57,12 +57,23 @@ jobs:
           PORT: 3000
           BASE_URL: "http://localhost:3000"
         run: |
+          set -m
           npm start &
           SERVER_PID=$!
+          CLEANED_UP=0
+
           cleanup() {
             EXIT_CODE=$?
-            echo "Stopping Next.js server (PID: $SERVER_PID)..."
-            kill $SERVER_PID 2>/dev/null || true
+            if [ "$CLEANED_UP" -eq 1 ]; then
+              exit $EXIT_CODE
+            fi
+            CLEANED_UP=1
+            echo "Stopping Next.js server and child processes (PID: $SERVER_PID)..."
+            kill -TERM -$SERVER_PID 2>/dev/null || kill -TERM $SERVER_PID 2>/dev/null || true
+            pkill -TERM -P $SERVER_PID 2>/dev/null || true
+            sleep 1
+            kill -KILL -$SERVER_PID 2>/dev/null || kill -KILL $SERVER_PID 2>/dev/null || true
+            pkill -KILL -P $SERVER_PID 2>/dev/null || true
             exit $EXIT_CODE
           }
           trap cleanup EXIT INT TERM
