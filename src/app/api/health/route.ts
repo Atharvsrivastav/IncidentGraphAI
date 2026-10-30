@@ -53,6 +53,15 @@ export async function GET() {
   const dbProvider = dbUrl.startsWith("postgres://") || dbUrl.startsWith("postgresql://")
     ? "postgresql"
     : "sqlite";
+  const isIsolated = Boolean(
+    process.env.E2E_ISOLATED === "1" ||
+    process.env.E2E_ISOLATED === "true" ||
+    dbUrl.toLowerCase().includes("e2e") ||
+    dbUrl.toLowerCase().includes("isolated") ||
+    dbUrl.toLowerCase().includes("test") ||
+    dbUrl.toLowerCase().includes("tmp") ||
+    dbUrl.toLowerCase().includes("temp")
+  );
 
   return NextResponse.json(
     {
@@ -66,6 +75,7 @@ export async function GET() {
         provider: dbProvider,
         servicesCount,
         error: dbError,
+        isIsolated,
       },
       telemetry: {
         mode: telemetryMode,
