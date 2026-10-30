@@ -135,7 +135,7 @@ npm run lint
 # 2. Automated test suite (75 tests)
 npm test
 
-# 3. Deterministic root-cause benchmark (117 scenarios, 100% accuracy required)
+# 3. Deterministic root-cause benchmark (117 scenarios across 5 topology families; 100% Top-1 hit rate on 65 evaluable failures)
 npm run benchmark
 
 # 4. Production build check

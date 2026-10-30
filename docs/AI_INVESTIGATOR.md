@@ -7,7 +7,7 @@ IncidentGraph AI integrates a server-side, evidence-grounded AI investigation pi
 3. Sanitizes all credentials, tokens, and database passwords via a zero-leakage redaction pipeline.
 4. Transmits redacted telemetry within an untrusted data boundary to an external LLM.
 5. Post-validates every hypothesis against actual database evidence IDs, discarding hallucinated citations.
-6. Presents a structured incident brief with calibrated uncertainty, read-only diagnostic checks, and human-approved remediation options.
+6. Presents a structured incident brief with explicit uncertainty tiers, read-only diagnostic checks, and human-approved remediation options.
 
 ---
 
@@ -50,7 +50,7 @@ sequenceDiagram
 
 - **Evidence Before Generated Explanations**: The LLM is never prompted to guess in a vacuum. Every hypothesis must cite explicit evidence IDs (`ev_...`) observed during the incident window.
 - **Independent Deterministic Ranking**: The 100% deterministic graph engine (`RootCauseEngine`) operates independently as a source of truth. The AI synthesis cross-references and evaluates alignment with this deterministic baseline.
-- **Calibrated Uncertainty**: No uncalibrated percentages or artificial certainty. If signals are ambiguous or contradictory, the diagnosis status explicitly declares `INCONCLUSIVE` or `MULTIPLE_CANDIDATES`.
+- **Explicit Uncertainty & Abstention**: Rejects artificial percentage certainty. If signals are ambiguous or contradictory, the diagnosis status explicitly declares `INCONCLUSIVE` or `MULTIPLE_CANDIDATES`.
 - **Truthful Provenance**: Every investigation is tagged with its genuine data provenance:
   - `LIVE_TELEMETRY`: Metrics and traces ingested from production Grafana Cloud (Mimir + Tempo).
   - `SIMULATED`: Generated via deterministic chaos fault injection.
@@ -139,11 +139,11 @@ In addition to the 117-scenario deterministic benchmark, the repository provides
 | **Citation Validity Rate** | % of cited evidence IDs that exist in DB (Target: 100%) | `tests/ai-evaluation.test.ts` |
 | **Unsupported Claim Rate** | % of citations hallucinated (Target: 0%) | `tests/ai-evaluation.test.ts` |
 | **Service Grounding Rate** | % of cited services in topology (Target: 100%) | `tests/ai-evaluation.test.ts` |
-| **Calibrated Abstention** | Appropriate abstention on ambiguous/false-alarm cases | `tests/ai-evaluation.test.ts` |
+| **Categorical SRE Abstention** | Appropriate abstention on ambiguous/false-alarm cases | `tests/ai-evaluation.test.ts` |
 | **Performance & Latency** | Mean synthesis time & token tracking | `tests/ai-evaluation.test.ts` |
 
 > [!NOTE]
-> The synthetic 117-scenario benchmark hit rate (100% Top-1) measures deterministic graph algorithms, not LLM accuracy. We strictly separate the two benchmarks.
+> The synthetic 117-scenario benchmark hit rate (100% Top-1 on 65 evaluable definitive failure scenarios across 5 topology families) measures deterministic graph algorithms, not LLM accuracy. We strictly separate the two benchmarks.
 
 ---
 

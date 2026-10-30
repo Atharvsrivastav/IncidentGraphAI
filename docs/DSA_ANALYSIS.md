@@ -11,7 +11,7 @@ In this system, DSA is not a theoretical demonstration—every data structure an
 | Layer | Responsibility | Mechanism | Why Chosen Over Alternatives |
 | :--- | :--- | :--- | :--- |
 | **Telemetry Ingestion** | Signal collection & context propagation | W3C `traceparent`, OpenTelemetry SDK, Prometheus, Tempo | Industry standard for non-intrusive distributed trace and metric collection across process boundaries. |
-| **Deterministic DSA Engine** | Topological analysis, blast radius, anomaly correlation, candidate ranking | Directed graphs, BFS, DFS 3-coloring, Binary Max-Heap, Sliding Windows | **100% deterministic, zero hallucination, $O(V + E)$ predictable latency.** Does not guess causal links; proves them from graph edges and temporal ordering. |
+| **Deterministic DSA Engine** | Topological analysis, blast radius, anomaly correlation, candidate ranking | Directed graphs, BFS, DFS 3-coloring, Binary Max-Heap, Sliding Windows | **100% deterministic, non-generative, $O(V + E)$ predictable latency.** Does not guess causal links; computes them from graph reachability and temporal ordering. |
 | **AI / Synthesis Layer** | Natural-language explanation & remediation playbooks | Structured prompt synthesis, context grounding | Translates mathematically proven top-$K$ candidates and span metrics into human-readable runbooks for on-call engineers. |
 
 ---
@@ -123,10 +123,10 @@ if (result.hasCycles) {
 ## 4. Binary Max-Heap & Priority Queue (`PriorityQueue<T>`)
 
 - **Implementation:** [`src/lib/algorithms/priorityQueue.ts`](file:///c:/Users/Atharv/Desktop/IncidentGrapghAI/src/lib/algorithms/priorityQueue.ts)
-- **Role:** Prioritizes root-cause candidate evaluation and extracts top-$K$ most probable failure causes in strictly descending heuristic score order.
+- **Role:** Prioritizes root-cause candidate evaluation and extracts top-$K$ highest-ranked root-cause candidates in strictly descending heuristic score order.
 
 ### 4.1 Problem Solved
-During widespread cascading outages, dozens of microservices trigger latency or error alarms simultaneously. The SRE team cannot investigate 30 alerts at once; they need the top 3 most likely root causes instantly.
+During widespread cascading outages, dozens of microservices trigger latency or error alarms simultaneously. The SRE team cannot investigate 30 alerts at once; they need the top 3 highest-ranked root-cause candidates instantly.
 
 ### 4.2 Why Selected
 Sorting an array of all $N$ candidates takes $O(N \log N)$. In large topologies, maintaining a complete array sort is wasteful. A Binary Max-Heap allows $O(\log N)$ inserts and extracts the top $K$ candidates in $O(K \log N)$ time. It also avoids array shifting overhead ($O(N)$) present in naive list queues.
@@ -152,7 +152,7 @@ Array-indexed complete binary tree:
 const queue = new PriorityQueue<RootCauseCandidate>();
 candidates.forEach(c => queue.insert(c, c.score));
 
-// Extract strictly the top-3 probable causes:
+// Extract strictly the top-3 highest-ranked candidate causes:
 const top3 = queue.extractTopK(3);
 ```
 
@@ -182,7 +182,7 @@ For a window buffer of samples $W = [s_1, s_2, \dots, s_k]$:
 ## 6. Multi-Signal Root-Cause Candidate Scoring Engine
 
 - **Implementation:** [`src/lib/algorithms/rootCauseEngine.ts`](file:///c:/Users/Atharv/Desktop/IncidentGrapghAI/src/lib/algorithms/rootCauseEngine.ts) & [`src/lib/algorithms/realRootCauseEngine.ts`](file:///c:/Users/Atharv/Desktop/IncidentGrapghAI/src/lib/algorithms/realRootCauseEngine.ts)
-- **Role:** Computes a composite confidence score $S(v) \in [0, 100]$ for every service node based purely on topological and telemetry evidence, **without peeking at the simulation scenario**.
+- **Role:** Computes a relative heuristic ranking score $S(v) \in [0, 100]$ for every service node based purely on topological and telemetry evidence, **without peeking at the simulation scenario**.
 
 ### 6.1 Mathematical Scoring Heuristic
 $$S(v) = w_{\text{depth}} \cdot C_{\text{depth}}(v) + w_{\text{onset}} \cdot C_{\text{onset}}(v) + w_{\text{latency}} \cdot C_{\text{latency}}(v) + w_{\text{error}} \cdot C_{\text{error}}(v) + w_{\text{impact}} \cdot C_{\text{impact}}(v)$$

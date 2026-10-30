@@ -7,14 +7,47 @@
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Neon Database](https://img.shields.io/badge/Neon-PostgreSQL%20Serverless-00E599?logo=postgresql&logoColor=white)](https://neon.tech/)
-[![Tests](https://img.shields.io/badge/Vitest-76%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Vitest-81%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Benchmark](https://img.shields.io/badge/Benchmark-117%2F117%20Passed-blueviolet)](docs/ROOT_CAUSE_BENCHMARK.md)
+[![Recruiter Demo](https://img.shields.io/badge/Recruiter%20Demo-3%20Min%20Walkthrough-success)](docs/RECRUITER_DEMO.md)
 
 > **Intelligent, explainable incident investigation and root-cause analysis for distributed microservice architectures using directed graphs, deterministic algorithms, OpenTelemetry, Grafana Cloud, and evidence-grounded AI synthesis.**
 >
-> 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)
->
-> ⚡ **Quick Walkthrough**: Click `1-Click Guided Demo` on the homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
+> 🌐 **Live Production Demo**: [https://incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app)  
+> 🎬 **Recruiter Demo Video**: [`docs/recordings/incident_graph_ai_recruiter_demo.mp4`](docs/recordings/incident_graph_ai_recruiter_demo.mp4) *(95-second silent 1080p screen recording walkthrough; contains no audio stream or narration)*  
+> 🎙️ **Companion Voiceover Script**: [`docs/DEMO_VOICEOVER.md`](docs/DEMO_VOICEOVER.md) *(Separate approximately 3-minute narration transcript for spoken presentation)*  
+> 📑 **Recruiter Click-by-Click Guide**: [`docs/RECRUITER_DEMO.md`](docs/RECRUITER_DEMO.md)  
+> 🏛️ **Architecture Deep-Dive**: [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md)  
+> ⚡ **Quick Test**: Click `1-Click Guided Demo` on the live homepage to inject a multi-tier outage, trace cascading blast radius, and run an evidence-grounded AI investigation in 30 seconds. (Zero API key required).
+
+> [!NOTE]
+> **Production Telemetry & AI Configuration**: The public deployment at [incident-graph-ai.vercel.app](https://incident-graph-ai.vercel.app) reports `mode: SIMULATION` with Grafana Cloud connectivity probes verified (Prometheus and Tempo available). Because an external OpenAI key is intentionally not configured in the public environment, the AI Investigator operates in deterministic simulation replay mode, providing reproducible incident briefs with evidence-ID cross-checking and zero external cost.
+
+---
+
+## 📸 Recruiter-Ready 16:9 Screenshot Tour
+
+All screenshots below are captured from the active running application at 1920x1080 resolution:
+
+### 1. Operations Overview Dashboard
+The central command center displaying fleet health status, active incidents, telemetry breach timelines, and MTTR performance metrics:
+![IncidentGraph AI Overview Dashboard](docs/screenshots/01_hero_dashboard.png)
+
+### 2. Interactive Service Dependency Graph
+Dynamic topology map powered by React Flow (`@xyflow/react`). Directed dependency graph with color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), cycle detection alerts, and real-time inspection drawers:
+![Service Dependency Map](docs/screenshots/02_service_dependency_map.png)
+
+### 3. Deterministic Failure Simulator (Active Fault Injection)
+Injects realistic failure scenarios (e.g., PostgreSQL connection pool exhaustion) and models multi-step cascading failure propagation along dependency edges:
+![Failure Simulator Active Fault](docs/screenshots/03_failure_simulation.png)
+
+### 4. Incident Investigation & Root-Cause Ranking
+Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas (e.g. `postgres-db` assigned a deterministic heuristic score of 94/100):
+![Incident Investigation and Root Cause](docs/screenshots/04_root_cause_diagnosis.png)
+
+### 5. Evidence-Grounded AI Investigation & Replay
+Deterministic AI investigation brief with verified impact, ranked hypotheses with supporting evidence IDs, read-only diagnostic checks, and safe remediation options:
+![AI Investigation and Replay](docs/screenshots/05_ai_replay_investigation.png)
 
 ---
 
@@ -33,9 +66,8 @@ In modern microservice architectures, diagnosing outages is notoriously difficul
 
 **IncidentGraph AI** replaces guesswork with **deterministic graph algorithms**, **evidence-based heuristics**, and **grounded AI synthesis**. By modeling microservice topologies as a directed graph ($A \rightarrow B$ means service $A$ calls or depends on service $B$) and correlating live OpenTelemetry signals, it isolates the true originating failure in seconds.
 
-### Key Highlights
-- **100% Deterministic & Explainable**: Root causes are identified using proven graph traversal algorithms (Reverse BFS, 3-Color DFS) and a multi-factor ranking heuristic. No black-box hallucinations.
-- **Evidence-Grounded AI Investigation**: Server-side LLM synthesis (`OpenAIProvider` or deterministic `MockAIProvider`) that correlates telemetry anomalies, trace spans, and graph reachability into an actionable SRE incident brief. Every claim is validated against genuine database evidence IDs, discarding hallucinated citations and enforcing calibrated uncertainty.
+- **Deterministic & Explainable Core**: Root causes are identified using proven graph traversal algorithms (Reverse BFS, 3-Color DFS) and a multi-factor ranking heuristic, eliminating speculative black-box guesswork.
+- **Evidence-Grounded AI Investigation**: Server-side incident synthesis (`OpenAIProvider` or deterministic `MockAIProvider`) that correlates telemetry anomalies, trace spans, and graph reachability into an actionable SRE incident brief. Outputs undergo schema validation and evidence-ID cross-checking against database records (with non-matching citations discarded). Note that syntactic citation validation does not guarantee semantic correctness; human review remains necessary.
 - **Zero Ground-Truth Leakage & Secret Redaction**: The analysis engine evaluates only observable runtime evidence without peeking at simulation ground truth. All credentials, tokens, and database passwords are automatically redacted before LLM transmission.
 - **Dual Telemetry Modes with Truthful Provenance**: Operates offline via local SQLite and a deterministic chaos simulator, or connects to live production-grade **Grafana Cloud** (Prometheus Mimir + Tempo Traces) without requiring Docker or root privileges.
 - **Interactive SRE Operations Console**: Visualizes service topologies, blast radius cascades, trace waterfalls, and algorithmic execution benchmarks in real time. Full incident triage with copyable Markdown incident briefs.
@@ -54,27 +86,27 @@ The central command center displaying fleet health status, active incidents, tel
 Dynamic topology map powered by React Flow (`@xyflow/react`). Color-coded health rings (Healthy, Degraded, Down), animated edge dependencies (`SYNC_HTTP`, `DATABASE_CONN`, `ASYNC_QUEUE`), and real-time inspection drawers:
 ![Service Dependency Map](docs/screenshots/02_servicemap_desktop.png)
 
-### Deterministic Failure Simulator (Active Fault Injection)
-Injects realistic failure scenarios (e.g., PostgreSQL disk latency, Auth key verification timeouts) and models multi-step cascading failure propagation along dependency edges:
+### 3. Deterministic Failure Simulator (Active Fault Injection)
+Injects realistic failure scenarios (e.g., PostgreSQL disk latency, Auth key verification timeouts) and models multi-step cascading failure propagation along dependency edges using deterministic simulator-generated telemetry:
 ![Failure Simulator Active Fault](docs/screenshots/03_simulator_injected_desktop.png)
 
-### Incident Investigation & Root-Cause Ranking
+### 4. Incident Investigation & Root-Cause Ranking
 Evidence-based candidate breakdown. Ranks originating services by combining graph blast-radius coverage, temporal onset, latency ratios, and error-rate deltas:
 ![Incident Investigation and Root Cause](docs/screenshots/05_incident_investigation_desktop.png)
 
-### Trace Investigation Waterfall
+### 5. Trace Investigation Waterfall
 Interactive distributed trace timeline inspecting multi-hop span latencies, W3C trace IDs, and database bottlenecks:
 ![Trace Investigation Waterfall](docs/screenshots/13_trace_waterfall_desktop.png)
 
-### Real Cloud Telemetry Mode (Grafana Cloud Active)
-Live microservices mesh connected to Grafana Cloud with active Prometheus Mimir and Tempo distributed tracing badges:
+### 6. Real Cloud Telemetry Mode (Grafana Cloud Integration)
+Supported real cloud mode: microservices mesh exporting directly to Grafana Cloud OTLP with verified Prometheus Mimir and Tempo probes (verified via `npm run test:cloud`; note that the public production web app reports `mode: SIMULATION` to avoid third-party cloud egress charges):
 ![Real Cloud Telemetry Mode](docs/screenshots/14_real_cloud_telemetry_desktop.png)
 
-### Interactive DSA Lab
+### 7. Interactive DSA Lab
 Live visual laboratory demonstrating how the core computer science algorithms run under the hood with step-by-step execution metrics:
 ![Interactive DSA Lab](docs/screenshots/07_dsalab_desktop.png)
 
-### Fleet Recovery & Baseline Reset
+### 8. Fleet Recovery & Baseline Reset
 Simulator restoration view showing automatic fleet health recovery, edge metric stabilization, and incident resolution:
 ![Fleet Recovery View](docs/screenshots/06_simulator_restored_desktop.png)
 
@@ -261,8 +293,8 @@ To evaluate the complete incident triage loop in under 3 minutes on the [live pr
 
 ### Production-Ready Resume Bullet Points
 - **Distributed Observability & Graph Architecture**: *Architected and deployed a microservice incident investigation platform in Next.js 16, TypeScript, Neon PostgreSQL, and Grafana Cloud (Mimir + Tempo), isolating root-cause anomalies in under 20ms using Reverse BFS reachability and 3-color DFS cycle detection.*
-- **Evidence-Grounded AI Synthesis**: *Built an evidence-grounded AI investigator with schema validation and citation verification, cross-referencing telemetry IDs against observed anomalies to enforce calibrated uncertainty and prevent LLM hallucinations with zero-key deterministic fallback.*
-- **OpenTelemetry & Chaos Benchmarking**: *Instrumented sample services with OpenTelemetry W3C trace context and PromQL queries; validated algorithmic stability with a 117-scenario benchmark achieving 100% Top-3 diagnostic accuracy across 5 topology archetypes.*
+- **Evidence-Grounded AI Synthesis**: *Built an evidence-grounded AI investigator with schema validation and citation verification, cross-referencing telemetry IDs against observed anomalies to enforce structured grounding; features zero-key deterministic replay when external LLMs are unconfigured (human review remains necessary as citation checks do not guarantee semantic correctness).*
+- **OpenTelemetry & Chaos Benchmarking**: *Instrumented sample services with OpenTelemetry W3C trace context and PromQL queries; validated algorithmic stability across a 117-scenario benchmark suite in 5 topology families (117/117 passing configured acceptance criteria; 100% Top-1 / Top-3 hit rate among 65 evaluable definitive failure scenarios).*
 
 ### Concise LinkedIn Project Description
 > **IncidentGraph AI** is an open-source, full-stack incident investigation console designed to solve the cascading alert storm problem in distributed microservice architectures. Using directed dependency graphs, reverse BFS reachability, OpenTelemetry, and Grafana Cloud, it isolates true originating root causes in milliseconds rather than hours. Features evidence-grounded AI synthesis with strict citation validation, live Neon PostgreSQL serverless persistence, and zero-key deterministic replay.
@@ -285,18 +317,26 @@ IncidentGraph AI strictly separates mathematical root-cause diagnosis from gener
 |   • Adjacency List + Reverse BFS + 3-Color DFS Cycle Detection                         |
 |   • Evaluates observable telemetry breaches, timestamp precedence, and path coverage   |
 |   • Computes mathematical candidate scores (0-100) and confidence category (HIGH/MED/LOW)|
-|   • 100% reproducible, zero hallucinations, no external API dependencies               |
+|   • 100% reproducible deterministic graph ranking; zero LLM dependency in core diagnosis|
 |                                                                                         |
-|  [STAGE 2: Evidence-Grounded AI Synthesis (LLM)]                                        |
+|  [STAGE 2: Evidence-Grounded AI Synthesis (LLM / Replay)]                               |
 |   • Takes candidate rankings, topology, and verified evidence IDs as structured context|
 |   • Formulates executive briefs, verified impact assessments, and remediation runbooks |
-|   • Grounding validator verifies every citation against genuine database evidence IDs  |
-|   • Discards ungrounded claims; falls back to deterministic replay if no key is present|
+|   • Validates citations against database evidence IDs; human review remains necessary  |
+|   • Deterministic replay operates without live LLM API; LLM outputs undergo schema check|
 +-----------------------------------------------------------------------------------------+
 ```
 
 ### Benchmark Scope & Methodological Honesty
-The **117-scenario robustness benchmark** ([`docs/ROOT_CAUSE_BENCHMARK.md`](docs/ROOT_CAUSE_BENCHMARK.md)) measures algorithmic reliability across synthetic graph archetypes (single-point failures, cascading timeouts, circular loops, noisy data, and contradictory signals). It evaluates mathematical correctness, cycle handling, and ranking stability under controlled conditions, rather than production incident accuracy across live heterogeneous clouds.
+The **117-scenario robustness benchmark** ([`docs/ROOT_CAUSE_BENCHMARK.md`](docs/ROOT_CAUSE_BENCHMARK.md)) measures algorithmic reliability across 5 synthetic topology families (single-point failures, cascading timeouts, circular loops, noisy data, and contradictory signals). It evaluates mathematical correctness, cycle handling, and ranking stability under controlled synthetic conditions, rather than production incident accuracy across live heterogeneous clouds.
+
+#### Reconciled Suite Partitions & Denominators:
+- **Total Suite**: 117 synthetic scenarios across 5 topology families (Canonical E-Commerce, Linear Pipeline, Microservices Mesh, Hub-and-Spoke, and Cyclic Graph).
+- **117 / 117 Suite Pass Rate**: All 117 scenarios pass their configured acceptance criteria.
+- **Definitive Failure Scenarios (65)**: Evaluates root-cause diagnostic precision; achieves **100% Top-1 and Top-3 hit rates** among these 65 evaluable failure scenarios.
+- **Healthy Baselines (13)**: Evaluates false-alarm resistance; achieves **0% false-positive rate**.
+- **Recovery Cycles (5)**: Evaluates alert resolution; achieves **100% recovery verification**.
+- **Ambiguous & Perturbed Signals (34)**: Evaluates robustness under noise; achieves **70.59% appropriate inconclusive abstention** (24 scenarios) and 10 valid simultaneous multi-root identifications.
 
 ---
 
@@ -434,8 +474,8 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 
 | Check | Command | Description | Status |
 |---|---|---|---|
-| **Unit & Integration Tests** | `npm test` | Runs 76 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **76 / 76 Passing (100%)** |
-| **Robustness Benchmark** | `npm run benchmark` | Evaluates 117 synthetic chaos scenarios across 5 topology archetypes with zero non-conclusive verdicts on definitive failures | **117 / 117 Passing (100% Top-3 Hit Rate)** |
+| **Unit & Integration Tests** | `npm test` | Runs 81 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **81 / 81 Passing (100%)** |
+| **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology families (distinct from the 7 interactive failure scenarios in the simulator; results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Suite Scenarios Passing Acceptance Criteria (100% Top-1 / Top-3 on 65 Evaluable Failures)** |
 | **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |
