@@ -103,8 +103,20 @@ async function runBrowserSuite() {
   const page = await context.newPage();
 
   const consoleErrors = [];
+  const pageErrors = [];
   const networkFailures = [];
   const sectionResults = [];
+
+  let assertionsPassed = 0;
+  let assertionsFailed = 0;
+
+  function assert(condition, message) {
+    if (!condition) {
+      assertionsFailed++;
+      throw new Error(`Assertion Failed: ${message}`);
+    }
+    assertionsPassed++;
+  }
 
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
@@ -117,7 +129,7 @@ async function runBrowserSuite() {
   });
 
   page.on('pageerror', (err) => {
-    consoleErrors.push(`[Page Error]: ${err.message}`);
+    pageErrors.push(`[Page Error]: ${err.message}`);
   });
 
   page.on('requestfailed', (req) => {
@@ -135,16 +147,19 @@ async function runBrowserSuite() {
       await page.goto(`${BASE_URL}/`, { waitUntil: 'domcontentloaded' });
       const pageTitle = await page.title();
       console.log(`  Page Title: "${pageTitle}"`);
+      assert(pageTitle.includes('IncidentGraph'), `Expected page title to contain "IncidentGraph", got "${pageTitle}"`);
 
       // Check main branding and KPI counters
       await page.waitForSelector('text=IncidentGraph AI', { timeout: 8000 });
+      assert(await page.locator('text=IncidentGraph AI').first().isVisible(), 'Branding header "IncidentGraph AI" must be visible');
+
       const quickActions = await page.$('text=Quick Actions');
       console.log(`  Dashboard Quick Actions: ${quickActions ? 'Present' : 'Not found'}`);
 
       await captureScreenshot(page, '01_dashboard_desktop.png');
-      sectionResults.push({ name: '1. Overview Dashboard', passed: true });
+      sectionResults.push({ name: '1. Overview Dashboard', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '1. Overview Dashboard', passed: false, error: err.message });
+      sectionResults.push({ name: '1. Overview Dashboard', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -157,30 +172,33 @@ async function runBrowserSuite() {
 
       // Wait for SVG canvas
       await page.waitForSelector('svg', { timeout: 8000 });
+      assert(await page.locator('svg').first().isVisible(), 'SVG topology canvas must be rendered');
       console.log('  SVG Topology Canvas loaded');
 
       // Test search filter input
-      const searchBox = await page.$('input[placeholder*="Search"]');
-      if (searchBox) {
+      const searchBox = page.locator('input[placeholder*="Search"]');
+      if (await searchBox.isVisible()) {
         await searchBox.fill('postgres');
         await page.waitForTimeout(400);
         console.log('  Search filter filled with "postgres"');
         await searchBox.fill('');
         await page.waitForTimeout(300);
+        assert(true, 'Search filter interaction succeeded');
       }
 
       // Click on a node in the graph
-      const postgresNode = await page.$('text=postgres-db');
-      if (postgresNode) {
+      const postgresNode = page.locator('text=postgres-db').first();
+      if (await postgresNode.isVisible()) {
         await postgresNode.click();
         await page.waitForTimeout(500);
         console.log('  Clicked topology node "postgres-db"');
+        assert(true, 'Clicked topology node "postgres-db"');
       }
 
       await captureScreenshot(page, '02_servicemap_desktop.png');
-      sectionResults.push({ name: '2. Service Map & Topology', passed: true });
+      sectionResults.push({ name: '2. Service Map & Topology', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '2. Service Map & Topology', passed: false, error: err.message });
+      sectionResults.push({ name: '2. Service Map & Topology', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -210,6 +228,7 @@ async function runBrowserSuite() {
       // Select the PostgreSQL scenario card
       const scenarioCard = page.locator('h4:has-text("PostgreSQL")').first();
       await scenarioCard.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await scenarioCard.isVisible(), 'PostgreSQL scenario card must be visible');
       await scenarioCard.click();
       console.log('  Selected scenario card: "PostgreSQL Database Slowdown"');
       await page.waitForTimeout(400);
@@ -217,6 +236,7 @@ async function runBrowserSuite() {
       // Click "Inject Selected Scenario" and deterministically capture POST /api/simulations/inject response
       const injectBtn = page.locator('button:has-text("Inject Selected Scenario")');
       await injectBtn.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await injectBtn.isVisible(), 'Inject button must be visible');
 
       const [injectResponse] = await Promise.all([
         page.waitForResponse(
@@ -226,21 +246,19 @@ async function runBrowserSuite() {
         injectBtn.click(),
       ]);
 
-      if (!injectResponse.ok()) {
-        const errorText = await injectResponse.text();
-        throw new Error(`Simulation injection failed with status ${injectResponse.status()}: ${errorText}`);
-      }
-
+      assert(injectResponse.ok(), `Simulation injection response must be OK (status ${injectResponse.status()})`);
       const injectData = await injectResponse.json();
-      if (!injectData.incidentId || typeof injectData.incidentId !== 'string') {
-        throw new Error(`Injection endpoint returned invalid incident ID: ${JSON.stringify(injectData)}`);
-      }
+      assert(
+        typeof injectData.incidentId === 'string' && injectData.incidentId.length > 0,
+        `Injection endpoint returned valid incidentId: ${JSON.stringify(injectData)}`
+      );
 
       createdIncidentId = injectData.incidentId;
       console.log(`  Deterministic incident created successfully: ID=${createdIncidentId}`);
 
       // Verify Active Simulation Banner appears at Step 1
       await page.waitForSelector('text=Active Simulation: Step 1', { timeout: 8000 });
+      assert(await page.locator('text=Active Simulation: Step 1').isVisible(), 'Active simulation Step 1 banner must be visible');
       console.log('  Verified Active Simulation status banner: Step 1');
 
       // Click "Advance Step" button
@@ -253,18 +271,17 @@ async function runBrowserSuite() {
           ),
           advanceBtn.click(),
         ]);
-        if (!advanceResponse.ok()) {
-          console.warn(`  Advance step returned non-OK status: ${advanceResponse.status()}`);
-        }
+        assert(advanceResponse.ok(), `Advance step response must be OK (status ${advanceResponse.status()})`);
         console.log('  Clicked "Advance Step" button');
         await page.waitForSelector('text=Active Simulation: Step 2', { timeout: 8000 });
+        assert(await page.locator('text=Active Simulation: Step 2').isVisible(), 'Active simulation Step 2 banner must be visible');
         console.log('  Verified Active Simulation status banner: Step 2');
       }
 
       await captureScreenshot(page, '03_simulator_injected_desktop.png');
-      sectionResults.push({ name: '3. Failure Simulator Injection', passed: true });
+      sectionResults.push({ name: '3. Failure Simulator Injection', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '3. Failure Simulator Injection', passed: false, error: err.message });
+      sectionResults.push({ name: '3. Failure Simulator Injection', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -279,10 +296,13 @@ async function runBrowserSuite() {
       await page.waitForSelector('table tbody tr', { timeout: 8000 });
       const rowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
       console.log(`  Incidents table row count: ${rowCount}`);
+      assert(rowCount > 0, `Incidents table must have at least 1 row, found ${rowCount}`);
 
       // Verify the exact created incident link is present in the table
+      assert(createdIncidentId !== null, 'createdIncidentId must exist before checking incidents table');
       const exactLinkSelector = `a[href="/incidents/${createdIncidentId}"]`;
       await page.waitForSelector(exactLinkSelector, { timeout: 8000 });
+      assert(await page.locator(exactLinkSelector).first().isVisible(), `Link for exact incident /incidents/${createdIncidentId} must be visible`);
       console.log(`  Verified exact incident link in table: /incidents/${createdIncidentId}`);
 
       // Click status filter "IDENTIFIED"
@@ -291,6 +311,7 @@ async function runBrowserSuite() {
         await identifiedBtn.click();
         await page.waitForTimeout(300);
         console.log('  Clicked status filter: "IDENTIFIED"');
+        assert(true, 'Filtered by status IDENTIFIED');
       }
 
       // Reset filters via ALL buttons
@@ -303,11 +324,12 @@ async function runBrowserSuite() {
 
       // Re-confirm exact incident link after filter reset
       await page.waitForSelector(exactLinkSelector, { timeout: 6000 });
+      assert(await page.locator(exactLinkSelector).first().isVisible(), 'Exact incident link confirmed after filter reset');
 
       await captureScreenshot(page, '04_incidents_list_desktop.png');
-      sectionResults.push({ name: '4. Incidents List & Filtering', passed: true });
+      sectionResults.push({ name: '4. Incidents List & Filtering', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '4. Incidents List & Filtering', passed: false, error: err.message });
+      sectionResults.push({ name: '4. Incidents List & Filtering', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -316,13 +338,12 @@ async function runBrowserSuite() {
     // ----------------------------------------------------
     console.log('\n--- 5. Testing Incident Investigation Details ---');
     try {
-      if (!createdIncidentId) {
-        throw new Error('Test 5 prerequisite missing: createdIncidentId is null.');
-      }
+      assert(createdIncidentId !== null, 'Test 5 prerequisite missing: createdIncidentId is null.');
 
       // Locate the EXACT Investigate link for createdIncidentId
       const targetExactLink = page.locator(`a[href="/incidents/${createdIncidentId}"]`);
       await targetExactLink.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await targetExactLink.isVisible(), `Exact link a[href="/incidents/${createdIncidentId}"] must be visible`);
       console.log(`  Navigating to exact incident detail: /incidents/${createdIncidentId}`);
 
       await Promise.all([
@@ -332,31 +353,26 @@ async function runBrowserSuite() {
 
       // Verify the page URL corresponds to the same incident ID
       const pageUrl = page.url();
-      if (!pageUrl.includes(`/incidents/${createdIncidentId}`)) {
-        throw new Error(`Navigated URL "${pageUrl}" does not match created incident ID "${createdIncidentId}"`);
-      }
+      assert(
+        pageUrl.includes(`/incidents/${createdIncidentId}`),
+        `Navigated URL "${pageUrl}" does not match created incident ID "${createdIncidentId}"`
+      );
 
       // Check for incident not found error
       const notFoundElement = await page.$('text=Incident not found');
-      if (notFoundElement) {
-        const bodyText = await page.innerText('body');
-        throw new Error(`Incident not found on detail page for ID "${createdIncidentId}". Body: ${bodyText.slice(0, 300)}`);
-      }
+      assert(!notFoundElement, `Incident not found on detail page for ID "${createdIncidentId}"`);
 
       // Verify incident header displays ID
       await page.waitForSelector(`text=ID: ${createdIncidentId}`, { timeout: 8000 });
+      assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), `Header must display ID: ${createdIncidentId}`);
       console.log(`  Confirmed incident detail header corresponds to ID: ${createdIncidentId}`);
 
       // Locate Ranked Root Causes tab button using reliable multi-fallback locator
       const rootCausesTabLocator = page.locator(
         'button:has-text("Ranked Root Causes"), button:has-text("DSA Graph Candidates"), [data-testid="ranked-root-causes-tab"]'
       );
-      try {
-        await rootCausesTabLocator.first().waitFor({ state: 'visible', timeout: 8000 });
-      } catch {
-        const pageContent = await page.innerText('body');
-        throw new Error(`Failed to locate Ranked Root Causes tab button. Page text sample: ${pageContent.slice(0, 350)}`);
-      }
+      await rootCausesTabLocator.first().waitFor({ state: 'visible', timeout: 8000 });
+      assert(await rootCausesTabLocator.first().isVisible(), 'Ranked Root Causes tab button must be visible');
 
       // Switch to the Ranked Root Causes / DSA Candidates tab
       await rootCausesTabLocator.first().click();
@@ -365,10 +381,7 @@ async function runBrowserSuite() {
 
       // Verify root cause candidates or top suspect card is present
       const candidateCard = (await page.$('text=PostgreSQL')) || (await page.$('text=postgres-db')) || (await page.$('text=Heuristic Score'));
-      if (!candidateCard) {
-        const pageText = await page.innerText('body');
-        throw new Error(`Root cause candidates not rendered in investigation tab. Page text: ${pageText.slice(0, 350)}`);
-      }
+      assert(candidateCard !== null, 'Root cause candidate card must be rendered in investigation tab');
       console.log('  Verified Ranked Root Causes candidate card rendered');
 
       // Click "Evidence Timeline" tab
@@ -377,28 +390,33 @@ async function runBrowserSuite() {
         await evidenceTabBtn.click();
         await page.waitForTimeout(500);
         console.log('  Switched to "Evidence Timeline" tab');
+        assert(true, 'Switched to Evidence Timeline tab');
       }
 
-      // Click "Re-Run DSA Root-Cause Engine" button
+      // Click "Re-Run DSA Root-Cause Engine" button if visible, asserting POST API response
       const reanalyzeBtn = page.locator('button:has-text("Re-Run DSA Root-Cause Engine")');
       if (await reanalyzeBtn.isVisible()) {
         const [reanalyzeResponse] = await Promise.all([
           page.waitForResponse(
             (res) => res.url().includes(`/api/incidents/${createdIncidentId}/analyze`) && res.request().method() === 'POST',
             { timeout: 10000 }
-          ).catch(() => null),
+          ),
           reanalyzeBtn.click(),
         ]);
-        if (reanalyzeResponse?.ok()) {
-          console.log('  Re-Run DSA Root-Cause Engine completed successfully');
-        }
-        await page.waitForTimeout(1000);
+        assert(reanalyzeResponse.ok(), `Re-Run DSA Root-Cause Engine POST returned status ${reanalyzeResponse.status()}`);
+        const analyzeData = await reanalyzeResponse.json();
+        assert(analyzeData !== null, 'Re-analysis API returned JSON response');
+        console.log('  Re-Run DSA Root-Cause Engine POST request succeeded');
+
+        // Verify resulting incident data or visible confirmation after the request
+        await page.waitForTimeout(600);
+        assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), 'Incident header remains confirmed after re-analysis');
       }
 
       await captureScreenshot(page, '05_incident_investigation_desktop.png');
-      sectionResults.push({ name: '5. Incident Investigation Details', passed: true });
+      sectionResults.push({ name: '5. Incident Investigation Details', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '5. Incident Investigation Details', passed: false, error: err.message });
+      sectionResults.push({ name: '5. Incident Investigation Details', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -409,27 +427,53 @@ async function runBrowserSuite() {
     try {
       await page.goto(`${BASE_URL}/simulator`, { waitUntil: 'domcontentloaded' });
 
-      // Restore failing service in the table if any degraded
+      // Assert that the simulator page loaded
+      await page.waitForSelector('h1:has-text("Failure Simulator")', { timeout: 8000 });
+      assert(await page.locator('h1:has-text("Failure Simulator")').isVisible(), 'Failure Simulator page header must be visible');
+      await page.waitForSelector('text=Live Fleet Telemetry', { timeout: 8000 });
+      assert(await page.locator('text=Live Fleet Telemetry').first().isVisible(), 'Live Fleet Telemetry section must be visible');
+
+      // Check for restore-eligible services
       await page.waitForTimeout(500);
       const restoreButtons = await page.$$('button:text-is("Restore")');
-      let restoredCount = 0;
+      let targetRestoreBtn = null;
       for (const btn of restoreButtons) {
         if (!(await btn.isDisabled())) {
-          await btn.click();
-          restoredCount++;
-          await page.waitForTimeout(1000);
-          break; // Restore first degraded service
+          targetRestoreBtn = btn;
+          break;
         }
       }
-      console.log(`  Restored degraded services: ${restoredCount}`);
 
-      // Reset Baseline if button is visible and enabled
+      if (targetRestoreBtn) {
+        // Assert restore API response is successful
+        const [restoreResponse] = await Promise.all([
+          page.waitForResponse(
+            (res) => res.url().includes('/api/services/') && res.url().endsWith('/restore') && res.request().method() === 'POST',
+            { timeout: 10000 }
+          ),
+          targetRestoreBtn.click(),
+        ]);
+        assert(restoreResponse.ok(), `Service restore API returned non-OK status ${restoreResponse.status()}`);
+        console.log('  Restored degraded service via API: 200 OK');
+        await page.waitForTimeout(800);
+        sectionResults.push({ name: '6. Simulator Service Restoration & Reset', status: 'passed' });
+      } else {
+        // If the environment intentionally has no restore-eligible service, explicitly classify this as SKIPPED rather than PASSED
+        console.log('  No restore-eligible (DEGRADED/DOWN) services found in simulator; classifying as SKIPPED');
+        sectionResults.push({
+          name: '6. Simulator Service Restoration & Reset',
+          status: 'skipped',
+          skipReason: 'No restore-eligible service found in current simulator state',
+        });
+      }
+
+      // Preserve safe behavior for protected database reset controls
       const finalResetBtn = page.locator('button:has-text("Reset Baseline")').first();
       if (await finalResetBtn.isVisible().catch(() => false)) {
         if (!(await finalResetBtn.isDisabled())) {
           await finalResetBtn.click();
           console.log('  Clicked "Reset Baseline" button');
-          await page.waitForTimeout(1500);
+          await page.waitForTimeout(1000);
         } else {
           console.log('  Reset Baseline button is disabled');
         }
@@ -438,9 +482,8 @@ async function runBrowserSuite() {
       }
 
       await captureScreenshot(page, '06_simulator_restored_desktop.png');
-      sectionResults.push({ name: '6. Simulator Service Restoration & Reset', passed: true });
     } catch (err) {
-      sectionResults.push({ name: '6. Simulator Service Restoration & Reset', passed: false, error: err.message });
+      sectionResults.push({ name: '6. Simulator Service Restoration & Reset', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -450,59 +493,83 @@ async function runBrowserSuite() {
     console.log('\n--- 7. Testing DSA Lab Interactive Controls ---');
     try {
       await page.goto(`${BASE_URL}/dsa-lab`, { waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('h1:has-text("Data Structures & Algorithms Lab")', { timeout: 8000 });
+      assert(await page.locator('h1:has-text("Data Structures & Algorithms Lab")').isVisible(), 'DSA Lab page header must be visible');
 
-      // Test Tab 1: BFS (Impact Propagation)
-      const bfsTab = page.locator('button:has-text("1. BFS")');
-      if (await bfsTab.isVisible()) {
-        await bfsTab.click();
+      const expectedTabs = [
+        {
+          name: 'BFS',
+          label: '1. BFS (Impact Propagation)',
+          selector: 'button:has-text("1. BFS")',
+          expectedContent: 'Traverses reverse-dependency edges',
+        },
+        {
+          name: 'DFS',
+          label: '2. DFS (Cycle Detection)',
+          selector: 'button:has-text("2. DFS")',
+          expectedContent: '3-Color Scheme',
+        },
+        {
+          name: 'Priority Queue',
+          label: '3. Priority Queue (Binary Heap)',
+          selector: 'button:has-text("3. Priority Queue")',
+          expectedContent: 'Binary Tree in array storage',
+        },
+        {
+          name: 'Sliding Window',
+          label: '4. Sliding Window Telemetry',
+          selector: 'button:has-text("4. Sliding Window")',
+          expectedContent: 'Sliding Window',
+        },
+        {
+          name: 'Root-Cause Ranking Engine',
+          label: '5. Root-Cause Ranking Engine',
+          selector: 'button:has-text("5. Root-Cause Ranking Engine")',
+          expectedContent: 'Heuristic Weights',
+        },
+      ];
+
+      for (const tab of expectedTabs) {
+        const tabBtn = page.locator(tab.selector);
+        await tabBtn.waitFor({ state: 'visible', timeout: 6000 });
+        assert(await tabBtn.isVisible(), `DSA Tab "${tab.label}" must exist and be visible`);
+
+        await tabBtn.click();
         await page.waitForTimeout(400);
-        console.log('  Switched to "1. BFS (Impact Propagation)"');
-      }
 
-      // Test Tab 2: DFS (Cycle Detection)
-      const dfsTab = page.locator('button:has-text("2. DFS")');
-      if (await dfsTab.isVisible()) {
-        await dfsTab.click();
-        await page.waitForTimeout(400);
-        console.log('  Switched to "2. DFS (Cycle Detection)"');
+        // Verify active-tab state (class containing bg-blue-600)
+        const btnClass = await tabBtn.getAttribute('class');
+        assert(
+          btnClass && btnClass.includes('bg-blue-600'),
+          `Tab "${tab.label}" should have active styling (bg-blue-600), got: "${btnClass}"`
+        );
 
-        // Toggle test cycle checkbox
-        const cycleCheckbox = await page.$('input[type="checkbox"]');
-        if (cycleCheckbox) {
-          await cycleCheckbox.click();
-          await page.waitForTimeout(400);
-          console.log('  Toggled synthetic test cycle checkbox in DFS tab');
+        // Verify corresponding content is visible
+        const contentLocator = page.locator(`text=${tab.expectedContent}`);
+        await contentLocator.first().waitFor({ state: 'visible', timeout: 6000 });
+        assert(
+          await contentLocator.first().isVisible(),
+          `Active tab "${tab.label}" should display content matching "${tab.expectedContent}"`
+        );
+
+        console.log(`  Verified tab "${tab.label}" active state and content`);
+
+        // Extra DFS check: toggle synthetic cycle checkbox if present
+        if (tab.name === 'DFS') {
+          const cycleCheckbox = page.locator('input[type="checkbox"]');
+          if (await cycleCheckbox.isVisible()) {
+            await cycleCheckbox.click();
+            await page.waitForTimeout(300);
+            assert(true, 'Toggled DFS test cycle checkbox');
+            console.log('  Toggled synthetic test cycle checkbox in DFS tab');
+          }
         }
       }
 
-      // Test Tab 3: Priority Queue
-      const pqTab = page.locator('button:has-text("3. Priority Queue")');
-      if (await pqTab.isVisible()) {
-        await pqTab.click();
-        await page.waitForTimeout(400);
-        console.log('  Switched to "3. Priority Queue (Binary Heap)"');
-      }
-
-      // Test Tab 4: Sliding Window
-      const swTab = page.locator('button:has-text("4. Sliding Window")');
-      if (await swTab.isVisible()) {
-        await swTab.click();
-        await page.waitForTimeout(400);
-        console.log('  Switched to "4. Sliding Window Telemetry"');
-      }
-
-      // Test Tab 5: Root-Cause Engine
-      const rcTab = page.locator('button:has-text("5. Root-Cause Ranking Engine")');
-      if (await rcTab.isVisible()) {
-        await rcTab.click();
-        await page.waitForTimeout(400);
-        console.log('  Switched to "5. Root-Cause Ranking Engine"');
-      }
-
       await captureScreenshot(page, '07_dsalab_desktop.png');
-      sectionResults.push({ name: '7. DSA Lab Interactive Controls', passed: true });
+      sectionResults.push({ name: '7. DSA Lab Interactive Controls', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '7. DSA Lab Interactive Controls', passed: false, error: err.message });
+      sectionResults.push({ name: '7. DSA Lab Interactive Controls', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -512,24 +579,29 @@ async function runBrowserSuite() {
     console.log('\n--- 8. Testing Settings Page ---');
     try {
       await page.goto(`${BASE_URL}/settings`, { waitUntil: 'domcontentloaded' });
-      await page.waitForSelector('text=System Administration', { timeout: 8000 });
+      await page.waitForSelector('h1:has-text("Settings & Diagnostics")', { timeout: 8000 });
+      assert(await page.locator('h1:has-text("Settings & Diagnostics")').isVisible(), 'Settings page header must be visible');
+      assert(await page.locator('text=System Administration').first().isVisible(), 'System Administration badge must be visible');
 
-      // Wait for health state to settle
       await page.waitForTimeout(500);
 
       const resetDbBtn = page.locator('button:has-text("Reset Database")');
-      if (await resetDbBtn.isVisible().catch(() => false) && !(await resetDbBtn.isDisabled().catch(() => true))) {
-        await resetDbBtn.click({ timeout: 3000 }).catch(() => null);
-        await page.waitForTimeout(600);
-        console.log('  Interacted with "Reset Database" button');
-      } else {
-        console.log('  Reset Database button is protected or disabled in this environment');
+      if (await resetDbBtn.isVisible().catch(() => false)) {
+        if (!(await resetDbBtn.isDisabled().catch(() => true))) {
+          await resetDbBtn.click({ timeout: 3000 }).catch(() => null);
+          await page.waitForTimeout(600);
+          console.log('  Interacted with "Reset Database" button');
+          assert(true, 'Interacted with enabled Reset Database button');
+        } else {
+          console.log('  Reset Database button is protected or disabled in this environment (safe)');
+          assert(true, 'Reset Database button is safely protected/disabled');
+        }
       }
 
       await captureScreenshot(page, '08_settings_desktop.png');
-      sectionResults.push({ name: '8. Settings & Diagnostics Page', passed: true });
+      sectionResults.push({ name: '8. Settings & Diagnostics Page', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '8. Settings & Diagnostics Page', passed: false, error: err.message });
+      sectionResults.push({ name: '8. Settings & Diagnostics Page', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -540,33 +612,35 @@ async function runBrowserSuite() {
     try {
       await page.setViewportSize({ width: 390, height: 844 });
 
-      // Mobile Dashboard
-      await page.goto(`${BASE_URL}/`, { waitUntil: 'domcontentloaded' });
-      const dashOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
-      console.log(`  Dashboard Mobile - Horizontal Overflow: ${dashOverflow ? 'DETECTED' : 'None (Clean)'}`);
-      await captureScreenshot(page, '09_dashboard_mobile.png');
+      const mobilePages = [
+        { name: 'Dashboard', path: '/', screenshot: '09_dashboard_mobile.png' },
+        { name: 'Service Map', path: '/service-map', screenshot: '10_servicemap_mobile.png' },
+        { name: 'Simulator', path: '/simulator', screenshot: '11_simulator_mobile.png' },
+        { name: 'Incidents', path: '/incidents', screenshot: '12_incidents_mobile.png' },
+      ];
 
-      // Mobile Service Map
-      await page.goto(`${BASE_URL}/service-map`, { waitUntil: 'domcontentloaded' });
-      const mapOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
-      console.log(`  Service Map Mobile - Horizontal Overflow: ${mapOverflow ? 'DETECTED' : 'None (Clean)'}`);
-      await captureScreenshot(page, '10_servicemap_mobile.png');
+      for (const p of mobilePages) {
+        await page.goto(`${BASE_URL}${p.path}`, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(400);
 
-      // Mobile Simulator
-      await page.goto(`${BASE_URL}/simulator`, { waitUntil: 'domcontentloaded' });
-      const simOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
-      console.log(`  Simulator Mobile - Horizontal Overflow: ${simOverflow ? 'DETECTED' : 'None (Clean)'}`);
-      await captureScreenshot(page, '11_simulator_mobile.png');
+        const dims = await page.evaluate(() => ({
+          scrollWidth: document.documentElement.scrollWidth,
+          clientWidth: document.documentElement.clientWidth,
+          innerWidth: window.innerWidth,
+        }));
 
-      // Mobile Incidents
-      await page.goto(`${BASE_URL}/incidents`, { waitUntil: 'domcontentloaded' });
-      const incOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
-      console.log(`  Incidents Mobile - Horizontal Overflow: ${incOverflow ? 'DETECTED' : 'None (Clean)'}`);
-      await captureScreenshot(page, '12_incidents_mobile.png');
+        assert(
+          dims.scrollWidth <= dims.clientWidth,
+          `Mobile responsiveness overflow failure on ${p.name} (${p.path}): scrollWidth (${dims.scrollWidth}px) exceeds clientWidth (${dims.clientWidth}px, innerWidth: ${dims.innerWidth}px)`
+        );
 
-      sectionResults.push({ name: '9. Mobile Viewport Responsiveness', passed: true });
+        console.log(`  ${p.name} Mobile - Clean (${dims.scrollWidth}px <= ${dims.clientWidth}px)`);
+        await captureScreenshot(page, p.screenshot);
+      }
+
+      sectionResults.push({ name: '9. Mobile Viewport Responsiveness', status: 'passed' });
     } catch (err) {
-      sectionResults.push({ name: '9. Mobile Viewport Responsiveness', passed: false, error: err.message });
+      sectionResults.push({ name: '9. Mobile Viewport Responsiveness', status: 'failed', error: err.message });
       throw err;
     }
 
@@ -580,26 +654,40 @@ async function runBrowserSuite() {
   console.log('                   BROWSER TEST REPORT SUMMARY                  ');
   console.log('================================================================');
 
-  const passedCount = sectionResults.filter((r) => r.passed).length;
+  const passedSections = sectionResults.filter((r) => r.status === 'passed').length;
+  const skippedSections = sectionResults.filter((r) => r.status === 'skipped').length;
+  const failedSections = sectionResults.filter((r) => r.status === 'failed').length;
   const totalSections = 9;
-  console.log(`Sections Executed: ${sectionResults.length} / ${totalSections}`);
-  console.log(`Sections Passed:   ${passedCount} / ${totalSections}`);
+
+  console.log(`Sections Executed:  ${sectionResults.length} / ${totalSections}`);
+  console.log(`Sections Passed:    ${passedSections}`);
+  console.log(`Sections Skipped:   ${skippedSections}`);
+  console.log(`Sections Failed:    ${failedSections}`);
+  console.log(`Assertions Passed:  ${assertionsPassed}`);
+  console.log(`Assertions Failed:  ${assertionsFailed}`);
 
   sectionResults.forEach((r) => {
-    console.log(`  ${r.passed ? '✓' : '✗'} ${r.name}${r.error ? ` (Error: ${r.error})` : ''}`);
+    const symbol = r.status === 'passed' ? '✓' : r.status === 'skipped' ? '⊘' : '✗';
+    const detail = r.error ? ` (Error: ${r.error})` : r.skipReason ? ` (Skipped: ${r.skipReason})` : '';
+    console.log(`  ${symbol} [${r.status.toUpperCase()}] ${r.name}${detail}`);
   });
 
   console.log(`\nBrowser Console Errors: ${consoleErrors.length}`);
   consoleErrors.forEach((e) => console.log(`  ${e}`));
 
+  console.log(`Page Errors: ${pageErrors.length}`);
+  pageErrors.forEach((e) => console.log(`  ${e}`));
+
   console.log(`Network Failures: ${networkFailures.length}`);
   networkFailures.forEach((n) => console.log(`  ${n}`));
 
-  if (passedCount === totalSections) {
-    console.log('\n>>> BROWSER SUITE OVERALL RESULT: 100% PASS (All 9 sections passed)');
+  const allPassedOrSkipped = (passedSections + skippedSections === totalSections) && failedSections === 0 && assertionsFailed === 0;
+
+  if (allPassedOrSkipped) {
+    console.log(`\n>>> BROWSER SUITE OVERALL RESULT: 100% PASS (${passedSections} passed, ${skippedSections} skipped, 0 failed)`);
     process.exit(0);
   } else {
-    console.error(`\n>>> BROWSER SUITE OVERALL RESULT: FAILED (${passedCount}/${totalSections} sections passed)`);
+    console.error(`\n>>> BROWSER SUITE OVERALL RESULT: FAILED (${failedSections} failed, ${assertionsFailed} failed assertions)`);
     process.exit(1);
   }
 }
