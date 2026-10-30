@@ -19,12 +19,14 @@ import {
 import { RootCauseEngine } from "../src/lib/algorithms/rootCauseEngine";
 import { TelemetryPoint } from "../src/lib/algorithms/types";
 import { evaluateMockPromQl } from "../sample-services/mock-observability";
+import { ensureDatabaseSeeded } from "../src/lib/db/ensure-seeded";
 
 describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
   const originalFetch = global.fetch;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.restoreAllMocks();
+    await ensureDatabaseSeeded();
   });
 
   afterEach(() => {

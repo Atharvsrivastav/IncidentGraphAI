@@ -1,4 +1,5 @@
 import { prisma } from "../db/prisma";
+import { ensureDatabaseSeeded } from "../db/ensure-seeded";
 import { prometheusClient, ServiceMetricsSummary } from "./prometheusClient";
 import { jaegerClient } from "./jaegerClient";
 import {
@@ -137,7 +138,11 @@ export class TelemetryManager {
     lastCollectedAt: string;
     lastIngestedAt: string | null;
   }> {
-    const dbServices = await prisma.service.findMany();
+    let dbServices = await prisma.service.findMany();
+    if (dbServices.length === 0) {
+      await ensureDatabaseSeeded();
+      dbServices = await prisma.service.findMany();
+    }
 
     // 1. Strict Simulation Isolation: zero network requests
     if (this.currentMode === "SIMULATION") {
@@ -357,7 +362,11 @@ export class TelemetryManager {
 
     // 1. Strict Simulation Isolation: zero network calls
     if (this.currentMode === "SIMULATION") {
-      const dbServices = await prisma.service.findMany();
+      let dbServices = await prisma.service.findMany();
+      if (dbServices.length === 0) {
+        await ensureDatabaseSeeded();
+        dbServices = await prisma.service.findMany();
+      }
       return this.buildSimulatedBatch(dbServices, batchId, collectedAt);
     }
 
