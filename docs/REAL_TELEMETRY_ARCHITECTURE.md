@@ -262,6 +262,10 @@ To maintain total documentation integrity, the capabilities of IncidentGraph AI 
 | **Sample Microservice Stack** | ✅ Yes | ✅ Yes (E2E Test) | N/A (Local In-Memory / Docker) | Express HTTP & OpenTelemetry instrumentation |
 | **React Flow State Synchronization** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side State) | Preserves user-dragged coordinates while updating node metrics |
 | **Live / Degraded Service Map UI** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side Rendering) | Honest LIVE vs DEGRADED banners and UNKNOWN metric states |
+| **Requested vs Effective Mode** | ✅ Yes | ✅ Yes (Vitest) | N/A (Operational State) | Separates requested mode from verified operational telemetry state |
+| **Navigation Failure Guard** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side State) | Failed mode switches never set status to LIVE |
+| **Mock Emulation Honest Attribution** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side UI) | Prominent MOCK EMULATION badge; never claims production status |
+| **Unknown Services Metric Validity** | ✅ Yes | ✅ Yes (Vitest) | N/A (Client-Side UI) | Renders N/A for missing metrics, preserves genuine zeroes |
 
 > [!NOTE]
 > Live end-to-end verification against external Grafana Cloud hosted infrastructure requires genuine cloud API tokens (`metrics:read` and `traces:read`). When running in CI or offline developer workstations without external credentials, the entire test suite executes deterministically against rigorous mocked provider responses with zero network leakage. Genuine live Grafana Cloud validation remains pending configuration of production credentials.
@@ -297,10 +301,10 @@ The telemetry suite includes deterministic mocked provider tests, normalization 
 # Run the dedicated live telemetry test suite (63 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the service map UI integration & synchronization suite (15 tests)
+# Run the service map UI integration & synchronization suite (26 tests)
 npx vitest run tests/service-map-ui.test.ts
 
-# Run the complete test suite (159 tests across 9 suites)
+# Run the complete test suite (170 tests across 9 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)

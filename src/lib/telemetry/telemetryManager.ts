@@ -16,9 +16,23 @@ import {
 
 export class TelemetryManager {
   private static instance: TelemetryManager;
-  private currentMode: TelemetryMode = "SIMULATION";
+  private requestedMode: TelemetryMode = "SIMULATION";
+  private effectiveMode: TelemetryMode = "SIMULATION";
   private lastHealthCheck: BackendHealthStatus | null = null;
   private lastIngestedAt: string | null = null;
+  private cachedObservation: {
+    timestamp: number;
+    data: {
+      mode: TelemetryMode;
+      requestedMode: TelemetryMode;
+      effectiveMode: TelemetryMode;
+      backendHealth: BackendHealthStatus;
+      observedServices: ObservedServiceMetric[];
+      unknownServices: ObservedServiceMetric[];
+      lastCollectedAt: string;
+      lastIngestedAt: string | null;
+    };
+  } | null = null;
 
   public static getInstance(): TelemetryManager {
     if (!TelemetryManager.instance) {
@@ -28,14 +42,39 @@ export class TelemetryManager {
   }
 
   public getMode(): TelemetryMode {
-    return this.currentMode;
+    return this.requestedMode;
+  }
+
+  public getRequestedMode(): TelemetryMode {
+    return this.requestedMode;
+  }
+
+  public getEffectiveMode(): TelemetryMode {
+    return this.effectiveMode;
+  }
+
+  public getOperationalState(): {
+    requestedMode: TelemetryMode;
+    effectiveMode: TelemetryMode;
+    lastIngestedAt: string | null;
+  } {
+    return {
+      requestedMode: this.requestedMode,
+      effectiveMode: this.effectiveMode,
+      lastIngestedAt: this.lastIngestedAt,
+    };
   }
 
   public setMode(mode: TelemetryMode): void {
-    if (mode === "REAL") {
-      this.currentMode = "LIVE";
+    const normalized = mode === "REAL" ? "LIVE" : mode;
+    this.requestedMode = normalized;
+    this.cachedObservation = null;
+
+    if (normalized === "SIMULATION") {
+      this.effectiveMode = "SIMULATION";
     } else {
-      this.currentMode = mode;
+      // LIVE mode requires confirmed telemetry observations; starts at DEGRADED until verified
+      this.effectiveMode = "DEGRADED";
     }
   }
 
@@ -44,12 +83,16 @@ export class TelemetryManager {
   }
 
   public async getBackendHealth(forceProbe: boolean = false): Promise<BackendHealthStatus> {
+    if (!forceProbe && this.cachedObservation && Date.now() - this.cachedObservation.timestamp < 3000) {
+      return this.cachedObservation.data.backendHealth;
+    }
+
     const cloudConfigured = Boolean(
       (process.env.GRAFANA_CLOUD_OTLP_ENDPOINT && process.env.GRAFANA_CLOUD_OTLP_ENDPOINT.trim().length > 0) ||
       (process.env.GRAFANA_CLOUD_PROMETHEUS_URL && process.env.GRAFANA_CLOUD_PROMETHEUS_URL.trim().length > 0)
     );
 
-    if (this.currentMode === "SIMULATION" && !forceProbe) {
+    if (this.requestedMode === "SIMULATION" && !forceProbe) {
       const status: BackendHealthStatus = {
         prometheusAvailable: false,
         jaegerAvailable: false,
@@ -125,19 +168,26 @@ export class TelemetryManager {
       return `Tempo/Jaeger connected, but Prometheus is offline (${promHealth.error || "unreachable"}).`;
     }
     if (isMock) {
-      return "Connected to local mock observability server (MOCK_EMULATION).";
+      return "Connected to local mock observability server (MOCK_EMULATION). Dev mock emulation - not production telemetry.";
     }
     return "Connected to genuine local Prometheus and Jaeger observability stack.";
   }
 
-  public async getObservedServices(): Promise<{
+  public async getObservedServices(forceRefresh: boolean = false): Promise<{
     mode: TelemetryMode;
+    requestedMode?: TelemetryMode;
+    effectiveMode?: TelemetryMode;
     backendHealth: BackendHealthStatus;
     observedServices: ObservedServiceMetric[];
     unknownServices: ObservedServiceMetric[];
     lastCollectedAt: string;
     lastIngestedAt: string | null;
   }> {
+    // Reuse fresh cached observation snapshot to avoid duplicating expensive provider queries on every navigation poll
+    if (!forceRefresh && this.cachedObservation && Date.now() - this.cachedObservation.timestamp < 3000) {
+      return this.cachedObservation.data;
+    }
+
     let dbServices = await prisma.service.findMany();
     if (dbServices.length === 0) {
       await ensureDatabaseSeeded();
@@ -145,7 +195,7 @@ export class TelemetryManager {
     }
 
     // 1. Strict Simulation Isolation: zero network requests
-    if (this.currentMode === "SIMULATION") {
+    if (this.requestedMode === "SIMULATION") {
       const mockHealth: BackendHealthStatus = {
         prometheusAvailable: false,
         jaegerAvailable: false,
@@ -181,6 +231,7 @@ export class TelemetryManager {
     // Truthful mode decision: requires BOTH backends to be connected, queries to succeed, and verified data returned
     const isTrulyLive = backendHealth.prometheusAvailable && backendHealth.jaegerAvailable && promSuccess && tempoSuccess;
     const effectiveMode: TelemetryMode = isTrulyLive ? "LIVE" : "DEGRADED";
+    this.effectiveMode = effectiveMode;
 
     if (isTrulyLive) {
       this.lastIngestedAt = new Date().toISOString();
@@ -218,14 +269,23 @@ export class TelemetryManager {
       isKnownInTopology: true,
     }));
 
-    return {
+    this.effectiveMode = "SIMULATION";
+    const result = {
       mode: "SIMULATION" as const,
+      requestedMode: "SIMULATION" as const,
+      effectiveMode: "SIMULATION" as const,
       backendHealth,
       observedServices: observed,
       unknownServices: [],
       lastCollectedAt: new Date().toISOString(),
       lastIngestedAt: this.lastIngestedAt,
     };
+
+    this.cachedObservation = {
+      timestamp: Date.now(),
+      data: result,
+    };
+    return result;
   }
 
   private buildDegradedOfflineObservedServices(
@@ -249,14 +309,23 @@ export class TelemetryManager {
       isKnownInTopology: true,
     }));
 
-    return {
+    this.effectiveMode = "DEGRADED";
+    const result = {
       mode: "DEGRADED" as const,
+      requestedMode: this.requestedMode,
+      effectiveMode: "DEGRADED" as const,
       backendHealth,
       observedServices: unavailable,
       unknownServices: [],
       lastCollectedAt: new Date().toISOString(),
       lastIngestedAt: this.lastIngestedAt,
     };
+
+    this.cachedObservation = {
+      timestamp: Date.now(),
+      data: result,
+    };
+    return result;
   }
 
   private buildLiveObservedServices(
@@ -401,14 +470,23 @@ export class TelemetryManager {
       }
     }
 
-    return {
+    const result = {
       mode: effectiveMode,
+      requestedMode: this.requestedMode,
+      effectiveMode,
       backendHealth,
       observedServices,
       unknownServices,
       lastCollectedAt: new Date().toISOString(),
       lastIngestedAt: this.lastIngestedAt,
     };
+
+    this.cachedObservation = {
+      timestamp: Date.now(),
+      data: result,
+    };
+
+    return result;
   }
 
   /**
@@ -421,7 +499,7 @@ export class TelemetryManager {
     const collectedAt = new Date().toISOString();
 
     // 1. Strict Simulation Isolation: zero network calls
-    if (this.currentMode === "SIMULATION") {
+    if (this.requestedMode === "SIMULATION") {
       let dbServices = await prisma.service.findMany();
       if (dbServices.length === 0) {
         await ensureDatabaseSeeded();
@@ -538,14 +616,14 @@ export class TelemetryManager {
   }
 
   public async getRecentTraces(serviceId?: string, limit: number = 20): Promise<DistributedTrace[]> {
-    if (this.currentMode === "SIMULATION") {
+    if (this.requestedMode === "SIMULATION") {
       return [];
     }
     return await jaegerClient.getRecentTraces(serviceId, limit);
   }
 
   public async getTraceDetail(traceId: string): Promise<DistributedTrace | null> {
-    if (this.currentMode === "SIMULATION") {
+    if (this.requestedMode === "SIMULATION") {
       return null;
     }
     return await jaegerClient.getTraceById(traceId);

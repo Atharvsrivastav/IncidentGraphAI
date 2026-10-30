@@ -49,8 +49,13 @@ export async function investigateIncident(
 
   // 3. Ensure deterministic root-cause candidates exist
   let deterministicCandidates = incident.rootCauseCandidates;
+  const isLiveScenario =
+    incident.simulationScenario === "live-telemetry-observation" ||
+    telemetryManager.getRequestedMode() === "LIVE" ||
+    telemetryManager.getEffectiveMode() === "LIVE";
+
   if (deterministicCandidates.length === 0) {
-    if (incident.simulationScenario === "live-telemetry-observation" || telemetryManager.getMode() === "REAL") {
+    if (isLiveScenario) {
       await realRootCauseEngine.analyzeRealIncident(incidentId);
     } else {
       await simulator.recalculateRootCauses(incidentId);
@@ -66,8 +71,9 @@ export async function investigateIncident(
 
   // 4. Determine Provenance truthfully
   let provenance: TelemetryProvenance = "SIMULATED";
-  if (incident.simulationScenario === "live-telemetry-observation" || telemetryManager.getMode() === "REAL") {
-    provenance = "LIVE_TELEMETRY";
+  if (isLiveScenario) {
+    const health = await telemetryManager.getBackendHealth();
+    provenance = health.backendType === "MOCK_EMULATION" ? "MOCK" : "LIVE_TELEMETRY";
   } else if (!incident.simulationScenario) {
     provenance = "MOCK";
   }

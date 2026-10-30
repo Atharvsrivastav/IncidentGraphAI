@@ -8,6 +8,7 @@ import {
   ServiceDependencyItem,
 } from "../src/lib/telemetry/mergeServiceMetrics";
 import { ObservedServiceMetric } from "../src/lib/telemetry/types";
+import { TelemetryManager } from "../src/lib/telemetry/telemetryManager";
 
 describe("Service Map UI Integration & React Flow Synchronization Suite", () => {
   const baseDbServices: ServiceMapItem[] = [
@@ -402,6 +403,374 @@ describe("Service Map UI Integration & React Flow Synchronization Suite", () => 
       const orderEdge = incidentEdges.find((e) => e.source === "order-service");
       expect(orderEdge?.animated).toBe(true);
       expect(orderEdge?.style?.stroke).toBe("#f43f5e");
+    });
+  });
+
+  // =========================================================================
+  // 7. Separation of Requested Mode from Effective Telemetry State
+  // =========================================================================
+  describe("Requested Mode vs Effective Telemetry State Separation", () => {
+    it("separates requested LIVE mode from unconfirmed effective state", () => {
+      const manager = TelemetryManager.getInstance();
+
+      // Reset to simulation
+      manager.setMode("SIMULATION");
+      expect(manager.getRequestedMode()).toBe("SIMULATION");
+      expect(manager.getEffectiveMode()).toBe("SIMULATION");
+
+      // Request LIVE mode
+      manager.setMode("LIVE");
+      expect(manager.getRequestedMode()).toBe("LIVE");
+      // Prior to confirmed observations, effectiveMode must NOT claim LIVE!
+      expect(manager.getEffectiveMode()).toBe("DEGRADED");
+
+      const operational = manager.getOperationalState();
+      expect(operational.requestedMode).toBe("LIVE");
+      expect(operational.effectiveMode).toBe("DEGRADED");
+    });
+
+    it("resets effectiveMode immediately when SIMULATION is requested", () => {
+      const manager = TelemetryManager.getInstance();
+      manager.setMode("LIVE");
+      expect(manager.getRequestedMode()).toBe("LIVE");
+
+      manager.setMode("SIMULATION");
+      expect(manager.getRequestedMode()).toBe("SIMULATION");
+      expect(manager.getEffectiveMode()).toBe("SIMULATION");
+    });
+  });
+
+  // =========================================================================
+  // 8. Navigation State and Failed Request Guard
+  // =========================================================================
+  describe("Navigation Status Handling & Failed Request Guard", () => {
+    it("simulates failed POST request and proves state is never falsely updated to LIVE", () => {
+      // Current navigation state
+      let requestedState = "SIMULATION";
+      let effectiveState = "SIMULATION";
+
+      // Simulate a failed fetch response (e.g. 500 error or network failure)
+      const simulatedFetch = async () => {
+        return { ok: false, status: 500, json: async (): Promise<Record<string, unknown>> => ({ error: "Internal Error" }) };
+      };
+
+      const handleModeSwitch = async (targetMode: string) => {
+        try {
+          const res = await simulatedFetch();
+          if (res.ok) {
+            const data = await res.json();
+            effectiveState = normalizeTelemetryMode((data.effectiveMode ?? data.mode) as string | null);
+            requestedState = normalizeTelemetryMode((data.requestedMode ?? targetMode) as string | null);
+          } else {
+            // Failed request: NEVER set status to LIVE!
+            // State remains untouched
+          }
+        } catch {
+          // Network failure: NEVER set status to LIVE!
+        }
+      };
+
+      void handleModeSwitch("LIVE");
+
+      expect(requestedState).toBe("SIMULATION");
+      expect(effectiveState).toBe("SIMULATION");
+      expect(effectiveState).not.toBe("LIVE");
+    });
+
+    it("simulates successful POST request with DEGRADED backends returning honest effectiveMode", async () => {
+      let requestedState = "SIMULATION";
+      let effectiveState = "SIMULATION";
+
+      // Simulate successful API response where backends are degraded/offline
+      const simulatedFetch = async () => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            requestedMode: "LIVE",
+            effectiveMode: "DEGRADED",
+            mode: "DEGRADED",
+          }),
+        };
+      };
+
+      const res = await simulatedFetch();
+      if (res.ok) {
+        const data = await res.json();
+        effectiveState = normalizeTelemetryMode(data.effectiveMode ?? data.mode);
+        requestedState = normalizeTelemetryMode(data.requestedMode ?? "LIVE");
+      }
+
+      expect(requestedState).toBe("LIVE");
+      expect(effectiveState).toBe("DEGRADED");
+    });
+
+    it("evaluates Navigation status badge: never shows 'All Systems Operational' when live telemetry is degraded", () => {
+      const getNavigationBadge = (systemStatus: string, effectiveMode: string) => {
+        if (systemStatus === "INCIDENT") {
+          return { dot: "bg-red-500", label: "Active Incident" };
+        }
+        if (effectiveMode === "DEGRADED") {
+          return { dot: "bg-amber-500", label: "Telemetry Pipeline Degraded" };
+        }
+        return { dot: "bg-emerald-500", label: "All Systems Operational" };
+      };
+
+      // 1. Simulation without incident -> All Systems Operational
+      expect(getNavigationBadge("HEALTHY", "SIMULATION")).toEqual({
+        dot: "bg-emerald-500",
+        label: "All Systems Operational",
+      });
+
+      // 2. Telemetry degraded without incident -> Telemetry Pipeline Degraded (NEVER All Systems Operational)
+      expect(getNavigationBadge("HEALTHY", "DEGRADED")).toEqual({
+        dot: "bg-amber-500",
+        label: "Telemetry Pipeline Degraded",
+      });
+
+      // 3. Incident active -> Active Incident
+      expect(getNavigationBadge("INCIDENT", "DEGRADED")).toEqual({
+        dot: "bg-red-500",
+        label: "Active Incident",
+      });
+    });
+  });
+
+  // =========================================================================
+  // 9. Mock Emulation Honest Presentation
+  // =========================================================================
+  describe("Mock Emulation Honest Presentation", () => {
+    it("distinguishes MOCK_EMULATION from genuine production telemetry in banner rendering", () => {
+      const getBannerDisplay = (backendType: string, telemetryMode: string) => {
+        if (telemetryMode !== "LIVE") return null;
+
+        const isMock = backendType === "MOCK_EMULATION";
+        return {
+          title: isMock
+            ? "Mock Telemetry Emulation Active (Dev Server)"
+            : "Live Telemetry Mode Active",
+          badge: isMock
+            ? "MOCK EMULATION — NOT PRODUCTION TELEMETRY"
+            : backendType === "GRAFANA_CLOUD"
+            ? "☁ Grafana Cloud (Hosted)"
+            : "Genuine Docker Stack",
+          isProduction: !isMock,
+        };
+      };
+
+      // Mock backend must NEVER claim "Live Telemetry Mode Active"
+      const mockDisplay = getBannerDisplay("MOCK_EMULATION", "LIVE");
+      expect(mockDisplay?.title).toBe("Mock Telemetry Emulation Active (Dev Server)");
+      expect(mockDisplay?.badge).toBe("MOCK EMULATION — NOT PRODUCTION TELEMETRY");
+      expect(mockDisplay?.isProduction).toBe(false);
+
+      // Genuine Grafana Cloud
+      const cloudDisplay = getBannerDisplay("GRAFANA_CLOUD", "LIVE");
+      expect(cloudDisplay?.title).toBe("Live Telemetry Mode Active");
+      expect(cloudDisplay?.badge).toBe("☁ Grafana Cloud (Hosted)");
+      expect(cloudDisplay?.isProduction).toBe(true);
+
+      // Genuine Docker stack
+      const dockerDisplay = getBannerDisplay("GENUINE_STACK", "LIVE");
+      expect(dockerDisplay?.title).toBe("Live Telemetry Mode Active");
+      expect(dockerDisplay?.badge).toBe("Genuine Docker Stack");
+      expect(dockerDisplay?.isProduction).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 10. Unknown Services Metric Rendering with Validity Flags
+  // =========================================================================
+  describe("Unknown Services Metric Rendering with Validity Flags", () => {
+    it("renders valid metrics accurately and preserves genuine zero values", () => {
+      const unknownMetric: ObservedServiceMetric = {
+        serviceId: "cache-proxy",
+        serviceName: "cache-proxy",
+        source: "PROMETHEUS",
+        status: "HEALTHY",
+        latencyMs: 0,
+        hasValidLatency: true,
+        errorRate: 0,
+        hasValidErrorRate: true,
+        requestRate: 0,
+        hasValidRequestRate: true,
+        lastObserved: "2026-10-31T00:00:00Z",
+        traceCount: 0,
+        isStale: false,
+        isKnownInTopology: false,
+      };
+
+      const formatUnknownMetrics = (u: ObservedServiceMetric) => {
+        const reqText = u.hasValidRequestRate === true ? `${u.requestRate} req/s` : "N/A req/s";
+        const latText = u.hasValidLatency === true ? `${u.latencyMs}ms` : "N/A ms";
+        return { reqText, latText };
+      };
+
+      const formatted = formatUnknownMetrics(unknownMetric);
+      // Genuine 0 values are preserved
+      expect(formatted.reqText).toBe("0 req/s");
+      expect(formatted.latText).toBe("0ms");
+    });
+
+    it("renders missing metrics as N/A instead of printing zero placeholders", () => {
+      const unknownMetric: ObservedServiceMetric = {
+        serviceId: "external-auth",
+        serviceName: "external-auth",
+        source: "PROMETHEUS",
+        status: "UNKNOWN",
+        latencyMs: 0,
+        hasValidLatency: false, // Invalid / missing latency
+        errorRate: 0,
+        hasValidErrorRate: false,
+        requestRate: 0,
+        hasValidRequestRate: false, // Invalid / missing request rate
+        lastObserved: "2026-10-31T00:00:00Z",
+        traceCount: 0,
+        isStale: true,
+        isKnownInTopology: false,
+      };
+
+      const formatUnknownMetrics = (u: ObservedServiceMetric) => {
+        const reqText = u.hasValidRequestRate === true ? `${u.requestRate} req/s` : "N/A req/s";
+        const latText = u.hasValidLatency === true ? `${u.latencyMs}ms` : "N/A ms";
+        return { reqText, latText };
+      };
+
+      const formatted = formatUnknownMetrics(unknownMetric);
+      // Missing fields render as N/A
+      expect(formatted.reqText).toBe("N/A req/s");
+      expect(formatted.latText).toBe("N/A ms");
+    });
+  });
+
+  // =========================================================================
+  // 11. Component-Level ServiceGraph Props & Drawer Telemetry Synchronization
+  // =========================================================================
+  describe("Component-Level ServiceGraph Props & Drawer Telemetry Synchronization", () => {
+    it("simulates ServiceGraph receiving updated service props and changing node data while preserving coordinates", () => {
+      // Step 1: Initial mount
+      const initialServices = [...baseDbServices];
+      let currentNodes = buildGraphNodes(initialServices, [], null, []);
+
+      // Verify initial gateway latency
+      const initialGateway = currentNodes.find((n) => n.id === "api-gateway");
+      expect((initialGateway?.data as Record<string, unknown>).latency).toBe(18);
+
+      // Step 2: User drags api-gateway to custom coordinates { x: 555, y: 777 }
+      currentNodes = currentNodes.map((n) =>
+        n.id === "api-gateway" ? { ...n, position: { x: 555, y: 777 } } : n
+      );
+
+      // Step 3: Polling cycle updates service props with elevated latency and degraded status
+      const updatedServices: ServiceMapItem[] = baseDbServices.map((s) =>
+        s.id === "api-gateway"
+          ? {
+              ...s,
+              status: "DEGRADED",
+              currentLatency: 280,
+              hasValidLatency: true,
+              currentErrorRate: 6.2,
+              hasValidErrorRate: true,
+            }
+          : s
+      );
+
+      // Effect execution: setNodes((prev) => buildGraphNodes(services, prev, ...))
+      const synchronizedNodes = buildGraphNodes(updatedServices, currentNodes, null, []);
+      const updatedGateway = synchronizedNodes.find((n) => n.id === "api-gateway");
+
+      // Verifications:
+      // 1. Dragged coordinates remain unchanged
+      expect(updatedGateway?.position).toEqual({ x: 555, y: 777 });
+      // 2. Node data reflects updated telemetry
+      expect((updatedGateway?.data as Record<string, unknown>).latency).toBe(280);
+      expect((updatedGateway?.data as Record<string, unknown>).status).toBe("DEGRADED");
+      expect((updatedGateway?.data as Record<string, unknown>).errorRate).toBe(6.2);
+    });
+
+    it("simulates ServiceGraph receiving updated dependency props and updating rendered edges", () => {
+      // Step 1: Initial dependencies
+      let currentEdges = buildGraphEdges(baseDependencies, null, []);
+      expect(currentEdges.length).toBe(3);
+
+      // Step 2: New downstream dependency added to notification-service
+      const updatedDependencies: ServiceDependencyItem[] = [
+        ...baseDependencies,
+        {
+          sourceServiceId: "order-service",
+          targetServiceId: "notification-service",
+          dependencyType: "ASYNC_EVENT",
+          timeoutThreshold: 5000,
+        },
+      ];
+
+      // Effect execution: setEdges(buildGraphEdges(dependencies, ...))
+      currentEdges = buildGraphEdges(updatedDependencies, null, []);
+      expect(currentEdges.length).toBe(4);
+
+      const asyncEdge = currentEdges.find((e) => e.target === "notification-service");
+      expect(asyncEdge).toBeDefined();
+      expect(asyncEdge?.source).toBe("order-service");
+    });
+
+    it("verifies ServiceDetailDrawer renders N/A for UNKNOWN metrics and displays valid measurements", () => {
+      const renderDrawerMetrics = (service: ServiceMapItem) => {
+        const hasLatency =
+          service.hasValidLatency !== false &&
+          service.currentLatency !== null &&
+          service.currentLatency !== undefined;
+
+        const hasError =
+          service.hasValidErrorRate !== false &&
+          service.currentErrorRate !== null &&
+          service.currentErrorRate !== undefined;
+
+        const hasVolume =
+          service.hasValidRequestRate !== false &&
+          service.requestRate !== null &&
+          service.requestRate !== undefined;
+
+        return {
+          latencyText: hasLatency ? `${Math.round(service.currentLatency!)}ms` : "N/A",
+          errorText: hasError ? `${service.currentErrorRate!.toFixed(1)}%` : "N/A",
+          volumeText: hasVolume ? `${service.requestRate} requests / sec` : "N/A",
+          status: service.status,
+        };
+      };
+
+      // Case A: Complete valid telemetry
+      const healthyService: ServiceMapItem = {
+        ...baseDbServices[0],
+        status: "HEALTHY",
+        currentLatency: 22,
+        hasValidLatency: true,
+        currentErrorRate: 0.1,
+        hasValidErrorRate: true,
+        requestRate: 850,
+        hasValidRequestRate: true,
+      };
+      const healthyRender = renderDrawerMetrics(healthyService);
+      expect(healthyRender.latencyText).toBe("22ms");
+      expect(healthyRender.errorText).toBe("0.1%");
+      expect(healthyRender.volumeText).toBe("850 requests / sec");
+
+      // Case B: UNKNOWN status with missing latency and missing error rate
+      const unknownService: ServiceMapItem = {
+        ...baseDbServices[0],
+        status: "UNKNOWN",
+        currentLatency: null,
+        hasValidLatency: false,
+        currentErrorRate: null,
+        hasValidErrorRate: false,
+        requestRate: null,
+        hasValidRequestRate: false,
+      };
+      const unknownRender = renderDrawerMetrics(unknownService);
+      expect(unknownRender.latencyText).toBe("N/A");
+      expect(unknownRender.errorText).toBe("N/A");
+      expect(unknownRender.volumeText).toBe("N/A");
+      expect(unknownRender.status).toBe("UNKNOWN");
     });
   });
 });

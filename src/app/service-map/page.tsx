@@ -186,15 +186,31 @@ export default function ServiceMapPage() {
 
       {/* Verified LIVE Telemetry Observation Banner */}
       {telemetryMode === "LIVE" && (
-        <div className="rounded-2xl border border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-slate-900/80 to-slate-950 p-4 backdrop-blur-md">
+        <div
+          className={`rounded-2xl border p-4 backdrop-blur-md ${
+            backendHealth?.backendType === "MOCK_EMULATION"
+              ? "border-amber-500/40 bg-gradient-to-r from-amber-950/30 via-slate-900/80 to-slate-950"
+              : "border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-slate-900/80 to-slate-950"
+          }`}
+        >
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-600/30 border border-emerald-500/40 text-emerald-400">
+              <div
+                className={`flex h-8 w-8 items-center justify-center rounded-lg border ${
+                  backendHealth?.backendType === "MOCK_EMULATION"
+                    ? "bg-amber-600/30 border-amber-500/40 text-amber-400"
+                    : "bg-emerald-600/30 border-emerald-500/40 text-emerald-400"
+                }`}
+              >
                 <Radio className="h-4 w-4 animate-pulse" />
               </div>
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-bold text-white">Live Telemetry Mode Active</span>
+                  <span className="font-bold text-white">
+                    {backendHealth?.backendType === "MOCK_EMULATION"
+                      ? "Mock Telemetry Emulation Active (Dev Server)"
+                      : "Live Telemetry Mode Active"}
+                  </span>
                   {backendHealth?.backendType === "GRAFANA_CLOUD" && (
                     <span className="rounded bg-sky-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-sky-300 border border-sky-500/30">
                       ☁ Grafana Cloud (Hosted)
@@ -206,8 +222,11 @@ export default function ServiceMapPage() {
                     </span>
                   )}
                   {backendHealth?.backendType === "MOCK_EMULATION" && (
-                    <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30" title="Connected to in-process development mock server, not Docker containers.">
-                      Dev Mock Emulation Stack
+                    <span
+                      className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40"
+                      title="Connected to in-process development mock server, not Docker containers."
+                    >
+                      MOCK EMULATION — NOT PRODUCTION TELEMETRY
                     </span>
                   )}
                   <span className="text-[10px] font-mono text-slate-400">
@@ -218,13 +237,25 @@ export default function ServiceMapPage() {
                   <span>
                     Metrics Backend:{" "}
                     <strong className={backendHealth?.prometheusAvailable ? "text-emerald-400" : "text-rose-400"}>
-                      {backendHealth?.prometheusAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                      {backendHealth?.prometheusAvailable
+                        ? backendHealth?.isCloudBackend
+                          ? "Connected (Grafana Cloud)"
+                          : backendHealth?.isMockBackend
+                          ? "Connected (Mock Emulation)"
+                          : "Connected (Live)"
+                        : "Offline"}
                     </strong>
                   </span>
                   <span>
                     Traces Backend:{" "}
                     <strong className={backendHealth?.jaegerAvailable ? "text-emerald-400" : "text-rose-400"}>
-                      {backendHealth?.jaegerAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud Tempo)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                      {backendHealth?.jaegerAvailable
+                        ? backendHealth?.isCloudBackend
+                          ? "Connected (Grafana Cloud Tempo)"
+                          : backendHealth?.isMockBackend
+                          ? "Connected (Mock Emulation)"
+                          : "Connected (Live)"
+                        : "Offline"}
                     </strong>
                   </span>
                 </div>
@@ -239,9 +270,13 @@ export default function ServiceMapPage() {
             <div className="flex items-center gap-2">
               <Link
                 href="/traces"
-                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-3.5 py-2 font-semibold text-white shadow-md shadow-emerald-600/30 transition-all text-xs"
+                className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 font-semibold text-white shadow-md transition-all text-xs ${
+                  backendHealth?.backendType === "MOCK_EMULATION"
+                    ? "bg-amber-600 hover:bg-amber-500 shadow-amber-600/30"
+                    : "bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/30"
+                }`}
               >
-                <span>Inspect Live Traces</span>
+                <span>Inspect {backendHealth?.backendType === "MOCK_EMULATION" ? "Mock Traces" : "Live Traces"}</span>
                 <ExternalLink className="h-3 w-3" />
               </Link>
             </div>
@@ -266,8 +301,8 @@ export default function ServiceMapPage() {
                     </span>
                   )}
                   {backendHealth?.backendType === "MOCK_EMULATION" && (
-                    <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30">
-                      Dev Mock Degraded
+                    <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40">
+                      MOCK EMULATION — NOT PRODUCTION TELEMETRY
                     </span>
                   )}
                   <span className="text-[10px] font-mono text-slate-400">
@@ -281,13 +316,25 @@ export default function ServiceMapPage() {
                   <span>
                     Metrics Backend:{" "}
                     <strong className={backendHealth?.prometheusAvailable ? "text-emerald-400" : "text-rose-400"}>
-                      {backendHealth?.prometheusAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                      {backendHealth?.prometheusAvailable
+                        ? backendHealth?.isCloudBackend
+                          ? "Connected (Grafana Cloud)"
+                          : backendHealth?.isMockBackend
+                          ? "Connected (Mock Emulation)"
+                          : "Connected (Live)"
+                        : "Offline"}
                     </strong>
                   </span>
                   <span>
                     Traces Backend:{" "}
                     <strong className={backendHealth?.jaegerAvailable ? "text-emerald-400" : "text-rose-400"}>
-                      {backendHealth?.jaegerAvailable ? (backendHealth?.isCloudBackend ? "Connected (Grafana Cloud Tempo)" : backendHealth?.isMockBackend ? "Connected (Mock)" : "Connected (Live)") : "Offline"}
+                      {backendHealth?.jaegerAvailable
+                        ? backendHealth?.isCloudBackend
+                          ? "Connected (Grafana Cloud Tempo)"
+                          : backendHealth?.isMockBackend
+                          ? "Connected (Mock Emulation)"
+                          : "Connected (Live)"
+                        : "Offline"}
                     </strong>
                   </span>
                 </div>
@@ -323,11 +370,23 @@ export default function ServiceMapPage() {
             The following services are transmitting OpenTelemetry metrics but are not configured in the static database topology:
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
-            {unknownServices.map((u) => (
-              <span key={u.serviceId} className="rounded bg-slate-900 border border-slate-700 px-2.5 py-1 font-mono text-[11px]">
-                {u.serviceName} ({u.requestRate} req/s, {u.latencyMs}ms)
-              </span>
-            ))}
+            {unknownServices.map((u) => {
+              const reqText = u.hasValidRequestRate === true ? `${u.requestRate} req/s` : "N/A req/s";
+              const latText = u.hasValidLatency === true ? `${u.latencyMs}ms` : "N/A ms";
+              return (
+                <span
+                  key={u.serviceId}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-amber-500/50 bg-slate-900/90 px-2.5 py-1 font-mono text-[11px] text-amber-200 shadow-sm"
+                >
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                  <span className="font-semibold text-slate-200">{u.serviceName}</span>
+                  <span className="text-slate-400">({reqText}, {latText})</span>
+                  <span className="rounded bg-amber-500/10 px-1 py-0.2 text-[9px] text-amber-400 border border-amber-500/20">
+                    Unregistered
+                  </span>
+                </span>
+              );
+            })}
           </div>
         </div>
       )}

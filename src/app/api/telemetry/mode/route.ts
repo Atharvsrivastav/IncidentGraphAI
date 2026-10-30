@@ -7,10 +7,17 @@ const ModeSchema = z.object({
 });
 
 export async function GET() {
-  const mode = telemetryManager.getMode();
+  const requestedMode = telemetryManager.getRequestedMode();
+  const effectiveMode = telemetryManager.getEffectiveMode();
   const health = await telemetryManager.getBackendHealth();
   const lastIngestedAt = telemetryManager.getLastIngestedAt();
-  return NextResponse.json({ mode, health, lastIngestedAt });
+  return NextResponse.json({
+    mode: effectiveMode,
+    requestedMode,
+    effectiveMode,
+    health,
+    lastIngestedAt,
+  });
 }
 
 export async function POST(request: Request) {
@@ -19,15 +26,27 @@ export async function POST(request: Request) {
     const validated = ModeSchema.parse(body);
 
     telemetryManager.setMode(validated.mode);
-    const health = await telemetryManager.getBackendHealth();
-    const currentMode = telemetryManager.getMode();
+
+    let effectiveMode = telemetryManager.getEffectiveMode();
+    let health = await telemetryManager.getBackendHealth();
+
+    // If LIVE or REAL was requested, probe observation to determine truthful initial operational state
+    if (validated.mode === "LIVE" || validated.mode === "REAL") {
+      const observation = await telemetryManager.getObservedServices(true);
+      effectiveMode = observation.effectiveMode ?? observation.mode;
+      health = observation.backendHealth;
+    }
+
+    const requestedMode = telemetryManager.getRequestedMode();
 
     return NextResponse.json({
       success: true,
-      mode: currentMode,
+      mode: effectiveMode,
+      requestedMode,
+      effectiveMode,
       health,
       lastIngestedAt: telemetryManager.getLastIngestedAt(),
-      message: `Telemetry mode switched to ${currentMode}`,
+      message: `Telemetry mode switched to ${requestedMode} (effective: ${effectiveMode})`,
     });
   } catch (err: unknown) {
     if (err instanceof z.ZodError) {
