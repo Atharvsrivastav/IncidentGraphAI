@@ -82,6 +82,19 @@ IncidentGraph AI incorporates a production-minded, read-only telemetry ingestion
   - **Full Numeric Precision (No Premature Request-Rate Rounding):**
     - Request rates retain full IEEE-754 double precision internally and are never rounded via `Math.round()` prior to division or aggregation.
     - Low-volume traffic (e.g. 0.4 req/s with 0.1 errors/s) produces exact error percentages (25%) rather than rounding 0.4 to 0 and dropping the outage signal.
+  - **Fixed 60-Second PromQL Range Lookback Window (`evaluateMockPromQlRange`):**
+    - The range vector `[1m]` strictly enforces an exact 60-second observation lookback window $[t - 60\text{s}, t]$ and rate divisor $60$, regardless of the query evaluation `step` size.
+    - Evaluated across query step sizes of 15s, 30s, 60s, and 120s: range step controls only the interval between matrix evaluation timestamps ($t_0, t_0 + \text{step}, \dots$), never the PromQL range-vector lookback window.
+    - Instant queries (`/api/v1/query`) evaluate strictly within $[nowSec - 60, nowSec]$. If the current one-minute window is empty, queries return empty vectors (`result: []`) rather than recycling stale historical observations.
+    - Stored observations maintain explicit timestamps and instance labels. Responses are clearly marked with provider `MOCK_EMULATION`.
+  - **Strict Error Rate Matching & Missing-Series Handling:**
+    - `metricType: "ERROR_RATE"` percentage records are generated *only* when both request-rate and error-rate observations exist for the exact service identity and timestamp AND total request rate is strictly positive (`reqPerSec > 0`).
+    - Zero traffic (`reqPerSec === 0`) is preserved as an explicit no-traffic condition; it is never converted into a synthetic 0% "healthy" measurement.
+    - Absent error metric series are distinguished from genuine 0% error conditions (when requests > 0 and errors = 0).
+    - `metricType: "ERROR_THROUGHPUT"` is tracked independently with unit `"errors/s"`.
+  - **Zero Database Baseline Manufacturing for Missing Metrics:**
+    - Services with trace observations but absent Prometheus metrics are labeled `UNKNOWN` (`"Trace observations present, but metric telemetry missing"` with `source: "JAEGER"`, `latencyMs: 0`, and `isStale: true`).
+    - The engine never manufactures healthy telemetry (e.g., 0% error rate or synthetic nominal latency) from topology database baselines.
   - **Histogram Average Latency:** Derived from the windowed rate of sums divided by the windowed rate of counts:
     $$\text{Average Latency (ms)} = \left(\frac{\text{sum by (service)} (\text{rate}(http\_request\_duration\_seconds\_sum[1m]))}{\text{sum by (service)} (\text{rate}(http\_request\_duration\_seconds\_count[1m]))}\right) \times 1000$$
     If request count rate is 0, average latency evaluates safely to 0 ms.
@@ -237,6 +250,9 @@ To maintain total documentation integrity, the capabilities of IncidentGraph AI 
 | **Truthful Mode (LIVE vs DEGRADED)** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Requires both providers & non-empty data |
 | **Strict Simulation Isolation** | ✅ Yes | ✅ Yes (Vitest) | N/A (Offline / In-Memory) | Zero fetch calls across all entry points |
 | **Mock Observability Server** | ✅ Yes | ✅ Yes (Vitest) | N/A (In-Memory Emulation) | Explicit PromQL evaluator & range API |
+| **Historical Batch RCA Evidence** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | Feeds multi-step chronological samples to RCA engine |
+| **Fixed 60s Range Lookback Window** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | 60s window across 15, 30, 60, 120s step queries |
+| **Strict Missing-Metric Semantics** | ✅ Yes | ✅ Yes (Vitest) | ⚠️ Pending Real Cloud Creds | No fabricated healthy metrics; trace-only stays UNKNOWN |
 | **Sample Microservice Stack** | ✅ Yes | ✅ Yes (E2E Test) | N/A (Local In-Memory / Docker) | Express HTTP & OpenTelemetry instrumentation |
 
 > [!NOTE]
@@ -270,10 +286,10 @@ All telemetry provider credentials remain strictly server-side:
 The telemetry suite includes deterministic mocked provider tests, normalization validation, multi-service incident evaluations, and mode transitions that run without external network dependencies:
 
 ```bash
-# Run the dedicated live telemetry test suite
+# Run the dedicated live telemetry test suite (57 tests)
 npx vitest run tests/live-telemetry.test.ts
 
-# Run the complete test suite (131 tests across 8 suites)
+# Run the complete test suite (138 tests across 8 suites)
 npm test
 
 # Run the algorithmic benchmark suite (22 tests)

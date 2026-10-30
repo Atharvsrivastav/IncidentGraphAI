@@ -47,32 +47,84 @@ export class RealRootCauseEngine {
       }
     }
 
-    // 2. Fetch live observed metrics & traces from TelemetryManager
-    const { observedServices } = await telemetryManager.getObservedServices();
-    const recentTraces = await telemetryManager.getRecentTraces(undefined, 25);
+    // 2. Fetch live observed metrics, historical normalized batch, and recent traces from TelemetryManager
+    const [batch, { observedServices }, recentTraces] = await Promise.all([
+      telemetryManager.getNormalizedBatch(),
+      telemetryManager.getObservedServices(),
+      telemetryManager.getRecentTraces(undefined, 25),
+    ]);
 
-    // 3. Construct TelemetryPoints and current states from actual measurements
-    const currentServiceStates = new Map<string, { status: "HEALTHY" | "DEGRADED" | "DOWN"; latency: number; errorRate: number }>();
+    // 3. Extract unique timestamps across all normalized historical metrics
+    const uniqueTimestamps = new Set<string>();
+    for (const m of batch.metrics) {
+      if (m.metricType === "REQUEST_RATE" || m.metricType === "ERROR_RATE" || m.metricType === "LATENCY_AVG") {
+        uniqueTimestamps.add(m.timestamp);
+      }
+    }
+
+    // Sort historical timestamps in ascending chronological order
+    const sortedTimestamps = Array.from(uniqueTimestamps).sort(
+      (a, b) => new Date(a).getTime() - new Date(b).getTime()
+    );
+
+    // Convert historical timestamps into monotonically increasing observation steps (1, 2, 3...)
+    const stepByTimestamp = new Map<string, number>();
+    sortedTimestamps.forEach((ts, idx) => {
+      stepByTimestamp.set(ts, idx + 1);
+    });
+
+    // 4. Construct multiple chronological TelemetryPoint samples per service from historical batch
     const telemetrySamples: TelemetryPoint[] = [];
 
-    const now = new Date();
-    for (const obs of observedServices) {
-      const stateStatus = obs.status === "UNKNOWN" ? "HEALTHY" : obs.status;
-      currentServiceStates.set(obs.serviceId, {
-        status: stateStatus,
-        latency: obs.latencyMs,
-        errorRate: obs.errorRate,
-      });
+    for (const svc of services) {
+      const svcMetrics = batch.metrics.filter(
+        (m) => m.serviceName === svc.id || m.serviceName === svc.name
+      );
 
-      // Synthetic sample step 1
-      telemetrySamples.push({
-        serviceId: obs.serviceId,
-        simulationStep: 1,
-        timestamp: now,
+      for (const ts of sortedTimestamps) {
+        const reqRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "REQUEST_RATE");
+        const errRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "ERROR_RATE");
+        const latRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "LATENCY_AVG");
+
+        // Only construct a valid TelemetryPoint when measurements actually exist
+        // Do not fabricate healthy metrics from database baselines!
+        if (latRec !== undefined || errRec !== undefined) {
+          const latency = latRec?.value ?? 0;
+          const errorRate = errRec?.value ?? 0; // Preserves actual ERROR_RATE percentage, not throughput
+          const requestRate = reqRec?.value ?? 0;
+
+          let healthStatus = "HEALTHY";
+          if (errorRate > 25 || (svc.baselineLatency > 0 && latency >= svc.baselineLatency * 4)) {
+            healthStatus = "DOWN";
+          } else if (errorRate > 3 || (svc.baselineLatency > 0 && latency >= svc.baselineLatency * 1.8)) {
+            healthStatus = "DEGRADED";
+          }
+
+          telemetrySamples.push({
+            serviceId: svc.id,
+            simulationStep: stepByTimestamp.get(ts)!,
+            timestamp: new Date(ts),
+            latency,
+            errorRate,
+            requestCount: requestRate * 60,
+            healthStatus,
+          });
+        }
+      }
+    }
+
+    // 5. Construct current service states from actual measurements
+    // Preserve UNKNOWN; do NOT map UNKNOWN to HEALTHY!
+    const currentServiceStates = new Map<
+      string,
+      { status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN"; latency: number; errorRate: number }
+    >();
+
+    for (const obs of observedServices) {
+      currentServiceStates.set(obs.serviceId, {
+        status: obs.status,
         latency: obs.latencyMs,
         errorRate: obs.errorRate,
-        requestCount: obs.requestRate * 60,
-        healthStatus: stateStatus,
       });
     }
 

@@ -278,35 +278,40 @@ export class TelemetryManager {
       const metric = promMetrics.get(svc.id) || promMetrics.get(svc.name);
       const traceCount = traceCountByService.get(svc.id) || traceCountByService.get(svc.name) || 0;
 
-      if (!metric && traceCount === 0) {
-        let lastObserved = hasTelemetryData ? "No observations received" : "Empty query response (No series matching)";
+      // When Prometheus metric is missing or both latency and error rate observations are absent:
+      // Keep trace evidence separate from metric evidence.
+      // Missing latency must remain unknown (0, isStale: true). Missing error rate must not silently become healthy 0%.
+      if (!metric || (metric.hasValidLatency === false && metric.hasValidErrorRate === false)) {
+        let lastObserved = traceCount > 0
+          ? "Trace observations present, but metric telemetry missing"
+          : (hasTelemetryData ? "No metric observations received" : "Empty query response (No series matching)");
         if (!promQuerySuccess) {
           lastObserved = "Prometheus query failed (Incomplete or failed metric telemetry)";
         }
         observedServices.push({
           serviceId: svc.id,
           serviceName: svc.name,
-          source: "PROMETHEUS",
+          source: traceCount > 0 ? "JAEGER" : "PROMETHEUS",
           status: "UNKNOWN",
           latencyMs: 0,
           errorRate: 0,
-          requestRate: 0,
+          requestRate: metric?.requestRate ?? 0,
           lastObserved,
-          traceCount: 0,
+          traceCount,
           isStale: true,
           isKnownInTopology: true,
         });
         continue;
       }
 
-      const latency = metric?.latencyMs ?? svc.baselineLatency;
-      const errorRate = metric?.errorRate ?? 0;
-      const requestRate = metric?.requestRate ?? 0;
+      const latency = metric.latencyMs;
+      const errorRate = metric.errorRate;
+      const requestRate = metric.requestRate;
 
       let status: "HEALTHY" | "DEGRADED" | "DOWN" = "HEALTHY";
-      if (errorRate > 25 || latency > svc.baselineLatency * 4) {
+      if (errorRate > 25 || (svc.baselineLatency > 0 && latency > svc.baselineLatency * 4)) {
         status = "DOWN";
-      } else if (errorRate > 3 || latency > svc.baselineLatency * 1.8) {
+      } else if (errorRate > 3 || (svc.baselineLatency > 0 && latency > svc.baselineLatency * 1.8)) {
         status = "DEGRADED";
       }
 
@@ -316,8 +321,8 @@ export class TelemetryManager {
         source: "PROMETHEUS",
         status,
         latencyMs: latency,
-        latencyP95Ms: metric?.latencyP95Ms,
-        hasValidP95: metric?.hasValidP95,
+        latencyP95Ms: metric.latencyP95Ms,
+        hasValidP95: metric.hasValidP95,
         errorRate,
         requestRate,
         lastObserved: new Date().toISOString(),

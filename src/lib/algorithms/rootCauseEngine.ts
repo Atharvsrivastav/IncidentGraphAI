@@ -15,7 +15,7 @@ export interface RootCauseInput {
   incidentId: string;
   graph: DirectedGraph<ServiceNodeData>;
   telemetrySamples: TelemetryPoint[];
-  currentServiceStates: Map<string, { status: "HEALTHY" | "DEGRADED" | "DOWN"; latency: number; errorRate: number }>;
+  currentServiceStates: Map<string, { status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN"; latency: number; errorRate: number }>;
 }
 
 /**
@@ -55,18 +55,20 @@ export class RootCauseEngine {
     const windowMetrics = this.windowAnalyzer.analyzeAllServices(telemetryByService, baselines);
 
     // Identify all services that exhibit symptoms (status degraded/down or telemetry anomalies)
+    // UNKNOWN status alone without confirmed metric anomaly does NOT establish symptoms
     const symptomaticServiceIds = new Set<string>();
     for (const [id, state] of currentServiceStates.entries()) {
       const metrics = windowMetrics.get(id);
       if (
-        state.status !== "HEALTHY" ||
+        state.status === "DOWN" ||
+        state.status === "DEGRADED" ||
         (metrics && (metrics.hasLatencyAnomaly || metrics.hasErrorAnomaly))
       ) {
         symptomaticServiceIds.add(id);
       }
     }
 
-    // If no symptomatic services are detected, return an inconclusive analysis
+    // If no symptomatic services are detected or insufficient data, return an inconclusive analysis
     if (symptomaticServiceIds.size === 0) {
       return this.buildInconclusiveSummary(incidentId, startTime);
     }
@@ -147,7 +149,7 @@ export class RootCauseEngine {
   private evaluateCandidate(
     serviceId: string,
     graph: DirectedGraph<ServiceNodeData>,
-    state: { status: "HEALTHY" | "DEGRADED" | "DOWN"; latency: number; errorRate: number } | undefined,
+    state: { status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN"; latency: number; errorRate: number } | undefined,
     metrics: ReturnType<SlidingWindowAnalyzer["analyzeServiceWindow"]> | undefined,
     symptomaticServiceIds: Set<string>,
     minAnomalousStep: number

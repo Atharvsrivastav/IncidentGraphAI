@@ -27,19 +27,25 @@ export interface PrometheusRangeOptions {
 export interface ServiceMetricsSummary {
   serviceName: string;
   latencyMs: number;
+  hasValidLatency?: boolean;
   latencyP95Ms?: number;
   hasValidP95: boolean;
   errorRate: number; // 0 - 100%
+  hasValidErrorRate?: boolean;
   requestRate: number; // req/sec
+  hasValidRequestRate?: boolean;
   instanceCount: number;
 }
 
 export interface ServiceHistoryPoint {
   timestamp: string;
   latencyMs: number;
+  hasValidLatency?: boolean;
   latencyP95Ms?: number;
   errorRate: number;
+  hasValidErrorRate?: boolean;
   requestRate: number;
+  hasValidRequestRate?: boolean;
 }
 
 export interface ServiceMetricsDetailedResult {
@@ -552,27 +558,42 @@ export class PrometheusClient {
     ]);
 
     for (const svc of allServices) {
-      const reqData = requestRatesByService.get(svc) || { totalRate: 0, instanceCount: 0 };
-      const errRate = errorRatesByService.get(svc) || 0;
-      const latData = latencyAvgByService.get(svc) || { sumMs: 0, count: 0 };
+      const hasReq = requestRatesByService.has(svc);
+      const hasErr = errorRatesByService.has(svc);
+      const hasLat = latencyAvgByService.has(svc);
+
+      const reqData = requestRatesByService.get(svc);
+      const errRate = errorRatesByService.get(svc);
+      const latData = latencyAvgByService.get(svc);
       const p95Val = p95ByService.get(svc);
 
-      // Retain full numeric precision internally - do NOT round before division
-      const requestRate = reqData.totalRate;
+      const requestRate = reqData?.totalRate ?? 0;
+      const hasValidRequestRate = hasReq;
 
-      // Safe error rate percentage: (errorRate / requestRate) * 100
+      // Safe error rate percentage: only when BOTH request rate and error throughput series are present
+      // If error metric is missing (absent instrumentation) or request metric is missing: NOT valid!
       let errorRate = 0;
-      if (reqData.totalRate > 0) {
-        const rawPct = (errRate / reqData.totalRate) * 100;
-        if (Number.isFinite(rawPct)) {
-          errorRate = Number(Math.min(100, Math.max(0, rawPct)).toFixed(2));
+      let hasValidErrorRate = false;
+
+      if (hasReq && hasErr && reqData !== undefined && errRate !== undefined) {
+        if (reqData.totalRate > 0) {
+          const rawPct = (errRate / reqData.totalRate) * 100;
+          if (Number.isFinite(rawPct)) {
+            errorRate = Number(Math.min(100, Math.max(0, rawPct)).toFixed(2));
+            hasValidErrorRate = true;
+          }
+        } else {
+          // Zero request volume: explicit no-traffic condition, not a fabricated healthy measurement
+          hasValidErrorRate = false;
         }
       }
 
       // Latency is in milliseconds (converted from seconds exactly once)
       let latencyMs = 0;
-      if (latData.count > 0) {
+      let hasValidLatency = false;
+      if (hasLat && latData !== undefined && latData.count > 0) {
         latencyMs = Number((latData.sumMs / latData.count).toFixed(2));
+        hasValidLatency = true;
       }
 
       const hasValidP95 = p95Val !== undefined && !isNaN(p95Val) && p95Val > 0;
@@ -580,11 +601,14 @@ export class PrometheusClient {
       results.set(svc, {
         serviceName: svc,
         requestRate,
+        hasValidRequestRate,
         errorRate,
+        hasValidErrorRate,
         latencyMs,
+        hasValidLatency,
         latencyP95Ms: hasValidP95 ? Number(p95Val!.toFixed(2)) : undefined,
         hasValidP95,
-        instanceCount: reqData.instanceCount || 1,
+        instanceCount: reqData?.instanceCount || 1,
       });
     }
 
@@ -675,28 +699,50 @@ export class PrometheusClient {
       }
       let pt = svcMap.get(timestamp);
       if (!pt) {
-        pt = { timestamp, latencyMs: 0, errorRate: 0, requestRate: 0 };
+        pt = {
+          timestamp,
+          latencyMs: 0,
+          errorRate: 0,
+          requestRate: 0,
+          hasValidLatency: false,
+          hasValidErrorRate: false,
+          hasValidRequestRate: false,
+        };
         svcMap.set(timestamp, pt);
       }
       return pt;
     };
 
+    // Index request and error records by serviceName and timestamp
+    const reqByServiceTime = new Map<string, NormalizedMetricRecord>();
+    for (const r of reqRange.records) {
+      reqByServiceTime.set(`${r.serviceName}::${r.timestamp}`, r);
+    }
+    const errByServiceTime = new Map<string, NormalizedMetricRecord>();
+    for (const e of errRange.records) {
+      errByServiceTime.set(`${e.serviceName}::${e.timestamp}`, e);
+    }
+
     // 1. Request rate with full numeric precision (no premature Math.round)
     for (const r of reqRange.records) {
       const pt = getOrCreatePoint(r.serviceName, r.timestamp);
       pt.requestRate = r.value;
+      pt.hasValidRequestRate = true;
     }
 
-    // 2. Error rate percentage calculated from throughput and request volume without rounding request rate
+    // 2. Error rate percentage: only when BOTH request rate and error throughput exist and request volume > 0
     for (const e of errRange.records) {
       const pt = getOrCreatePoint(e.serviceName, e.timestamp);
-      if (pt.requestRate > 0 && e.value > 0) {
-        const rawPct = (e.value / pt.requestRate) * 100;
+      const reqRec = reqByServiceTime.get(`${e.serviceName}::${e.timestamp}`);
+      if (reqRec && reqRec.value > 0) {
+        const rawPct = (e.value / reqRec.value) * 100;
         pt.errorRate = Number.isFinite(rawPct)
           ? Number(Math.min(100, Math.max(0, rawPct)).toFixed(2))
           : 0;
+        pt.hasValidErrorRate = true;
       } else {
-        pt.errorRate = 0;
+        // Zero request traffic or missing request rate: do not fabricate healthy 0%
+        pt.hasValidErrorRate = false;
       }
     }
 
@@ -704,6 +750,7 @@ export class PrometheusClient {
     for (const l of latRange.records) {
       const pt = getOrCreatePoint(l.serviceName, l.timestamp);
       pt.latencyMs = Number(l.value.toFixed(2));
+      pt.hasValidLatency = true;
     }
 
     // 4. P95 latency
@@ -715,36 +762,38 @@ export class PrometheusClient {
     }
 
     // 5. Generate normalized ERROR_RATE percentage records matching by (serviceName, timestamp)
-    const reqByServiceTime = new Map<string, NormalizedMetricRecord>();
-    for (const r of reqRange.records) {
-      reqByServiceTime.set(`${r.serviceName}::${r.timestamp}`, r);
-    }
-    const errByServiceTime = new Map<string, NormalizedMetricRecord>();
-    for (const e of errRange.records) {
-      errByServiceTime.set(`${e.serviceName}::${e.timestamp}`, e);
-    }
+    // Generate ERROR_RATE ONLY when both required observations are available and matched.
+    // Do not silently create a 0% result from missing error throughput.
+    // Treat zero request volume as an explicit no-traffic condition rather than a fabricated healthy measurement.
 
-    const allKeys = new Set([...reqByServiceTime.keys(), ...errByServiceTime.keys()]);
     const calculatedErrorRateRecords: NormalizedMetricRecord[] = [];
 
-    for (const key of allKeys) {
-      const reqRec = reqByServiceTime.get(key);
+    for (const [key, reqRec] of reqByServiceTime.entries()) {
       const errRec = errByServiceTime.get(key);
-      const [serviceName, timestamp] = key.split("::");
-
-      const reqPerSec = reqRec ? reqRec.value : 0;
-      const errPerSec = errRec ? errRec.value : 0;
-
-      let errorPercentage = 0;
-      if (reqPerSec > 0 && errPerSec > 0) {
-        const rawPct = (errPerSec / reqPerSec) * 100;
-        if (Number.isFinite(rawPct)) {
-          errorPercentage = Number(Math.min(100, Math.max(0, rawPct)).toFixed(2));
-        }
+      if (!errRec) {
+        // Missing error series / absent error instrumentation -> do NOT generate ERROR_RATE
+        continue;
       }
 
-      const provider = reqRec?.provider || errRec?.provider || (this.isCloud ? "GRAFANA_CLOUD" : "PROMETHEUS");
-      const labels = { ...(reqRec?.labels || {}), ...(errRec?.labels || {}) };
+      const [serviceName, timestamp] = key.split("::");
+      const reqPerSec = reqRec.value;
+      const errPerSec = errRec.value;
+
+      // Treat zero request volume as an explicit no-traffic condition rather than a fabricated healthy measurement
+      if (reqPerSec <= 0) {
+        continue;
+      }
+
+      // Both observations valid and traffic > 0:
+      // If errPerSec === 0, errorPercentage is genuinely 0.0%
+      // If errPerSec > 0, calculate percentage
+      const rawPct = (errPerSec / reqPerSec) * 100;
+      const errorPercentage = Number.isFinite(rawPct)
+        ? Number(Math.min(100, Math.max(0, rawPct)).toFixed(2))
+        : 0;
+
+      const provider = reqRec.provider || errRec.provider || (this.isCloud ? "GRAFANA_CLOUD" : "PROMETHEUS");
+      const labels = { ...(reqRec.labels || {}), ...(errRec.labels || {}) };
 
       calculatedErrorRateRecords.push({
         id: `prom-calc-error-rate-${serviceName}-${timestamp}`,

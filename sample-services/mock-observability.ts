@@ -323,13 +323,18 @@ export function evaluateMockPromQl(query: string, nowSec: number): MockSeriesPoi
   if (rawServices.length === 0) return [];
 
   const services = rawServices;
-  const wStart = (nowSec - 60) * 1000;
-  const wEnd = nowSec * 1000;
   const windowSec = 60;
+  const wStart = (nowSec - windowSec) * 1000;
+  const wEnd = nowSec * 1000;
+
+  // Strict 1-minute lookback without falling back to stale observations
+  const observationsInWindow = obsStore.getObservations(undefined, wStart, wEnd);
+  if (q !== "up" && q !== "vector(1)" && observationsInWindow.length === 0) {
+    return [];
+  }
 
   const getObs = (s: string) => {
-    const inWin = obsStore.getObservations(s, wStart, wEnd);
-    return inWin.length > 0 ? inWin : obsStore.getObservations(s);
+    return obsStore.getObservations(s, wStart, wEnd);
   };
 
   // 1. Health checks
@@ -475,7 +480,7 @@ export function evaluateMockPromQlRange(
   if (rawServices.length === 0) return [];
 
   // Check if there are any observations in the requested time range
-  const observationsInRange = obsStore.getObservations(undefined, startSec * 1000, endSec * 1000);
+  const observationsInRange = obsStore.getObservations(undefined, (startSec - 60) * 1000, endSec * 1000);
   if (observationsInRange.length === 0) {
     // If there is insufficient stored history in the range, represent that honestly
     return [];
@@ -486,6 +491,10 @@ export function evaluateMockPromQlRange(
   for (let t = startSec; t <= endSec; t += stepSec) {
     timestamps.push(t);
   }
+
+  // PromQL [1m] range vector specifies a fixed 60-second lookback window.
+  // stepSec controls evaluation timestamps, NOT the 60s lookback window.
+  const lookbackSec = 60;
 
   // 1. Health checks
   if (q === "up") {
@@ -506,13 +515,13 @@ export function evaluateMockPromQlRange(
     return [{ metric: {}, values: timestamps.map((t) => [t, "1"]) }];
   }
 
-  // 2. Request rate
+  // 2. Request rate: sum by (service) (rate(http_requests_total[1m]))
   if (q === "sum by (service) (rate(http_requests_total[1m]))") {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
-        const rate = totalReq / stepSec;
+        const rate = totalReq / lookbackSec;
         return [t, String(Number(rate.toFixed(2)))];
       });
       return { metric: { service: s }, values };
@@ -523,9 +532,9 @@ export function evaluateMockPromQlRange(
     for (const s of services) {
       for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
         const values: Array<[number, string]> = timestamps.map((t) => {
-          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000).filter((o) => o.instance === inst);
+          const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000).filter((o) => o.instance === inst);
           const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
-          const rate = totalReq / stepSec;
+          const rate = totalReq / lookbackSec;
           return [t, String(Number(rate.toFixed(2)))];
         });
         results.push({ metric: { service: s, instance: inst }, values });
@@ -534,13 +543,13 @@ export function evaluateMockPromQlRange(
     return results;
   }
 
-  // 3. Error rate
+  // 3. Error rate: sum by (service) (rate(http_request_errors_total[1m]))
   if (q === "sum by (service) (rate(http_request_errors_total[1m]))") {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
-        const rate = errReq / stepSec;
+        const rate = errReq / lookbackSec;
         return [t, String(Number(rate.toFixed(2)))];
       });
       return { metric: { service: s }, values };
@@ -551,9 +560,9 @@ export function evaluateMockPromQlRange(
     for (const s of services) {
       for (const inst of [`${s}-inst-1`, `${s}-inst-2`]) {
         const values: Array<[number, string]> = timestamps.map((t) => {
-          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000).filter((o) => o.instance === inst);
+          const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000).filter((o) => o.instance === inst);
           const errReq = obs.filter((o) => o.isError).reduce((sum, o) => sum + o.requestCount, 0);
-          const rate = errReq / stepSec;
+          const rate = errReq / lookbackSec;
           return [t, String(Number(rate.toFixed(2)))];
         });
         results.push({ metric: { service: s, instance: inst }, values });
@@ -569,7 +578,7 @@ export function evaluateMockPromQlRange(
   ) {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const latObs = obs.filter((o) => o.latencyMs > 0);
         const totalReq = latObs.reduce((sum, o) => sum + o.requestCount, 0);
         const totalLatencyMs = latObs.reduce((sum, o) => sum + o.latencyMs * o.requestCount, 0);
@@ -583,9 +592,9 @@ export function evaluateMockPromQlRange(
   if (q === "sum by (service) (rate(http_request_duration_seconds_sum[1m]))") {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const latObs = obs.filter((o) => o.latencyMs > 0);
-        const sumSec = latObs.reduce((sum, o) => sum + (o.latencyMs / 1000) * o.requestCount, 0) / stepSec;
+        const sumSec = latObs.reduce((sum, o) => sum + (o.latencyMs / 1000) * o.requestCount, 0) / lookbackSec;
         return [t, String(Number(sumSec.toFixed(4)))];
       });
       return { metric: { service: s }, values };
@@ -595,9 +604,9 @@ export function evaluateMockPromQlRange(
   if (q === "sum by (service) (rate(http_request_duration_seconds_count[1m]))") {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const totalReq = obs.reduce((sum, o) => sum + o.requestCount, 0);
-        const rate = totalReq / stepSec;
+        const rate = totalReq / lookbackSec;
         return [t, String(Number(rate.toFixed(2)))];
       });
       return { metric: { service: s }, values };
@@ -608,7 +617,7 @@ export function evaluateMockPromQlRange(
   if (q === "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket[1m])))") {
     return services.map((s) => {
       const values: Array<[number, string]> = timestamps.map((t) => {
-        const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+        const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
         const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
         const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
         const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));
@@ -634,7 +643,7 @@ export function evaluateMockPromQlRange(
     for (const s of services) {
       for (const le of PROMETHEUS_LE_STRINGS) {
         const values: Array<[number, string]> = timestamps.map((t) => {
-          const obs = obsStore.getObservations(s, (t - stepSec) * 1000, t * 1000);
+          const obs = obsStore.getObservations(s, (t - lookbackSec) * 1000, t * 1000);
           const inst1Obs = obs.filter((o) => o.instance === `${s}-inst-1`);
           const inst2Obs = obs.filter((o) => o.instance === `${s}-inst-2`);
           const b1 = computeHistogramBuckets(inst1Obs.map((o) => o.latencyMs / 1000));

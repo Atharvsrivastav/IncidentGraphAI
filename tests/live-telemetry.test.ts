@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { PrometheusClient } from "../src/lib/telemetry/prometheusClient";
+import { PrometheusClient, ServiceMetricsDetailedResult } from "../src/lib/telemetry/prometheusClient";
 import { JaegerClient } from "../src/lib/telemetry/jaegerClient";
 import { TelemetryManager } from "../src/lib/telemetry/telemetryManager";
+import { BackendHealthStatus, DistributedTrace } from "../src/lib/telemetry/types";
 import {
   validateMetricRecord,
   validateTraceSpan,
@@ -27,6 +28,9 @@ import {
   PROMETHEUS_LE_STRINGS,
 } from "../sample-services/mock-observability";
 import { ensureDatabaseSeeded } from "../src/lib/db/ensure-seeded";
+import { realRootCauseEngine } from "../src/lib/algorithms/realRootCauseEngine";
+import { telemetryManager } from "../src/lib/telemetry/telemetryManager";
+import { prisma } from "../src/lib/db/prisma";
 
 describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
   const originalFetch = global.fetch;
@@ -1404,7 +1408,7 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
   // =========================================================================
   describe("Mock Observability Server & PromQL Evaluation", () => {
     it("evaluates supported PromQL expressions deterministically and rejects unsupported queries", () => {
-      const nowSec = 1730000000;
+      const nowSec = Math.floor(Date.now() / 1000);
 
       // 1. Health checks
       const upPoints = evaluateMockPromQl("up", nowSec);
@@ -2079,6 +2083,706 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(result.topRootCause).toBeDefined();
       expect(result.topRootCause?.serviceId).toBe("payment-service");
       expect(result.topRootCause?.supportingEvidence.some((e) => e.type === "TELEMETRY_SPIKE" || e.description.includes("error"))).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 8. End-to-End RCA Evidence Integrity Suite
+  // =========================================================================
+  describe("End-to-End RCA Evidence Integrity Suite", () => {
+    const liveHealthStatus: BackendHealthStatus = {
+      prometheusAvailable: true,
+      jaegerAvailable: true,
+      prometheusUrl: "http://localhost:9090",
+      jaegerUrl: "http://localhost:16686",
+      isMockBackend: false,
+      isCloudBackend: false,
+      cloudConfigured: false,
+      backendType: "GENUINE_STACK",
+      lastChecked: new Date().toISOString(),
+    };
+
+    it("verifies rate(...[1m]) uses fixed 60-second lookback window regardless of step size (15, 30, 60, 120s)", () => {
+      obsStore.clear();
+      const baseSec = 1730000000;
+
+      // Seed 120 observations over 60 seconds (baseSec - 60 to baseSec) for payment-service:
+      // Exactly 120 requests in the 60-second window -> rate should be exactly 120 / 60 = 2.0 req/s
+      for (let s = 1; s <= 60; s++) {
+        obsStore.addObservation({
+          serviceName: "payment-service",
+          instance: "payment-service-inst-1",
+          timestampMs: (baseSec - 60 + s) * 1000,
+          latencyMs: 40,
+          isError: false,
+          requestCount: 2,
+        });
+      }
+
+      // Test with step sizes: 15s, 30s, 60s, 120s
+      const stepSizes = [15, 30, 60, 120];
+
+      for (const stepSec of stepSizes) {
+        const startSec = baseSec - 120;
+        const endSec = baseSec;
+
+        const matrix = evaluateMockPromQlRange(
+          "sum by (service) (rate(http_requests_total[1m]))",
+          startSec,
+          endSec,
+          stepSec
+        );
+
+        expect(matrix).not.toBeNull();
+        expect(matrix!.length).toBeGreaterThan(0);
+
+        const paymentSeries = matrix!.find((m) => m.metric["service"] === "payment-service");
+        expect(paymentSeries).toBeDefined();
+
+        // Verify timestamps step by stepSec
+        for (let i = 1; i < paymentSeries!.values.length; i++) {
+          const prevTime = paymentSeries!.values[i - 1][0];
+          const currTime = paymentSeries!.values[i][0];
+          expect(currTime - prevTime).toBe(stepSec);
+        }
+
+        // The point evaluated at baseSec MUST evaluate exactly over [baseSec - 60, baseSec]
+        // Rate is 120 / 60 = 2.0 req/s across all step sizes!
+        const evalPointAtEnd = paymentSeries!.values.find((v) => v[0] === baseSec);
+        expect(evalPointAtEnd).toBeDefined();
+        expect(parseFloat(evalPointAtEnd![1])).toBe(2.0);
+      }
+    });
+
+    it("handles all ERROR_RATE missing-series combinations strictly without fabricating false healthy status", async () => {
+      const startSec = 1730000000;
+      // Case A: Missing error series (absent error instrumentation)
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "auth-service" }, values: [[startSec, "10.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        // Error query returns empty result (absent error series)
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prom:9090", 2000);
+      const historyMissingError = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+
+      // Verify no ERROR_RATE record is generated for auth-service (does not fabricate 0%)
+      const errRateRecordsA = historyMissingError.records.filter(
+        (r) => r.serviceName === "auth-service" && r.metricType === "ERROR_RATE"
+      );
+      expect(errRateRecordsA.length).toBe(0);
+      const ptA = historyMissingError.historyByService.get("auth-service")?.[0];
+      expect(ptA?.hasValidErrorRate).toBeFalsy();
+
+      // Case B: Missing request series (absent request rate instrumentation)
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "cache-service" }, values: [[startSec, "2.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const historyMissingReq = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+      const errRateRecordsB = historyMissingReq.records.filter(
+        (r) => r.serviceName === "cache-service" && r.metricType === "ERROR_RATE"
+      );
+      expect(errRateRecordsB.length).toBe(0);
+
+      // Case C: Zero request traffic (req = 0, err = 0) -> explicit no-traffic condition
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "idle-service" }, values: [[startSec, "0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (url.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "idle-service" }, values: [[startSec, "0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const historyIdle = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+      // Zero request volume must NOT generate fabricated 0% error rate
+      const errRateRecordsC = historyIdle.records.filter(
+        (r) => r.serviceName === "idle-service" && r.metricType === "ERROR_RATE"
+      );
+      expect(errRateRecordsC.length).toBe(0);
+      const ptC = historyIdle.historyByService.get("idle-service")?.[0];
+      expect(ptC?.hasValidErrorRate).toBe(false);
+
+      // Case D: Valid traffic > 0 and 0 errors -> genuine 0% ERROR_RATE record generated
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "healthy-service" }, values: [[startSec, "25.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (url.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "healthy-service" }, values: [[startSec, "0.0"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const historyHealthy = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+      const errRateRecordsD = historyHealthy.records.filter(
+        (r) => r.serviceName === "healthy-service" && r.metricType === "ERROR_RATE"
+      );
+      expect(errRateRecordsD.length).toBe(1);
+      expect(errRateRecordsD[0].value).toBe(0);
+      expect(errRateRecordsD[0].unit).toBe("%");
+      const ptD = historyHealthy.historyByService.get("healthy-service")?.[0];
+      expect(ptD?.hasValidErrorRate).toBe(true);
+      expect(ptD?.errorRate).toBe(0);
+
+      // Case E: Valid throughput (0.1 errors/s) with volume (0.4 req/s) -> 25% ERROR_RATE record
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("http_requests_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "active-service" }, values: [[startSec, "0.4"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (url.includes("http_request_errors_total")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                resultType: "matrix",
+                result: [{ metric: { service: "active-service" }, values: [[startSec, "0.1"]] }],
+              },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            status: "success",
+            data: { resultType: "matrix", result: [] },
+          }),
+        } as unknown as Response);
+      });
+
+      const historyActive = await client.getServiceMetricsHistory({ lookbackSec: 300, stepSec: 60 });
+      const rawThroughputE = historyActive.records.find(
+        (r) => r.serviceName === "active-service" && r.metricType === "ERROR_THROUGHPUT"
+      );
+      const errRateE = historyActive.records.find(
+        (r) => r.serviceName === "active-service" && r.metricType === "ERROR_RATE"
+      );
+
+      expect(rawThroughputE?.value).toBe(0.1);
+      expect(rawThroughputE?.unit).toBe("errors/s");
+      expect(errRateE?.value).toBe(25);
+      expect(errRateE?.unit).toBe("%");
+    });
+
+    it("strictly handles trace-only, metrics-only, and partial telemetry without fabricating baseline metrics", async () => {
+      telemetryManager.setMode("LIVE");
+
+      // Mock Prometheus: payment-service has metrics; order-service has NO metrics (only traces)
+      vi.spyOn(telemetryManager, "getBackendHealth").mockResolvedValue({
+        prometheusAvailable: true,
+        jaegerAvailable: true,
+        prometheusUrl: "http://localhost:9090",
+        jaegerUrl: "http://localhost:16686",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "GENUINE_STACK",
+        lastChecked: new Date().toISOString(),
+      });
+
+      const mockPromDetailed: ServiceMetricsDetailedResult = {
+        success: true,
+        p95Supported: true,
+        diagnostics: [],
+        metrics: new Map([
+          [
+            "payment-service",
+            {
+              serviceName: "payment-service",
+              latencyMs: 50,
+              hasValidLatency: true,
+              errorRate: 0,
+              hasValidErrorRate: true,
+              requestRate: 20,
+              hasValidRequestRate: true,
+              hasValidP95: false,
+              instanceCount: 1,
+            },
+          ],
+        ]),
+      };
+
+      vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue(mockPromDetailed);
+
+      // Mock Jaeger: order-service has traces (trace-only), payment-service has 0 traces
+      const mockTraces: DistributedTrace[] = [
+        {
+          traceId: "trace-order-only",
+          rootServiceName: "order-service",
+          operationName: "GET /orders",
+          startTime: new Date().toISOString(),
+          durationMs: 45,
+          totalSpans: 2,
+          servicesInvolved: ["order-service"],
+          hasErrors: false,
+          rootSpan: null,
+          allSpans: [],
+        },
+      ];
+
+      vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+        success: true,
+        traces: mockTraces,
+        normalizedSpans: [],
+        diagnostic: {
+          provider: "TEMPO",
+          endpoint: "/api/traces",
+          status: "OK",
+          message: "Traces retrieved",
+          latencyMs: 10,
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      const { observedServices } = await telemetryManager.getObservedServices();
+
+      // 1. Trace-only service (order-service): MUST be UNKNOWN, not HEALTHY, latency 0 (not baseline)
+      const orderObs = observedServices.find((s) => s.serviceId === "order-service");
+      expect(orderObs).toBeDefined();
+      expect(orderObs!.status).toBe("UNKNOWN");
+      expect(orderObs!.source).toBe("JAEGER");
+      expect(orderObs!.traceCount).toBe(1);
+      expect(orderObs!.latencyMs).toBe(0); // NOT baseline 42ms
+      expect(orderObs!.isStale).toBe(true);
+      expect(orderObs!.lastObserved).toContain("Trace observations present, but metric telemetry missing");
+
+      // 2. Metrics-only service (payment-service): MUST be HEALTHY from actual metric measurements
+      const paymentObs = observedServices.find((s) => s.serviceId === "payment-service");
+      expect(paymentObs).toBeDefined();
+      expect(paymentObs!.status).toBe("HEALTHY");
+      expect(paymentObs!.source).toBe("PROMETHEUS");
+      expect(paymentObs!.traceCount).toBe(0);
+      expect(paymentObs!.latencyMs).toBe(50);
+      expect(paymentObs!.isStale).toBe(false);
+    });
+
+    it("constructs multiple chronological TelemetryPoint samples with monotonic step ordering in RealRootCauseEngine", async () => {
+      telemetryManager.setMode("LIVE");
+
+      const now = Date.now();
+      const t1 = new Date(now - 120000).toISOString();
+      const t2 = new Date(now - 60000).toISOString();
+      const t3 = new Date(now).toISOString();
+
+      // Mock 3 chronological samples for payment-service in normalized batch
+      const mockMetrics: NormalizedMetricRecord[] = [
+        // T1: Step 1 (Healthy)
+        { id: "m1", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "REQUEST_RATE", metricName: "req", timestamp: t1, value: 50, unit: "req/s", labels: {}, hasAnomaly: false },
+        { id: "m2", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t1, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "m3", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t1, value: 30, unit: "ms", labels: {}, hasAnomaly: false },
+
+        // T2: Step 2 (Degrading)
+        { id: "m4", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "REQUEST_RATE", metricName: "req", timestamp: t2, value: 45, unit: "req/s", labels: {}, hasAnomaly: false },
+        { id: "m5", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t2, value: 8, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "m6", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t2, value: 120, unit: "ms", labels: {}, hasAnomaly: true },
+
+        // T3: Step 3 (Down)
+        { id: "m7", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "REQUEST_RATE", metricName: "req", timestamp: t3, value: 30, unit: "req/s", labels: {}, hasAnomaly: false },
+        { id: "m8", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t3, value: 35, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "m9", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t3, value: 350, unit: "ms", labels: {}, hasAnomaly: true },
+      ];
+
+      vi.spyOn(telemetryManager, "getNormalizedBatch").mockResolvedValue({
+        batchId: "test-batch-multi-step",
+        collectedAt: new Date().toISOString(),
+        mode: "LIVE",
+        metrics: mockMetrics,
+        spans: [],
+        diagnostics: [],
+      });
+
+      vi.spyOn(telemetryManager, "getObservedServices").mockResolvedValue({
+        mode: "LIVE",
+        backendHealth: liveHealthStatus,
+        observedServices: [
+          {
+            serviceId: "payment-service",
+            serviceName: "Payment Gateway Service",
+            source: "PROMETHEUS",
+            status: "DOWN",
+            latencyMs: 350,
+            errorRate: 35,
+            requestRate: 30,
+            lastObserved: t3,
+            traceCount: 0,
+            isStale: false,
+            isKnownInTopology: true,
+          },
+        ],
+        unknownServices: [],
+        lastCollectedAt: new Date().toISOString(),
+        lastIngestedAt: new Date().toISOString(),
+      });
+
+      vi.spyOn(telemetryManager, "getRecentTraces").mockResolvedValue([]);
+
+      const incident = await prisma.incident.create({
+        data: {
+          title: "Test Historical Telemetry Multi-Step",
+          description: "Testing chronological step ingestion",
+          severity: "HIGH",
+          status: "INVESTIGATING",
+          rootCauseStatus: "DETECTED",
+        },
+      });
+
+      const analysis = await realRootCauseEngine.analyzeRealIncident(incident.id);
+
+      expect(analysis.isConclusive).toBe(true);
+      expect(analysis.topRootCause?.serviceId).toBe("payment-service");
+
+      // Verify that candidates in database reflect analysis
+      const savedCandidates = await prisma.rootCauseCandidate.findMany({
+        where: { incidentId: incident.id },
+      });
+      expect(savedCandidates.length).toBeGreaterThan(0);
+      const topSaved = savedCandidates.find((c) => c.rank === 1);
+      expect(topSaved?.candidateServiceId).toBe("payment-service");
+    });
+
+    it("executes End-to-End Multi-Service Cascading RCA over real analysis path with correct root cause ranking", async () => {
+      telemetryManager.setMode("LIVE");
+
+      const baseTime = Date.now();
+      const t1 = new Date(baseTime - 300000).toISOString(); // Step 1: Baseline
+      const t2 = new Date(baseTime - 240000).toISOString(); // Step 2: Postgres contention onset
+      const t3 = new Date(baseTime - 180000).toISOString(); // Step 3: Payment degrades
+      const t4 = new Date(baseTime - 120000).toISOString(); // Step 4: Order checkout timeouts
+      const t5 = new Date(baseTime - 60000).toISOString();  // Step 5: Gateway 504 surge
+      const t6 = new Date(baseTime).toISOString();          // Step 6: Recovery
+
+      // Build 6-step cascading telemetry history for all 4 services
+      const mockMetrics: NormalizedMetricRecord[] = [
+        // --- Step 1 (Baseline - All Normal) ---
+        { id: "1-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t1, value: 11, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "1-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t1, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "1-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t1, value: 45, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "1-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t1, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "1-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t1, value: 35, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "1-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t1, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "1-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t1, value: 18, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "1-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t1, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+
+        // --- Step 2 (Postgres Latency Surge - Originating Failure Onset) ---
+        // postgres-db baseline is 11ms; 1850ms is ~168x baseline!
+        { id: "2-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t2, value: 1850, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "2-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t2, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "2-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t2, value: 50, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "2-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t2, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "2-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t2, value: 38, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "2-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t2, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "2-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t2, value: 20, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "2-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t2, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+
+        // --- Step 3 (Payment Stalls Waiting for DB) ---
+        { id: "3-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t3, value: 1900, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "3-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t3, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "3-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t3, value: 1950, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "3-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t3, value: 15, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "3-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t3, value: 75, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "3-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t3, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "3-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t3, value: 25, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "3-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t3, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+
+        // --- Step 4 (Order Service Checkout Timeout Surge) ---
+        { id: "4-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t4, value: 1920, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "4-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t4, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "4-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t4, value: 2000, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "4-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t4, value: 22, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "4-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t4, value: 2100, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "4-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t4, value: 25, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "4-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t4, value: 80, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "4-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t4, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+
+        // --- Step 5 (API Gateway Ingress Timeout Surge) ---
+        { id: "5-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t5, value: 1900, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "5-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t5, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "5-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t5, value: 1980, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "5-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t5, value: 25, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "5-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t5, value: 2150, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "5-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t5, value: 28, unit: "%", labels: {}, hasAnomaly: true },
+        { id: "5-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t5, value: 2250, unit: "ms", labels: {}, hasAnomaly: true },
+        { id: "5-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t5, value: 35, unit: "%", labels: {}, hasAnomaly: true },
+
+        // --- Step 6 (Recovery) ---
+        { id: "6-db-lat", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t6, value: 12, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "6-db-err", provider: "PROMETHEUS", serviceName: "postgres-db", metricType: "ERROR_RATE", metricName: "err", timestamp: t6, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "6-pay-lat", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t6, value: 50, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "6-pay-err", provider: "PROMETHEUS", serviceName: "payment-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t6, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "6-ord-lat", provider: "PROMETHEUS", serviceName: "order-service", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t6, value: 40, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "6-ord-err", provider: "PROMETHEUS", serviceName: "order-service", metricType: "ERROR_RATE", metricName: "err", timestamp: t6, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+        { id: "6-gw-lat", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "LATENCY_AVG", metricName: "lat", timestamp: t6, value: 22, unit: "ms", labels: {}, hasAnomaly: false },
+        { id: "6-gw-err", provider: "PROMETHEUS", serviceName: "api-gateway", metricType: "ERROR_RATE", metricName: "err", timestamp: t6, value: 0, unit: "%", labels: {}, hasAnomaly: false },
+      ];
+
+      vi.spyOn(telemetryManager, "getNormalizedBatch").mockResolvedValue({
+        batchId: "batch-cascading-test",
+        collectedAt: t6,
+        mode: "LIVE",
+        metrics: mockMetrics,
+        spans: [],
+        diagnostics: [],
+      });
+
+      vi.spyOn(telemetryManager, "getObservedServices").mockResolvedValue({
+        mode: "LIVE",
+        backendHealth: liveHealthStatus,
+        observedServices: [
+          { serviceId: "postgres-db", serviceName: "PostgreSQL Database Cluster", source: "PROMETHEUS", status: "DOWN", latencyMs: 1850, errorRate: 0, requestRate: 1550, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
+          { serviceId: "payment-service", serviceName: "Payment Gateway Service", source: "PROMETHEUS", status: "DEGRADED", latencyMs: 1950, errorRate: 15, requestRate: 240, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
+          { serviceId: "order-service", serviceName: "Order Service", source: "PROMETHEUS", status: "DEGRADED", latencyMs: 2100, errorRate: 25, requestRate: 520, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
+          { serviceId: "api-gateway", serviceName: "API Gateway", source: "PROMETHEUS", status: "DOWN", latencyMs: 2250, errorRate: 35, requestRate: 1450, lastObserved: t6, traceCount: 0, isStale: false, isKnownInTopology: true },
+        ],
+        unknownServices: [],
+        lastCollectedAt: t6,
+        lastIngestedAt: t6,
+      });
+
+      vi.spyOn(telemetryManager, "getRecentTraces").mockResolvedValue([]);
+
+      const incident = await prisma.incident.create({
+        data: {
+          title: "Production Outage: Cascading Gateway 504 Failure",
+          description: "Database connection contention cascading to payment and gateway",
+          severity: "CRITICAL",
+          status: "INVESTIGATING",
+          rootCauseStatus: "DETECTED",
+        },
+      });
+
+      const analysis = await realRootCauseEngine.analyzeRealIncident(incident.id);
+
+      // Verify analysis conclusion
+      expect(analysis.isConclusive).toBe(true);
+      expect(analysis.topRootCause).toBeDefined();
+
+      // PostgreSQL must be ranked #1 as originating root cause:
+      // - Earliest anomaly onset detected at step 2
+      // - Deepest node in dependency tier (tier 3/4)
+      // - Cascading reachability explains upstream payment, order, and gateway symptoms
+      expect(analysis.topRootCause?.serviceId).toBe("postgres-db");
+
+      // Verify timing precedence evidence mentions step 2 (earliest anomaly onset)
+      const timingEvidence = analysis.topRootCause?.supportingEvidence.find(
+        (e) => e.type === "TIMING_PRECEDENCE"
+      );
+      expect(timingEvidence).toBeDefined();
+      expect(timingEvidence?.description).toContain("simulation step 2");
+
+      // Verify cascading impact evidence explains upstream dependents
+      const cascadeEvidence = analysis.topRootCause?.supportingEvidence.find(
+        (e) => e.type === "CASCADING_IMPACT"
+      );
+      expect(cascadeEvidence).toBeDefined();
+
+      // Verify upstream services are recognized as affected dependents
+      const affectedServiceIds = analysis.affectedServicesGraph.map((s) => s.serviceId);
+      expect(affectedServiceIds).toContain("payment-service");
+      expect(affectedServiceIds).toContain("order-service");
+      expect(affectedServiceIds).toContain("api-gateway");
+
+      // Verify database persistence of the analysis
+      const updatedIncident = await prisma.incident.findUnique({ where: { id: incident.id } });
+      expect(updatedIncident?.rootCauseStatus).toBe("ANALYZED");
+      expect(updatedIncident?.suspectedRootCauseId).toBe("postgres-db");
+    });
+
+    it("returns inconclusive when telemetry evidence is insufficient and never maps UNKNOWN to HEALTHY", async () => {
+      telemetryManager.setMode("LIVE");
+
+      // Empty telemetry batch
+      vi.spyOn(telemetryManager, "getNormalizedBatch").mockResolvedValue({
+        batchId: "empty-batch",
+        collectedAt: new Date().toISOString(),
+        mode: "DEGRADED",
+        metrics: [],
+        spans: [],
+        diagnostics: [],
+      });
+
+      const degradedHealthStatus: BackendHealthStatus = {
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: "http://localhost:9090",
+        jaegerUrl: "http://localhost:16686",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "GENUINE_STACK",
+        lastChecked: new Date().toISOString(),
+      };
+
+      vi.spyOn(telemetryManager, "getObservedServices").mockResolvedValue({
+        mode: "DEGRADED",
+        backendHealth: degradedHealthStatus,
+        observedServices: [
+          { serviceId: "postgres-db", serviceName: "PostgreSQL Database Cluster", source: "PROMETHEUS", status: "UNKNOWN", latencyMs: 0, errorRate: 0, requestRate: 0, lastObserved: "N/A", traceCount: 0, isStale: true, isKnownInTopology: true },
+          { serviceId: "payment-service", serviceName: "Payment Gateway Service", source: "PROMETHEUS", status: "UNKNOWN", latencyMs: 0, errorRate: 0, requestRate: 0, lastObserved: "N/A", traceCount: 0, isStale: true, isKnownInTopology: true },
+        ],
+        unknownServices: [],
+        lastCollectedAt: new Date().toISOString(),
+        lastIngestedAt: null,
+      });
+
+      vi.spyOn(telemetryManager, "getRecentTraces").mockResolvedValue([]);
+
+      const incident = await prisma.incident.create({
+        data: {
+          title: "Insufficient Evidence Test Incident",
+          description: "Testing inconclusive outcome on missing telemetry",
+          severity: "MEDIUM",
+          status: "INVESTIGATING",
+          rootCauseStatus: "DETECTED",
+        },
+      });
+
+      const analysis = await realRootCauseEngine.analyzeRealIncident(incident.id);
+
+      expect(analysis.isConclusive).toBe(false);
+      expect(analysis.topRootCause).toBeNull();
+
+      const updatedIncident = await prisma.incident.findUnique({ where: { id: incident.id } });
+      expect(updatedIncident?.rootCauseStatus).toBe("INCONCLUSIVE");
+      expect(updatedIncident?.suspectedRootCauseId).toBeNull();
+    });
+
+    it("preserves strict simulation isolation in RealRootCauseEngine and TelemetryManager", async () => {
+      telemetryManager.setMode("SIMULATION");
+
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy;
+
+      const batch = await telemetryManager.getNormalizedBatch();
+      expect(batch.mode).toBe("SIMULATION");
+      expect(batch.metrics.length).toBeGreaterThan(0);
+      expect(batch.metrics.every((m) => m.provider === "SIMULATION")).toBe(true);
+
+      const { observedServices } = await telemetryManager.getObservedServices();
+      expect(observedServices.every((s) => s.source === "SIMULATION")).toBe(true);
+
+      // Verify zero network requests occurred
+      expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
 });
