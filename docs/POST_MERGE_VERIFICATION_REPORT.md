@@ -5,7 +5,7 @@
 > **Merged Commit SHA:** `c7dafce2f8782186b3e1fe3e83cbf3df573f234f`  
 > **Target Branch:** `master`  
 > **Verification Date:** 2026-10-30  
-> **Overall Outcome:** **`POST-MERGE VERIFICATION PASSED`**
+> **Overall Outcome:** **`POST-MERGE VERIFICATION PASSED (CREDENTIAL REVOCATION OUTSTANDING)`**
 
 ---
 
@@ -99,7 +99,7 @@ Because **96.58%** of the suite ($113 / 117$) executes at or below 0.13 ms, $0.1
 ## 5. Security Audit — Credential Exposure & Remediation
 
 1. **Exposure Incident**:
-   - An active GitHub personal access token (OAuth `gho_...` format) was output in an earlier local debugging step while checking Git Credential Manager outputs.
+   - An active GitHub OAuth App access token (`gho_` format) was output in an earlier local debugging step while checking Git Credential Manager outputs.
 2. **Repository & History Audit**:
    - Executed `git grep "gho_"` across all tracked files: **0 occurrences** (clean).
    - Executed `git grep "ghp_"` across all tracked files: **0 occurrences** (clean).
@@ -107,7 +107,7 @@ Because **96.58%** of the suite ($113 / 117$) executes at or below 0.13 ms, $0.1
 3. **Mandatory Security Recommendation**:
    - The token appeared in terminal session logs and must be considered **compromised**.
    - **Action Required by Account Owner (`Atharvsrivastav`)**:
-     1. Navigate to: **GitHub Settings** $\rightarrow$ **Developer settings** $\rightarrow$ **Personal access tokens** (or Authorized OAuth Apps).
+     1. Navigate to: **GitHub Settings** $\rightarrow$ **Applications** $\rightarrow$ **Authorized OAuth Apps**.
      2. Identify the active token/session and click **Revoke**.
      3. Generate a new scoped token or authenticate future sessions via standard Git Credential Manager / GitHub CLI `gh auth login`.
    - *Note: As per security guidelines, this report does NOT assume or claim the token has been revoked until the owner executes revocation directly on GitHub.*
@@ -136,6 +136,6 @@ All verification commands executed on the clean merged `master` branch (`c7dafce
 
 ## 7. Conclusion
 
-All post-merge requirements, GitHub Actions workflow verifications, independent statistical recalculations, security audits, and verification suite runs have succeeded with zero blockers.
+Repository merge verification, independent benchmark recalculations, and GitHub Actions CI have all completed successfully. However, account-owner credential revocation remains outstanding until confirmed directly in GitHub Settings.
 
-**`POST-MERGE VERIFICATION PASSED`**
+**`POST-MERGE VERIFICATION PASSED (CREDENTIAL REVOCATION OUTSTANDING)`**
