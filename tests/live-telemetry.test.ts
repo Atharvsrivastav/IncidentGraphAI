@@ -34,7 +34,7 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
   // 1. Prometheus / Grafana Cloud Metrics Ingestion & Diagnostics
   // =========================================================================
   describe("Prometheus Metrics Ingestion", () => {
-    it("successfully queries instant metrics and normalizes values with labels", async () => {
+    it("successfully queries instant metrics and normalizes seconds to milliseconds consistently", async () => {
       const mockPromPayload = {
         status: "success",
         data: {
@@ -42,11 +42,11 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
           result: [
             {
               metric: { service: "order-service", env: "production", job: "order-api" },
-              value: [1730000000, "0.045"],
+              value: [1730000000, "0.045"], // 0.045 seconds
             },
             {
               metric: { service: "payment-service", env: "production", job: "payment-api" },
-              value: [1730000000, "0.120"],
+              value: [1730000000, "0.120"], // 0.120 seconds
             },
           ],
         },
@@ -68,9 +68,219 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
 
       const orderMetric = detailed.records.find((r) => r.serviceName === "order-service");
       expect(orderMetric).toBeDefined();
-      expect(orderMetric?.value).toBe(0.045);
+      // 0.045 seconds MUST be converted to 45 milliseconds
+      expect(orderMetric?.value).toBe(45);
       expect(orderMetric?.unit).toBe("ms");
       expect(orderMetric?.labels["env"]).toBe("production");
+
+      const paymentMetric = detailed.records.find((r) => r.serviceName === "payment-service");
+      expect(paymentMetric).toBeDefined();
+      // 0.120 seconds MUST be converted to 120 milliseconds
+      expect(paymentMetric?.value).toBe(120);
+      expect(paymentMetric?.unit).toBe("ms");
+    });
+
+    it("evaluates service-level metrics with rate math, histogram latency derivation, and error percentage", async () => {
+      // Mock Prometheus responses for the 3 sequential PromQL queries in getServiceMetrics()
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  { metric: { service: "order-service" }, value: [1730000000, "250.0"] },
+                  { metric: { service: "zero-traffic-service" }, value: [1730000000, "0.0"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("rate(http_request_errors_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  { metric: { service: "order-service" }, value: [1730000000, "12.5"] },
+                  { metric: { service: "zero-traffic-service" }, value: [1730000000, "0.0"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (decoded.includes("duration_seconds_sum")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: {
+                result: [
+                  // Sum / Count in seconds: 0.035 seconds
+                  { metric: { service: "order-service" }, value: [1730000000, "0.035"] },
+                  { metric: { service: "zero-traffic-service" }, value: [1730000000, "0.000"] },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const metricsMap = await client.getServiceMetrics();
+
+      expect(metricsMap.size).toBe(2);
+
+      const orderMetrics = metricsMap.get("order-service");
+      expect(orderMetrics).toBeDefined();
+      expect(orderMetrics?.requestRate).toBe(250); // 250 req/s
+      // Error % = (12.5 / 250) * 100 = 5.0%
+      expect(orderMetrics?.errorRate).toBe(5);
+      // Latency derived from sum/count and converted to ms: 0.035s * 1000 = 35ms
+      expect(orderMetrics?.latencyMs).toBe(35);
+
+      const zeroTrafficMetrics = metricsMap.get("zero-traffic-service");
+      expect(zeroTrafficMetrics).toBeDefined();
+      expect(zeroTrafficMetrics?.requestRate).toBe(0);
+      // Safe zero division handling: must yield 0.0% instead of NaN or Infinity
+      expect(zeroTrafficMetrics?.errorRate).toBe(0);
+      expect(zeroTrafficMetrics?.latencyMs).toBe(0);
+    });
+
+    it("executes bounded Prometheus range queries (/api/v1/query_range) and normalizes matrix points", async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const startSec = nowSec - 300; // 5 min ago
+      const endSec = nowSec;
+      const stepSec = 60; // 1 min steps
+
+      const mockMatrixPayload = {
+        status: "success",
+        data: {
+          resultType: "matrix",
+          result: [
+            {
+              metric: { service: "order-service", instance: "order-1" },
+              values: [
+                [startSec, "0.040"],
+                [startSec + 60, "0.045"],
+                [startSec + 120, "0.050"],
+              ],
+            },
+          ],
+        },
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: async () => mockMatrixPayload,
+      } as unknown as Response);
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 2000);
+      const detailed = await client.queryRange({
+        query: "http_request_duration_seconds",
+        startSec,
+        endSec,
+        stepSec,
+        metricType: "LATENCY_AVG",
+      });
+
+      expect(detailed.success).toBe(true);
+      expect(detailed.diagnostic.status).toBe("OK");
+      expect(detailed.records.length).toBe(3);
+
+      // Verify each point normalized to ms
+      expect(detailed.records[0].value).toBe(40); // 0.040s -> 40ms
+      expect(detailed.records[0].unit).toBe("ms");
+      expect(detailed.records[1].value).toBe(45); // 0.045s -> 45ms
+      expect(detailed.records[2].value).toBe(50); // 0.050s -> 50ms
+    });
+
+    it("validates range query bounds: rejects invalid ranges, negative steps, lookback > 24h, and excessive points", async () => {
+      const client = new PrometheusClient("http://mock-prometheus:9090", 1000);
+
+      // 1. start >= end
+      const invalidRange = await client.queryRange({
+        query: "up",
+        startSec: 2000,
+        endSec: 1000,
+        stepSec: 10,
+      });
+      expect(invalidRange.success).toBe(false);
+      expect(invalidRange.diagnostic.errorCode).toBe("BAD_REQUEST");
+      expect(invalidRange.diagnostic.message).toContain("must be strictly less than end");
+
+      // 2. step <= 0
+      const invalidStep = await client.queryRange({
+        query: "up",
+        startSec: 1000,
+        endSec: 2000,
+        stepSec: 0,
+      });
+      expect(invalidStep.success).toBe(false);
+      expect(invalidStep.diagnostic.message).toContain("must be greater than 0");
+
+      // 3. Lookback > 24h (86400s)
+      const excessiveLookback = await client.queryRange({
+        query: "up",
+        startSec: 1000,
+        endSec: 1000 + 86401,
+        stepSec: 60,
+      });
+      expect(excessiveLookback.success).toBe(false);
+      expect(excessiveLookback.diagnostic.message).toContain("exceeds maximum permitted lookback");
+
+      // 4. Excessive point count > 11,000 points
+      const excessivePoints = await client.queryRange({
+        query: "up",
+        startSec: 0,
+        endSec: 12000,
+        stepSec: 1, // 12,000 points > 11,000 limit
+      });
+      expect(excessivePoints.success).toBe(false);
+      expect(excessivePoints.diagnostic.message).toContain("exceeds standard point limit");
+    });
+
+    it("enforces timeout covering response-body parsing rather than headers alone", async () => {
+      // Mock fetch where headers return immediately 200 OK, but res.json() hangs until aborted
+      global.fetch = vi.fn().mockImplementation(() => {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => {
+            return new Promise((_, reject) => {
+              const err = new Error("The operation was aborted");
+              err.name = "AbortError";
+              setTimeout(() => reject(err), 60);
+            });
+          },
+        } as unknown as Response);
+      });
+
+      const client = new PrometheusClient("http://mock-prometheus:9090", 30);
+      const detailed = await client.queryInstantDetailed("up");
+
+      expect(detailed.success).toBe(false);
+      expect(detailed.diagnostic.errorCode).toBe("TIMEOUT");
+      expect(detailed.diagnostic.message).toContain("timed out");
     });
 
     it("handles 401 authentication failure with typed AUTH_FAILURE and zero secret leakage", async () => {
@@ -184,10 +394,34 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
       expect(detailed.normalizedSpans[0].traceId).toBe("4b82d91f2c418049a0a19e8c3b4a5d6e");
     });
 
-    it("parses OTLP / Tempo v2 trace batch hierarchy with parent-child relationships and error tags", async () => {
+    it("parses 4-tier OTLP trace batch hierarchy: calculates recursive depths 0 through 3 accurately", async () => {
       const traceId = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d";
+      // 4-tier hierarchy:
+      // api-gateway (span-root, depth 0)
+      //  └── order-service (span-order, depth 1)
+      //       └── payment-service (span-payment, depth 2)
+      //            └── postgres-db (span-db, depth 3)
       const mockOtlpBatch = {
         batches: [
+          {
+            resource: {
+              attributes: [{ key: "service.name", value: { stringValue: "api-gateway" } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId,
+                    spanId: "span-root",
+                    name: "GET /api/orders",
+                    startTimeUnixNano: "1730000000000000000",
+                    endTimeUnixNano: "1730000001000000000",
+                    attributes: [{ key: "http.status_code", value: { intValue: 200 } }],
+                  },
+                ],
+              },
+            ],
+          },
           {
             resource: {
               attributes: [{ key: "service.name", value: { stringValue: "order-service" } }],
@@ -197,12 +431,50 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
                 spans: [
                   {
                     traceId,
-                    spanId: "span-root-01",
-                    name: "POST /orders",
-                    startTimeUnixNano: "1730000000000000000",
-                    endTimeUnixNano: "1730000001000000000", // 1000ms
-                    status: { code: 2, message: "Database timeout" },
-                    attributes: [{ key: "http.status_code", value: { intValue: 500 } }],
+                    spanId: "span-order",
+                    parentSpanId: "span-root",
+                    name: "GET /orders/list",
+                    startTimeUnixNano: "1730000000100000000",
+                    endTimeUnixNano: "1730000000900000000",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            resource: {
+              attributes: [{ key: "service.name", value: { stringValue: "payment-service" } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId,
+                    spanId: "span-payment",
+                    parentSpanId: "span-order",
+                    name: "GET /payment/verify",
+                    startTimeUnixNano: "1730000000200000000",
+                    endTimeUnixNano: "1730000000800000000",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            resource: {
+              attributes: [{ key: "service.name", value: { stringValue: "postgres-db" } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId,
+                    spanId: "span-db",
+                    parentSpanId: "span-payment",
+                    name: "SELECT * FROM payments",
+                    startTimeUnixNano: "1730000000300000000",
+                    endTimeUnixNano: "1730000000700000000",
+                    status: { code: 2, message: "Connection pool exhausted" },
                   },
                 ],
               },
@@ -223,10 +495,95 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
 
       expect(trace).not.toBeNull();
       expect(trace?.traceId).toBe(traceId);
+      expect(trace?.allSpans.length).toBe(4);
       expect(trace?.hasErrors).toBe(true);
-      expect(trace?.rootServiceName).toBe("order-service");
-      expect(trace?.allSpans[0].statusCode).toBe("ERROR");
-      expect(trace?.allSpans[0].errorMessage).toBe("Database timeout");
+
+      const spanMap = new Map(trace?.allSpans.map((s) => [s.spanId, s]));
+      expect(spanMap.get("span-root")?.depth).toBe(0);
+      expect(spanMap.get("span-order")?.depth).toBe(1);
+      expect(spanMap.get("span-payment")?.depth).toBe(2);
+      expect(spanMap.get("span-db")?.depth).toBe(3);
+
+      expect(spanMap.get("span-db")?.statusCode).toBe("ERROR");
+      expect(spanMap.get("span-db")?.errorMessage).toBe("Connection pool exhausted");
+    });
+
+    it("handles missing parent span ID safely by treating child as root without crashing", async () => {
+      const traceId = "missing-parent-trace";
+      const mockBatch = {
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "orphan-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId,
+                    spanId: "span-orphan-01",
+                    parentSpanId: "span-that-does-not-exist",
+                    name: "GET /orphan",
+                    startTimeUnixNano: "1730000000000000000",
+                    endTimeUnixNano: "1730000000100000000",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => mockBatch,
+      } as unknown as Response);
+
+      const client = new JaegerClient("http://mock-tempo:3200", 1000);
+      const trace = await client.getTraceById(traceId);
+
+      expect(trace).not.toBeNull();
+      expect(trace?.allSpans.length).toBe(1);
+      // Orphan span must be assigned depth 0 and not throw
+      expect(trace?.allSpans[0].depth).toBe(0);
+    });
+
+    it("detects and breaks cyclic parent-child span loops safely", () => {
+      const client = new JaegerClient("http://mock-tempo:3200", 1000);
+      const rawJaegerTrace = {
+        traceID: "cycle-trace-001",
+        spans: [
+          {
+            traceID: "cycle-trace-001",
+            spanID: "span-A",
+            operationName: "op-A",
+            startTime: 1730000000000,
+            duration: 50000,
+            tags: [],
+            references: [{ refType: "CHILD_OF", spanID: "span-B", traceID: "cycle-trace-001" }],
+            processID: "p1",
+          },
+          {
+            traceID: "cycle-trace-001",
+            spanID: "span-B",
+            operationName: "op-B",
+            startTime: 1730000000000,
+            duration: 50000,
+            tags: [],
+            references: [{ refType: "CHILD_OF", spanID: "span-A", traceID: "cycle-trace-001" }],
+            processID: "p1",
+          },
+        ],
+        processes: {
+          p1: { serviceName: "cyclic-service", tags: [] },
+        },
+      };
+
+      // Must not throw RangeError: Maximum call stack size exceeded
+      expect(() => {
+        const parsed = client.parseTrace(rawJaegerTrace);
+        expect(parsed.allSpans.length).toBe(2);
+      }).not.toThrow();
     });
 
     it("handles Tempo 401 authentication failure with typed AUTH_FAILURE", async () => {
@@ -447,6 +804,138 @@ describe("Phase 6: Live Telemetry Ingestion & Multi-Service RCA Suite", () => {
         expect(svc.source).toBe("PROMETHEUS");
         expect(svc.status).toBe("UNKNOWN");
       }
+    });
+
+    it("determines LIVE mode strictly when both Prometheus and Tempo succeed and return valid data", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        // Health probes
+        if (decoded.includes("/api/v1/query?query=up") || decoded.includes("vector(1)")) {
+          return Promise.resolve({ ok: true, status: 200, headers: new Headers(), json: async () => ({ status: "success" }) } as unknown as Response);
+        }
+        if (decoded.includes("/api/traces") || decoded.includes("/api/search")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              traces: [{ traceID: "tr-100", rootServiceName: "order-service", durationMs: 40, spanSet: { spans: [] } }],
+            }),
+          } as unknown as Response);
+        }
+        // PromQL queries
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              status: "success",
+              data: { result: [{ metric: { service: "order-service" }, value: [1730000000, "150"] }] },
+            }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      const batch = await manager.getNormalizedBatch();
+      expect(batch.mode).toBe("LIVE");
+      expect(batch.metrics.length).toBeGreaterThan(0);
+      expect(batch.spans.length).toBeGreaterThan(0);
+      expect(manager.getLastIngestedAt()).not.toBeNull();
+    });
+
+    it("transitions to DEGRADED when Prometheus fails but Tempo succeeds", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        if (url.includes(":9090") || url.includes("/api/prom")) {
+          return Promise.resolve({ ok: false, status: 503, text: async () => "Prometheus Unavailable" } as unknown as Response);
+        }
+        // Tempo succeeds
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            traces: [{ traceID: "tr-200", rootServiceName: "order-service", durationMs: 35, spanSet: { spans: [] } }],
+          }),
+        } as unknown as Response);
+      });
+
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      const batch = await manager.getNormalizedBatch();
+      expect(batch.mode).toBe("DEGRADED");
+    });
+
+    it("transitions to DEGRADED when health check probe passes but actual telemetry queries fail", async () => {
+      global.fetch = vi.fn().mockImplementation((url: string) => {
+        const decoded = decodeURIComponent(url);
+        // Health check queries return 200 OK
+        if (decoded.includes("query=up") || decoded.includes("vector(1)") || decoded.includes("limit=1")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({ status: "success", data: { result: [] } }),
+          } as unknown as Response);
+        }
+        // Actual metric query fails with 500
+        if (decoded.includes("rate(http_requests_total[1m])")) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            statusText: "Internal Server Error",
+            text: async () => "Query evaluation timed out on Prometheus TSDB engine",
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ status: "success", data: { result: [] } }),
+        } as unknown as Response);
+      });
+
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      const batch = await manager.getNormalizedBatch();
+      // Even though health probes passed, query failure MUST force DEGRADED mode
+      expect(batch.mode).toBe("DEGRADED");
+      const promDiag = batch.diagnostics.find((d) => d.provider === "PROMETHEUS");
+      expect(promDiag?.status).toBe("ERROR");
+    });
+
+    it("treats empty query responses as DEGRADED with UNKNOWN status and never fabricates simulated data", async () => {
+      // Both backends respond 200 OK with empty result arrays
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          status: "success",
+          data: { result: [] },
+          traces: [],
+        }),
+      } as unknown as Response);
+
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      const batch = await manager.getNormalizedBatch();
+      // An empty response with zero series cannot be considered verified LIVE telemetry
+      expect(batch.mode).toBe("DEGRADED");
+      expect(batch.metrics.length).toBe(0);
+      expect(batch.spans.length).toBe(0);
     });
   });
 });

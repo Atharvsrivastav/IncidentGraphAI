@@ -128,19 +128,33 @@ export class TelemetryManager {
       return this.buildDegradedOfflineObservedServices(dbServices, backendHealth);
     }
 
-    const [promMetrics, recentTraces] = await Promise.all([
+    // Query both Prometheus and Jaeger with diagnostics
+    const [promDiagnosticRes, traceDetailed, promMetrics] = await Promise.all([
+      prometheusClient.queryInstantDetailed("rate(http_requests_total[1m])", "REQUEST_RATE"),
+      jaegerClient.getRecentTracesDetailed(undefined, 30),
       prometheusClient.getServiceMetrics(),
-      jaegerClient.getRecentTraces(undefined, 30),
     ]);
 
-    if (promMetrics.size > 0 || recentTraces.length > 0) {
+    const promSuccess = promDiagnosticRes.success && promDiagnosticRes.diagnostic.status === "OK";
+    const tempoSuccess = traceDetailed.success && traceDetailed.diagnostic.status === "OK";
+    const hasData = promMetrics.size > 0 || traceDetailed.traces.length > 0;
+
+    // Truthful mode decision: requires BOTH providers to succeed and return real non-empty series
+    const isTrulyLive = promSuccess && tempoSuccess && hasData;
+    const effectiveMode: TelemetryMode = isTrulyLive ? "LIVE" : "DEGRADED";
+
+    if (isTrulyLive) {
       this.lastIngestedAt = new Date().toISOString();
     }
 
-    const effectiveMode: TelemetryMode =
-      backendHealth.prometheusAvailable && backendHealth.jaegerAvailable ? "LIVE" : "DEGRADED";
-
-    return this.buildLiveObservedServices(dbServices, backendHealth, effectiveMode, promMetrics, recentTraces);
+    return this.buildLiveObservedServices(
+      dbServices,
+      backendHealth,
+      effectiveMode,
+      promMetrics,
+      traceDetailed.traces,
+      hasData
+    );
   }
 
   private buildSimulatedObservedServices(
@@ -204,7 +218,8 @@ export class TelemetryManager {
     backendHealth: BackendHealthStatus,
     effectiveMode: TelemetryMode,
     promMetrics: Map<string, { latencyMs: number; errorRate: number; requestRate: number }>,
-    recentTraces: DistributedTrace[]
+    recentTraces: DistributedTrace[],
+    hasTelemetryData: boolean
   ) {
     const topologyIds = new Set(dbServices.map((s) => s.id));
     const traceCountByService = new Map<string, number>();
@@ -231,7 +246,7 @@ export class TelemetryManager {
           latencyMs: 0,
           errorRate: 0,
           requestRate: 0,
-          lastObserved: "No observations received",
+          lastObserved: hasTelemetryData ? "No observations received" : "Empty query response (No series matching)",
           traceCount: 0,
           isStale: true,
           isKnownInTopology: true,
@@ -294,20 +309,27 @@ export class TelemetryManager {
   }
 
   public async getNormalizedBatch(): Promise<NormalizedTelemetryBatch> {
-    const health = await this.getBackendHealth();
     const batchId = `batch-${Date.now()}`;
     const collectedAt = new Date().toISOString();
 
     const [promResult, traceResult] = await Promise.all([
-      prometheusClient.queryInstantDetailed("http_request_duration_seconds", "LATENCY_AVG"),
+      prometheusClient.queryInstantDetailed("rate(http_requests_total[1m])", "REQUEST_RATE"),
       jaegerClient.getRecentTracesDetailed(undefined, 25),
     ]);
 
     const diagnostics: ProviderDiagnostic[] = [promResult.diagnostic, traceResult.diagnostic];
 
+    const promOk = promResult.success && promResult.diagnostic.status === "OK";
+    const tempoOk = traceResult.success && traceResult.diagnostic.status === "OK";
+    const hasData = promResult.records.length > 0 || traceResult.normalizedSpans.length > 0;
+
     let mode: "SIMULATION" | "LIVE" | "DEGRADED" = "SIMULATION";
     if (this.currentMode === "LIVE" || this.currentMode === "REAL") {
-      mode = health.prometheusAvailable && health.jaegerAvailable ? "LIVE" : "DEGRADED";
+      const isTrulyLive = promOk && tempoOk && hasData;
+      mode = isTrulyLive ? "LIVE" : "DEGRADED";
+      if (isTrulyLive) {
+        this.lastIngestedAt = new Date().toISOString();
+      }
     }
 
     return {

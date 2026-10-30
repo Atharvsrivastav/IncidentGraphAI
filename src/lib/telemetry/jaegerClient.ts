@@ -16,8 +16,8 @@ interface RawJaegerSpan {
   spanID: string;
   operationName: string;
   references?: Array<{ refType: string; traceID: string; spanID: string }>;
-  startTime: number; // in microseconds
-  duration: number; // in microseconds
+  startTime: number;
+  duration: number;
   tags: RawJaegerTag[];
   process?: { serviceName: string };
   processID?: string;
@@ -99,9 +99,10 @@ export class JaegerClient {
 
   public async checkHealth(): Promise<{ available: boolean; isMock?: boolean; isCloud?: boolean; error?: string; errorCode?: TelemetryErrorCode }> {
     const start = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       const probePath = this.isCloud ? "/api/search?limit=1" : "/api/traces?limit=1";
       const url = `${this.baseUrl}${probePath}`;
 
@@ -109,7 +110,6 @@ export class JaegerClient {
         signal: controller.signal,
         headers: this.getRequestHeaders(),
       });
-      clearTimeout(timeout);
 
       if (res.status === 401 || res.status === 403) {
         return {
@@ -136,6 +136,7 @@ export class JaegerClient {
         };
       }
 
+      await res.json();
       const isMock = res.headers.get("x-observability-provider") === "mock-observability-server";
       return { available: true, isMock, isCloud: this.isCloud };
     } catch (err: unknown) {
@@ -148,16 +149,18 @@ export class JaegerClient {
         errorCode: isTimeout ? "TIMEOUT" : "UNAVAILABLE",
         error: isTimeout ? `Trace probe timed out after ${this.timeoutMs}ms` : "Trace endpoint unreachable",
       };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
   public async getRecentTracesDetailed(service?: string, limit: number = 20): Promise<TraceQueryDetailedResult> {
     const start = Date.now();
     const nowIso = new Date().toISOString();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       const url = this.isCloud
         ? `${this.baseUrl}/api/search?limit=${limit}${service ? `&tags=service.name=${encodeURIComponent(service)}` : ""}`
         : `${this.baseUrl}/api/traces?limit=${limit}${service ? `&service=${encodeURIComponent(service)}` : ""}`;
@@ -166,9 +169,8 @@ export class JaegerClient {
         signal: controller.signal,
         headers: this.getRequestHeaders(),
       });
-      clearTimeout(timeout);
-      const latencyMs = Date.now() - start;
 
+      const latencyMs = Date.now() - start;
       if (res.status === 401 || res.status === 403) {
         return this.createFailureResult(latencyMs, nowIso, "AUTH_FAILURE", `Authentication failed (${res.status})`);
       }
@@ -180,13 +182,25 @@ export class JaegerClient {
         return this.createFailureResult(latencyMs, nowIso, code, `Trace query failed with HTTP ${res.status}`);
       }
 
-      const json = await res.json();
-      let traces: DistributedTrace[] = [];
+      let json: { data?: RawJaegerTrace[]; traces?: TempoSearchTrace[] };
+      try {
+        json = await res.json();
+      } catch (err: unknown) {
+        if (
+          controller.signal.aborted ||
+          (err instanceof Error && err.name === "AbortError") ||
+          Date.now() - start >= this.timeoutMs
+        ) {
+          throw err;
+        }
+        return this.createFailureResult(latencyMs, nowIso, "MALFORMED_RESPONSE", "Invalid JSON payload in trace response");
+      }
 
+      let traces: DistributedTrace[] = [];
       if (Array.isArray(json.data)) {
-        traces = (json.data as RawJaegerTrace[]).map((raw) => this.parseTrace(raw));
+        traces = json.data.map((raw) => this.parseTrace(raw));
       } else if (Array.isArray(json.traces)) {
-        traces = (json.traces as TempoSearchTrace[]).map((t) => this.parseTempoSearchTrace(t));
+        traces = json.traces.map((t) => this.parseTempoSearchTrace(t));
       }
 
       const normalizedSpans: NormalizedTraceSpan[] = [];
@@ -211,13 +225,15 @@ export class JaegerClient {
       };
     } catch (err: unknown) {
       const latencyMs = Date.now() - start;
-      const isTimeout = latencyMs >= this.timeoutMs || (err instanceof Error && err.name === "AbortError");
+      const isTimeout = latencyMs >= this.timeoutMs || controller.signal.aborted || (err instanceof Error && err.name === "AbortError");
       return this.createFailureResult(
         latencyMs,
         nowIso,
         isTimeout ? "TIMEOUT" : "UNAVAILABLE",
         isTimeout ? `Trace query timed out after ${this.timeoutMs}ms` : "Trace request failed"
       );
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -249,16 +265,15 @@ export class JaegerClient {
   }
 
   public async getTraceById(traceId: string): Promise<DistributedTrace | null> {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-      const url = `${this.baseUrl}/api/traces/${encodeURIComponent(traceId)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
+    try {
+      const url = `${this.baseUrl}/api/traces/${encodeURIComponent(traceId)}`;
       const res = await fetch(url, {
         signal: controller.signal,
         headers: this.getRequestHeaders(),
       });
-      clearTimeout(timeout);
 
       if (!res.ok) return null;
       const json = await res.json();
@@ -272,6 +287,8 @@ export class JaegerClient {
       return null;
     } catch {
       return null;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -333,7 +350,7 @@ export class JaegerClient {
     };
   }
 
-  private parseTempoTraceDetail(json: Record<string, unknown>, traceId: string): DistributedTrace {
+  public parseTempoTraceDetail(json: Record<string, unknown>, traceId: string): DistributedTrace {
     const batches = (json.batches || json.resourceSpans) as Array<{
       resource?: { attributes?: Array<{ key: string; value: { stringValue?: string } }> };
       scopeSpans?: Array<{
@@ -403,21 +420,16 @@ export class JaegerClient {
       return this.createFallbackTrace(traceId);
     }
 
-    let rootSpan: TraceSpan | null = null;
-    for (const s of allSpans) {
-      if (s.parentSpanId && spanMap.has(s.parentSpanId)) {
-        spanMap.get(s.parentSpanId)!.children.push(s);
-      } else if (!rootSpan) {
-        rootSpan = s;
-      }
-    }
+    // Build hierarchy and assign depths
+    this.linkChildrenAndAssignDepths(allSpans, spanMap);
 
+    const rootSpan = allSpans.find((s) => s.depth === 0) || allSpans[0];
     return {
       traceId,
-      rootServiceName: rootSpan?.serviceName || allSpans[0].serviceName,
-      operationName: rootSpan?.operationName || allSpans[0].operationName,
+      rootServiceName: rootSpan.serviceName,
+      operationName: rootSpan.operationName,
       startTime: new Date(allSpans[0].startTimeUs / 1000).toISOString(),
-      durationMs: rootSpan?.durationMs || Math.max(...allSpans.map((s) => s.durationMs)),
+      durationMs: rootSpan.durationMs || Math.max(...allSpans.map((s) => s.durationMs)),
       totalSpans: allSpans.length,
       hasErrors,
       servicesInvolved: Array.from(services),
@@ -453,7 +465,7 @@ export class JaegerClient {
     };
   }
 
-  private parseTrace(raw: RawJaegerTrace): DistributedTrace {
+  public parseTrace(raw: RawJaegerTrace): DistributedTrace {
     const processMap = raw.processes || {};
     const spanMap = new Map<string, TraceSpan>();
     const allSpans: TraceSpan[] = [];
@@ -500,25 +512,9 @@ export class JaegerClient {
       allSpans.push(span);
     }
 
-    let rootSpan: TraceSpan | null = null;
-    for (const span of allSpans) {
-      if (span.parentSpanId && spanMap.has(span.parentSpanId)) {
-        spanMap.get(span.parentSpanId)!.children.push(span);
-      } else if (!rootSpan) {
-        rootSpan = span;
-      }
-    }
+    this.linkChildrenAndAssignDepths(allSpans, spanMap);
 
-    const setDepths = (node: TraceSpan, currentDepth: number) => {
-      node.depth = currentDepth;
-      for (const child of node.children) {
-        setDepths(child, currentDepth + 1);
-      }
-    };
-    if (rootSpan) {
-      setDepths(rootSpan, 0);
-    }
-
+    const rootSpan = allSpans.find((s) => s.depth === 0) || allSpans[0];
     const minStartTime = allSpans.reduce((min, s) => Math.min(min, s.startTimeUs), Infinity);
     const totalDurationMs = rootSpan?.durationMs || Math.max(...allSpans.map((s) => s.durationMs), 1);
 
@@ -534,6 +530,49 @@ export class JaegerClient {
       rootSpan,
       allSpans,
     };
+  }
+
+  /**
+   * Reconstructs parent-child span relations and calculates hierarchy depths.
+   * Gracefully handles missing parents (treated as roots) and prevents cyclic recursion.
+   */
+  private linkChildrenAndAssignDepths(allSpans: TraceSpan[], spanMap: Map<string, TraceSpan>): void {
+    // 1. Link children to parents
+    for (const span of allSpans) {
+      if (span.parentSpanId && spanMap.has(span.parentSpanId)) {
+        const parent = spanMap.get(span.parentSpanId)!;
+        if (!parent.children.some((c) => c.spanId === span.spanId)) {
+          parent.children.push(span);
+        }
+      }
+    }
+
+    // 2. Identify candidate roots (no parent or parent missing from trace)
+    const roots = allSpans.filter((s) => !s.parentSpanId || !spanMap.has(s.parentSpanId));
+
+    // 3. Traverse hierarchy with cycle prevention
+    const visited = new Set<string>();
+
+    const assignDepth = (node: TraceSpan, currentDepth: number) => {
+      if (visited.has(node.spanId)) return;
+      visited.add(node.spanId);
+      node.depth = currentDepth;
+
+      for (const child of node.children) {
+        assignDepth(child, currentDepth + 1);
+      }
+    };
+
+    for (const root of roots) {
+      assignDepth(root, 0);
+    }
+
+    // 4. Safe fallback for any cyclic or unvisited nodes
+    for (const span of allSpans) {
+      if (!visited.has(span.spanId)) {
+        span.depth = 0;
+      }
+    }
   }
 }
 
