@@ -59,6 +59,14 @@ jobs:
         run: |
           npm start &
           SERVER_PID=$!
+          cleanup() {
+            EXIT_CODE=$?
+            echo "Stopping Next.js server (PID: $SERVER_PID)..."
+            kill $SERVER_PID 2>/dev/null || true
+            exit $EXIT_CODE
+          }
+          trap cleanup EXIT INT TERM
+
           node -e '
             async function wait() {
               for (let i = 0; i < 30; i++) {
@@ -79,5 +87,5 @@ jobs:
             }
             wait();
           '
+
           npm run test:browser
-          kill $SERVER_PID || true

@@ -241,6 +241,7 @@ function IncidentDetailContent({
               return (
                 <div
                   key={cand.id}
+                  data-testid={`root-cause-candidate-${cand.candidateServiceId}`}
                   className={`rounded-2xl border p-6 transition-all ${
                     isTopRank
                       ? "border-purple-500/60 bg-gradient-to-r from-purple-950/20 via-slate-900/80 to-slate-900/90 shadow-xl"
@@ -251,6 +252,7 @@ function IncidentDetailContent({
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800/80">
                     <div className="flex items-center gap-3">
                       <div
+                        data-testid={`candidate-rank-${cand.candidateServiceId}`}
                         className={`flex h-9 w-9 items-center justify-center rounded-xl font-mono text-sm font-black ${
                           isTopRank
                             ? "bg-purple-600 text-white shadow-lg shadow-purple-600/40"
@@ -277,7 +279,10 @@ function IncidentDetailContent({
                         <span className="text-[10px] font-mono text-purple-400 block uppercase">
                           Heuristic Score
                         </span>
-                        <span className="text-sm font-black font-mono text-purple-300">
+                        <span
+                          data-testid={`candidate-score-${cand.candidateServiceId}`}
+                          className="text-sm font-black font-mono text-purple-300"
+                        >
                           {cand.score} / 100
                         </span>
                       </div>

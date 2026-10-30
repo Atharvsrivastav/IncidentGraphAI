@@ -140,21 +140,19 @@ async function runBrowserSuite() {
   }
 
   // Narrow, documented allowlist for genuinely expected failures
-  const ALLOWLISTED_PATTERNS = [
-    // Standard browser automatic probe for favicon when not explicitly declared
-    (entry) => entry.url?.includes('favicon.ico') && entry.status === 404,
-  ];
-
-  function isAllowlisted(entry) {
-    return ALLOWLISTED_PATTERNS.some((fn) => fn(entry));
-  }
+  // Documentation: Headless Chrome sends an automatic GET /favicon.ico probe on navigation.
+  // When no static favicon link tag exists, the server responds with standard HTTP 404.
+  const isAllowlistedHttpError = (entry) =>
+    entry.method === 'GET' && entry.url.endsWith('/favicon.ico') && entry.status === 404;
 
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
       const text = msg.text();
-      if (!text.includes('favicon.ico')) {
-        consoleErrors.push({ text, location: msg.location() });
+      // Only permit standard browser 404 resource failure for automatic /favicon.ico probe
+      if (text.includes('favicon.ico') && (text.includes('404') || text.includes('status of 404'))) {
+        return;
       }
+      consoleErrors.push({ text, location: msg.location() });
     }
   });
 
@@ -163,14 +161,11 @@ async function runBrowserSuite() {
   });
 
   page.on('requestfailed', (req) => {
-    const entry = {
+    networkFailures.push({
       method: req.method(),
       url: req.url(),
       errorText: req.failure()?.errorText || 'Unknown failure',
-    };
-    if (!entry.url.includes('favicon.ico')) {
-      networkFailures.push(entry);
-    }
+    });
   });
 
   page.on('response', (res) => {
@@ -182,7 +177,7 @@ async function runBrowserSuite() {
         status,
         statusText: res.statusText(),
       };
-      if (!isAllowlisted(entry)) {
+      if (!isAllowlistedHttpError(entry)) {
         httpErrors.push(entry);
       }
     }
@@ -368,15 +363,57 @@ async function runBrowserSuite() {
     // ----------------------------------------------------
     // TEST 4: Incidents List & Status Filtering
     // ----------------------------------------------------
+    // TEST 4: Incidents List & Filtering Proof
+    // ----------------------------------------------------
     console.log('\n--- 4. Testing Incidents List & Filtering ---');
     try {
+      // Precondition guarantee: ensure database includes at least one non-IDENTIFIED incident fixture
+      const preCheckRes = await fetch(`${BASE_URL}/api/incidents`);
+      assert(preCheckRes.ok, 'Failed to query /api/incidents for baseline fixture check');
+      const preCheckData = await preCheckRes.json();
+      const existingNonIdentified = (preCheckData.incidents || []).filter((inc) => inc.status !== 'IDENTIFIED');
+      if (existingNonIdentified.length === 0) {
+        // Create an isolated non-IDENTIFIED incident fixture
+        const fixtureRes = await fetch(`${BASE_URL}/api/incidents`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: 'Synthetic Non-Identified Triage Incident',
+            description: 'Deterministic test fixture created to verify status filtering exclusion',
+            severity: 'MEDIUM',
+          }),
+        });
+        assert(fixtureRes.ok, `Failed to create non-IDENTIFIED incident fixture: ${fixtureRes.status}`);
+        console.log('  Created isolated non-IDENTIFIED incident fixture for filter verification');
+      }
+
       await page.goto(`${BASE_URL}/incidents`, { waitUntil: 'domcontentloaded' });
 
       // Verify incident rows are displayed in the table
       await page.waitForSelector('table tbody tr', { timeout: 8000 });
-      const initialRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
-      console.log(`  Initial incidents table row count: ${initialRowCount}`);
-      assert(initialRowCount > 0, `Incidents table must have at least 1 row, found ${initialRowCount}`);
+
+      // Capture the initial incident IDs and statuses
+      const initialIncidents = await page.$$eval('table tbody tr', (rows) =>
+        rows.map((r) => ({
+          id: r.querySelector('td:nth-child(1) span')?.textContent?.trim() || '',
+          status: r.querySelector('td:nth-child(3)')?.textContent?.trim() || '',
+        }))
+      );
+      console.log(`  Initial incidents table rows count: ${initialIncidents.length}`);
+      assert(initialIncidents.length > 0, `Incidents table must have at least 1 row, found ${initialIncidents.length}`);
+
+      // Confirm baseline fixture includes at least one non-IDENTIFIED incident
+      const nonIdentifiedIncidents = initialIncidents.filter((inc) => !inc.status.includes('IDENTIFIED'));
+      assert(
+        nonIdentifiedIncidents.length > 0,
+        `Baseline fixture must include at least one non-IDENTIFIED incident, found: ${JSON.stringify(initialIncidents)}`
+      );
+
+      const identifiedBefore = initialIncidents.filter((inc) => inc.status.includes('IDENTIFIED'));
+      assert(
+        identifiedBefore.length > 0,
+        `Baseline fixture must include at least one IDENTIFIED incident, found: ${JSON.stringify(initialIncidents)}`
+      );
 
       // Verify the exact created incident link is present in the table
       assert(createdIncidentId !== null, 'createdIncidentId must exist before checking incidents table');
@@ -393,27 +430,47 @@ async function runBrowserSuite() {
       await page.waitForTimeout(400);
 
       // Verify the actual filtering result: every visible row must have status IDENTIFIED
-      const filteredRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
-      assert(filteredRowCount > 0, `Filtered table should contain at least 1 IDENTIFIED incident, found ${filteredRowCount}`);
-      assert(filteredRowCount <= initialRowCount, `Filtered row count (${filteredRowCount}) must be <= initial count (${initialRowCount})`);
-
-      const statuses = await page.$$eval('table tbody tr', (rows) =>
-        rows.map((r) => r.querySelector('td:nth-child(3)')?.textContent?.trim() || '')
+      const filteredIncidents = await page.$$eval('table tbody tr', (rows) =>
+        rows.map((r) => ({
+          id: r.querySelector('td:nth-child(1) span')?.textContent?.trim() || '',
+          status: r.querySelector('td:nth-child(3)')?.textContent?.trim() || '',
+        }))
       );
-      for (const st of statuses) {
-        assert(st.includes('IDENTIFIED'), `Every visible filtered row must have status IDENTIFIED, got "${st}"`);
+      assert(
+        filteredIncidents.length === identifiedBefore.length,
+        `Filtered row count (${filteredIncidents.length}) must match initial IDENTIFIED count (${identifiedBefore.length})`
+      );
+      for (const row of filteredIncidents) {
+        assert(row.status.includes('IDENTIFIED'), `Every visible filtered row must have status IDENTIFIED, got "${row.status}"`);
       }
-      console.log(`  Verified IDENTIFIED filter applied correctly (${filteredRowCount} rows match)`);
 
-      // Restore ALL filter and verify initial incident row count returns
+      // Verify at least one non-IDENTIFIED incident disappeared
+      const filteredIdSet = new Set(filteredIncidents.map((inc) => inc.id));
+      for (const nonId of nonIdentifiedIncidents) {
+        assert(
+          !filteredIdSet.has(nonId.id),
+          `Non-IDENTIFIED incident ${nonId.id} must disappear from table when filtering by IDENTIFIED`
+        );
+      }
+      console.log(
+        `  Verified IDENTIFIED filter applied correctly (${filteredIncidents.length} rows match; ${nonIdentifiedIncidents.length} non-IDENTIFIED rows filtered out)`
+      );
+
+      // Restore ALL filter and verify original incident ID set returns
       const allBtn = page.locator('button:text-is("ALL")').last();
       await allBtn.click();
       await page.waitForTimeout(300);
 
-      const restoredRowCount = await page.$$eval('table tbody tr', (rows) => rows.length);
-      assert(restoredRowCount === initialRowCount, `Restoring ALL should recover initial row count (${initialRowCount}), got ${restoredRowCount}`);
+      const restoredIncidentIds = await page.$$eval('table tbody tr', (rows) =>
+        rows.map((r) => r.querySelector('td:nth-child(1) span')?.textContent?.trim() || '')
+      );
+      const initialIds = initialIncidents.map((inc) => inc.id);
+      assert(
+        restoredIncidentIds.length === initialIds.length && initialIds.every((id) => restoredIncidentIds.includes(id)),
+        `Restoring ALL must recover exact initial incident ID set. Expected ${JSON.stringify(initialIds)}, got ${JSON.stringify(restoredIncidentIds)}`
+      );
       assert(await page.locator(exactLinkSelector).first().isVisible(), 'Exact incident link confirmed after filter reset');
-      console.log('  Reset filters via ALL pill; verified exact incident link present');
+      console.log('  Reset filters via ALL pill; verified original incident ID set returned');
 
       await captureScreenshot(page, '04_incidents_list_desktop.png');
       sectionResults.push({ name: '4. Incidents List & Filtering', status: 'passed' });
@@ -515,14 +572,34 @@ async function runBrowserSuite() {
         `  Re-Run DSA Root-Cause Engine response validated: candidate=${topCand.serviceId}, score=${topCand.score}, confidence=${topCand.confidence}`
       );
 
-      // Verify the resulting investigation data reflects the re-analysis operation in the UI
+      // Capture the candidate IDs and details returned by analysis.allCandidates
+      const returnedCandidates = analyzeData.analysis.allCandidates;
+      const expectedServiceIds = returnedCandidates.map((c) => c.serviceId);
+
+      // Return to the Ranked Root Causes tab
       await rootCausesTabLocator.first().click();
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(400);
       assert(await page.locator(`text=ID: ${createdIncidentId}`).first().isVisible(), 'Incident header remains confirmed after re-analysis');
-      assert(
-        (await page.$('text=PostgreSQL')) !== null || (await page.$('text=postgres-db')) !== null,
-        'Root cause candidates remain rendered following re-analysis'
-      );
+
+      // Assert that the returned analysis candidates are reflected in the rendered UI
+      for (const cand of returnedCandidates) {
+        const candidateCard = page.locator(`[data-testid="root-cause-candidate-${cand.serviceId}"]`).first();
+        await candidateCard.waitFor({ state: 'visible', timeout: 6000 });
+        assert(await candidateCard.isVisible(), `Rendered candidate card for service "${cand.serviceId}" must be visible`);
+
+        // Verify ranking order where the interface displays it
+        const rankLocator = page.locator(`[data-testid="candidate-rank-${cand.serviceId}"]`).first();
+        assert(await rankLocator.isVisible(), `Rank element for candidate "${cand.serviceId}" must be visible`);
+        const rankText = await rankLocator.textContent();
+        assert(rankText?.includes(`#${cand.rank}`), `Candidate "${cand.serviceId}" expected rank #${cand.rank}, got "${rankText}"`);
+
+        // Verify heuristic score where the interface displays it
+        const scoreLocator = page.locator(`[data-testid="candidate-score-${cand.serviceId}"]`).first();
+        assert(await scoreLocator.isVisible(), `Score element for candidate "${cand.serviceId}" must be visible`);
+        const scoreText = await scoreLocator.textContent();
+        assert(scoreText?.includes(`${cand.score}`), `Candidate "${cand.serviceId}" expected score ${cand.score}, got "${scoreText}"`);
+      }
+      console.log(`  Rendered UI verified: reflected ${returnedCandidates.length} analysis candidates in exact rank order: ${expectedServiceIds.join(', ')}`);
 
       await captureScreenshot(page, '05_incident_investigation_desktop.png');
       sectionResults.push({ name: '5. Incident Investigation Details', status: 'passed' });
@@ -544,29 +621,67 @@ async function runBrowserSuite() {
       await page.waitForSelector('text=Live Fleet Telemetry', { timeout: 8000 });
       assert(await page.locator('text=Live Fleet Telemetry').first().isVisible(), 'Live Fleet Telemetry section must be visible');
 
-      // Check for restore-eligible services (services with status DEGRADED or DOWN)
-      await page.waitForTimeout(500);
-      const restoreButtons = await page.$$('button:text-is("Restore")');
-      let targetRestoreBtn = null;
-      for (const btn of restoreButtons) {
-        if (!(await btn.isDisabled())) {
-          targetRestoreBtn = btn;
-          break;
-        }
-      }
+      // Wait for service rows to appear
+      await page.waitForSelector('tr[data-testid^="service-row-"]', { timeout: 8000 });
 
-      if (targetRestoreBtn) {
-        // Assert restore API response is successful
+      // Identify restore-eligible service (DEGRADED or DOWN)
+      const serviceRows = await page.$$eval('tr[data-testid^="service-row-"]', (rows) =>
+        rows.map((r) => {
+          const testId = r.getAttribute('data-testid') || '';
+          const id = testId.replace('service-row-', '');
+          const statusEl = r.querySelector('[data-testid^="service-status-"]');
+          const status = statusEl?.textContent?.trim() || '';
+          return { id, status };
+        })
+      );
+
+      const degradedService = serviceRows.find((s) => s.status === 'DEGRADED' || s.status === 'DOWN');
+
+      if (degradedService) {
+        const targetServiceId = degradedService.id;
+        const initialStatus = degradedService.status;
+        console.log(`  Identified restore-eligible service: "${targetServiceId}" (initial status: ${initialStatus})`);
+
+        // Confirm initial status is DEGRADED or DOWN
+        assert(
+          initialStatus === 'DEGRADED' || initialStatus === 'DOWN',
+          `Target service must initially be DEGRADED or DOWN, got: ${initialStatus}`
+        );
+
+        // Locate restore button for the target service
+        const restoreBtn = page.locator(`[data-testid="restore-service-btn-${targetServiceId}"]`);
+        await restoreBtn.waitFor({ state: 'visible', timeout: 5000 });
+        assert(await restoreBtn.isVisible(), `Restore button for ${targetServiceId} must be visible`);
+        assert(!(await restoreBtn.isDisabled()), `Restore button for ${targetServiceId} must be enabled`);
+
+        // Perform restoration and assert POST response is successful
         const [restoreResponse] = await Promise.all([
           page.waitForResponse(
-            (res) => res.url().includes('/api/services/') && res.url().endsWith('/restore') && res.request().method() === 'POST',
+            (res) => res.url().includes(`/api/services/${targetServiceId}/restore`) && res.request().method() === 'POST',
             { timeout: 10000 }
           ),
-          targetRestoreBtn.click(),
+          restoreBtn.click(),
         ]);
         assert(restoreResponse.ok(), `Service restore API returned non-OK status ${restoreResponse.status()}`);
-        console.log('  Restored degraded service via API: 200 OK');
-        await page.waitForTimeout(800);
+
+        // Wait for the actual service data/UI to update
+        const statusLocator = page.locator(`[data-testid="service-status-${targetServiceId}"]`);
+        await page.waitForFunction(
+          (svcId) => {
+            const el = document.querySelector(`[data-testid="service-status-${svcId}"]`);
+            return el && el.textContent.includes('HEALTHY');
+          },
+          targetServiceId,
+          { timeout: 10000 }
+        );
+
+        // Verify that the same service ID now reports HEALTHY
+        const finalStatus = (await statusLocator.textContent())?.trim();
+        assert(
+          finalStatus?.includes('HEALTHY'),
+          `Service "${targetServiceId}" expected status HEALTHY after restoration, got "${finalStatus}"`
+        );
+        console.log(`  Service "${targetServiceId}" successfully transitioned from ${initialStatus} -> HEALTHY`);
         sectionResults.push({ name: '6. Simulator Service Restoration & Reset', status: 'passed' });
       } else {
         // If the environment intentionally has no restore-eligible service, explicitly classify this as SKIPPED rather than PASSED
@@ -574,20 +689,40 @@ async function runBrowserSuite() {
         sectionResults.push({
           name: '6. Simulator Service Restoration & Reset',
           status: 'skipped',
-          skipReason: 'No restore-eligible service found in current simulator state',
+          skipReason: 'No restore-eligible (DEGRADED/DOWN) services found in current simulator fleet',
         });
       }
 
-      // Preserve safe behavior for protected database reset controls
-      const finalResetBtn = page.locator('button:has-text("Reset Baseline")').first();
-      if (await finalResetBtn.isVisible().catch(() => false)) {
-        if (!(await finalResetBtn.isDisabled())) {
-          await finalResetBtn.click();
-          console.log('  Clicked "Reset Baseline" button');
+      // Check simulator baseline reset control without swallowing errors
+      const resetBaselineBtn = page.locator('[data-testid="reset-baseline-btn"]');
+      const isResetBaselineVisible = await resetBaselineBtn.isVisible();
+
+      if (isResetBaselineVisible) {
+        const isResetDisabled = await resetBaselineBtn.isDisabled();
+        if (!isResetDisabled) {
+          const [resetResponse] = await Promise.all([
+            page.waitForResponse(
+              (res) => res.url().includes('/api/simulations/reset') && res.request().method() === 'POST',
+              { timeout: 10000 }
+            ),
+            resetBaselineBtn.click(),
+          ]);
+          assert(resetResponse.ok(), `POST /api/simulations/reset failed with status ${resetResponse.status()}`);
           await page.waitForTimeout(1000);
+
+          const stateRes = await fetch(`${BASE_URL}/api/simulations/state`);
+          assert(stateRes.ok, 'Failed to fetch simulation state after baseline reset');
+          const stateData = await stateRes.json();
+          assert(
+            stateData.state?.status === 'IDLE' || stateData.state?.currentStep === 0,
+            `Expected simulation state to be reset (IDLE or step 0), got: ${JSON.stringify(stateData.state)}`
+          );
+          console.log('  Reset Baseline executed and verified: baseline state restored successfully');
         } else {
-          console.log('  Reset Baseline button is disabled in current state (safe)');
+          console.log('  Reset Baseline control is disabled in current simulator state');
         }
+      } else {
+        console.log('  Reset Baseline control unavailable: protected/hidden in production environment (!canReset)');
       }
 
       await captureScreenshot(page, '06_simulator_restored_desktop.png');

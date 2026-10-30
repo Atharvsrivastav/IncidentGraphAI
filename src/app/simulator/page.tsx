@@ -199,6 +199,7 @@ export default function SimulatorPage() {
             <button
               onClick={handleReset}
               disabled={actionInProgress}
+              data-testid="reset-baseline-btn"
               className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 px-4 py-2.5 text-xs font-bold text-slate-200 transition-colors"
             >
               <RotateCcw className="h-4 w-4" />
@@ -350,7 +351,7 @@ export default function SimulatorPage() {
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-sans">
               {services.map((svc) => (
-                <tr key={svc.id} className="hover:bg-slate-800/30 transition-colors">
+                <tr key={svc.id} data-testid={`service-row-${svc.id}`} className="hover:bg-slate-800/30 transition-colors">
                   <td className="py-3 px-3 font-semibold text-slate-200">
                     <div>{svc.name}</div>
                     <span className="font-mono text-[10px] text-slate-400">{svc.id}</span>
@@ -358,6 +359,7 @@ export default function SimulatorPage() {
                   <td className="py-3 px-3 font-mono text-slate-400">Tier {svc.tier}</td>
                   <td className="py-3 px-3">
                     <span
+                      data-testid={`service-status-${svc.id}`}
                       className={`rounded px-2 py-0.5 font-mono text-[10px] font-bold ${
                         svc.status === "DOWN"
                           ? "bg-rose-500/20 text-rose-400 border border-rose-500/30"
@@ -406,6 +408,7 @@ export default function SimulatorPage() {
                   </td>
                   <td className="py-3 px-3 text-right">
                     <button
+                      data-testid={`restore-service-btn-${svc.id}`}
                       onClick={() => handleRestoreService(svc.id)}
                       disabled={actionInProgress || svc.status === "HEALTHY"}
                       className="rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 px-3 py-1 text-[11px] font-medium text-blue-400 hover:text-white transition-colors"
