@@ -1,6 +1,7 @@
 import { chromium } from 'playwright-core';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 
@@ -1046,7 +1047,16 @@ async function runBrowserSuite() {
   process.exit(exitCode);
 }
 
-runBrowserSuite().catch((err) => {
-  console.error('Fatal execution error:', err);
-  process.exit(1);
-});
+export { verifyServerAvailable, runBrowserSuite };
+
+const isMain = process.argv[1] && (
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) ||
+  import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'))
+);
+
+if (isMain) {
+  runBrowserSuite().catch((err) => {
+    console.error('Fatal execution error:', err);
+    process.exit(1);
+  });
+}
