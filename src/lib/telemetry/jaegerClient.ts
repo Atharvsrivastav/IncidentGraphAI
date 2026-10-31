@@ -335,6 +335,12 @@ export class JaegerClient {
     if (!trace) {
       return { valid: false, reason: "No trace returned from backend" };
     }
+    if (trace.isSearchSummary) {
+      return {
+        valid: false,
+        reason: "Search-derived summary traces cannot be accepted for strict verification; full trace detail must be retrieved",
+      };
+    }
     if (trace.isFallback) {
       return { valid: false, reason: "Backend returned fallback trace; no actual span data exists in backend" };
     }
@@ -470,6 +476,7 @@ export class JaegerClient {
       rootSpan,
       allSpans,
       isFallback: !hasRealSpans,
+      isSearchSummary: true,
     };
   }
 

@@ -228,6 +228,15 @@ export function generatePrometheusConfig(options: PrometheusConfigOptions = {}):
     "  - job_name: 'prometheus'",
     "    static_configs:",
     "      - targets: ['localhost:9090']",
+    "",
+    "  # Dynamic file-based target discovery for disposable test verification services",
+    "  - job_name: 'order-service-dynamic'",
+    "    scrape_interval: 1s",
+    "    file_sd_configs:",
+    "      - files:",
+    "          - '/etc/prometheus/file_sd/*.json'",
+    "          - './docker/file_sd/*.json'",
+    "        refresh_interval: 1s",
   ];
 
   if (isRemoteWriteRequested && remoteWriteUrl && remoteWriteToken) {

@@ -74,10 +74,36 @@ export class PrometheusRegistry {
   }
 
   public static readonly MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS = 100;
-  private activeSyntheticIds = new Set<string>();
+  public static readonly DEFAULT_SYNTHETIC_ID_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  private syntheticIdTtlMs: number = PrometheusRegistry.DEFAULT_SYNTHETIC_ID_TTL_MS;
+  private activeSyntheticIds = new Map<string, number>();
 
-  public getActiveSyntheticVerificationIds(): string[] {
-    return Array.from(this.activeSyntheticIds);
+  public setSyntheticIdTtlMs(ttlMs: number): void {
+    if (typeof ttlMs !== "number" || isNaN(ttlMs) || ttlMs <= 0) {
+      throw new Error(`Invalid TTL ms: ${ttlMs}`);
+    }
+    this.syntheticIdTtlMs = ttlMs;
+  }
+
+  public getSyntheticIdTtlMs(): number {
+    return this.syntheticIdTtlMs;
+  }
+
+  public pruneExpiredSyntheticIds(nowMs: number = Date.now(), customTtlMs?: number): number {
+    const ttl = customTtlMs ?? this.syntheticIdTtlMs;
+    let prunedCount = 0;
+    for (const [id, registeredAt] of Array.from(this.activeSyntheticIds.entries())) {
+      if (nowMs - registeredAt >= ttl) {
+        this.clearSyntheticVerificationId(id);
+        prunedCount++;
+      }
+    }
+    return prunedCount;
+  }
+
+  public getActiveSyntheticVerificationIds(nowMs: number = Date.now()): string[] {
+    this.pruneExpiredSyntheticIds(nowMs);
+    return Array.from(this.activeSyntheticIds.keys());
   }
 
   public clearSyntheticVerificationIds(): void {
@@ -112,12 +138,14 @@ export class PrometheusRegistry {
 
     if (attributes?.verification_id) {
       const vId = String(attributes.verification_id).trim();
+      const now = typeof attributes._recordTimeMs === "number" ? attributes._recordTimeMs : Date.now();
+      this.pruneExpiredSyntheticIds(now);
       if (!this.activeSyntheticIds.has(vId) && this.activeSyntheticIds.size >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
         throw new Error(
           `Synthetic verification ID cardinality ceiling (${PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS}) reached. Cannot register new verification ID until existing IDs are expired or cleaned up.`
         );
       }
-      this.activeSyntheticIds.add(vId);
+      this.activeSyntheticIds.set(vId, now);
     }
 
     const extraVerification = attributes?.verification_id
@@ -226,9 +254,12 @@ export interface ServiceTelemetry {
   otlpTargetUrl: string;
   registry: PrometheusRegistry;
   recordSyntheticMetric: (verificationId: string, count?: number, status?: string) => void;
-  getActiveSyntheticVerificationIds: () => string[];
+  getActiveSyntheticVerificationIds: (nowMs?: number) => string[];
   clearSyntheticVerificationIds: () => void;
   clearSyntheticVerificationId: (verificationId: string) => boolean;
+  pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => number;
+  setSyntheticIdTtlMs: (ttlMs: number) => void;
+  getSyntheticIdTtlMs: () => number;
   getPrometheusMetrics: () => string;
   handleMetricsRequest: (res: import("http").ServerResponse) => void;
   setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
@@ -467,6 +498,7 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     const vId = verificationId.trim();
 
     // Cardinality check before modifying either PrometheusRegistry or OpenTelemetry
+    registry.pruneExpiredSyntheticIds();
     const activeIds = registry.getActiveSyntheticVerificationIds();
     if (!activeIds.includes(vId) && activeIds.length >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
       throw new Error(
@@ -483,10 +515,9 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     });
     try {
       rawRequestCounter.add(count, {
+        service: serviceName,
         method: "POST",
         route: "/test/synthetic",
-        status_code: 200,
-        verification_id: vId,
         status: safeStatus,
       });
     } catch (err: unknown) {
@@ -572,9 +603,12 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     otlpTargetUrl: traceUrl,
     registry,
     recordSyntheticMetric,
-    getActiveSyntheticVerificationIds: () => registry.getActiveSyntheticVerificationIds(),
+    getActiveSyntheticVerificationIds: (nowMs?: number) => registry.getActiveSyntheticVerificationIds(nowMs),
     clearSyntheticVerificationIds: () => registry.clearSyntheticVerificationIds(),
     clearSyntheticVerificationId: (id: string) => registry.clearSyntheticVerificationId(id),
+    pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => registry.pruneExpiredSyntheticIds(nowMs, customTtlMs),
+    setSyntheticIdTtlMs: (ttlMs: number) => registry.setSyntheticIdTtlMs(ttlMs),
+    getSyntheticIdTtlMs: () => registry.getSyntheticIdTtlMs(),
     getPrometheusMetrics,
     handleMetricsRequest,
     setHealthStatus,

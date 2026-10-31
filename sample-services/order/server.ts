@@ -4,12 +4,12 @@ import { initServiceTelemetry } from "../shared/telemetry";
 import { SamplePostgresClient } from "../shared/database";
 import { SpanStatusCode, context } from "@opentelemetry/api";
 
-function safeTokenEquals(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+export function safeTokenEquals(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const hashA = crypto.createHash("sha256").update(a).digest();
+  const hashB = crypto.createHash("sha256").update(b).digest();
+  const match = crypto.timingSafeEqual(hashA, hashB);
+  return match && a.trim().length > 0 && b.trim().length > 0;
 }
 
 const PORT = Number(process.env.SAMPLE_ORDER_PORT) || 4001;
@@ -319,27 +319,65 @@ export function createOrderServer(activeTelemetry = telemetry): http.Server {
           return;
         }
 
+        // Payload size protection: max 1024 bytes
+        const contentLength = Number(req.headers["content-length"]);
+        if (Number.isFinite(contentLength) && contentLength > 1024) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+          return;
+        }
+
         let body = "";
+        let bodyLength = 0;
         for await (const chunk of req) {
+          bodyLength += chunk.length;
+          if (bodyLength > 1024) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+            return;
+          }
           body += chunk;
         }
+
         let parsedBody: Record<string, unknown> = {};
         if (body.trim().length > 0) {
           try {
             parsedBody = JSON.parse(body);
           } catch {
-            // Ignore parse error on optional body
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON payload" }));
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON");
+            return;
+          }
+          if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Payload must be a JSON object" }));
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON object");
+            return;
           }
         }
 
-        const targetId = url.searchParams.get("verification_id") ||
+        const VERIFICATION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+        const rawTargetId = url.searchParams.get("verification_id") ||
           (typeof parsedBody.verification_id === "string" ? parsedBody.verification_id.trim() : undefined);
 
-        if (targetId) {
+        if (rawTargetId !== undefined) {
+          const targetId = rawTargetId.trim();
+          if (!VERIFICATION_ID_REGEX.test(targetId)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: "Invalid verification_id: must be 8-64 alphanumeric, underscore, or dash characters",
+            }));
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid verification ID");
+            return;
+          }
           const removed = activeTelemetry.clearSyntheticVerificationId(targetId);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, removed, verification_id: targetId }));
         } else {
+          // Clear only synthetic verification IDs (never touch standard metrics)
           activeTelemetry.clearSyntheticVerificationIds();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, clearedAll: true }));

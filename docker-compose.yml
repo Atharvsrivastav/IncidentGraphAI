@@ -63,6 +63,7 @@ services:
         fi
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/file_sd:/etc/prometheus/file_sd
     ports:
       - "9090:9090" # Prometheus Web UI & PromQL Query API
     depends_on:

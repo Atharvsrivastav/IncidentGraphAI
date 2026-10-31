@@ -7,7 +7,7 @@
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Neon Database](https://img.shields.io/badge/Neon-PostgreSQL%20Serverless-00E599?logo=postgresql&logoColor=white)](https://neon.tech/)
-[![Tests](https://img.shields.io/badge/Vitest-300%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Vitest-321%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Benchmark](https://img.shields.io/badge/Benchmark-117%2F117%20Passed-blueviolet)](docs/ROOT_CAUSE_BENCHMARK.md)
 [![Recruiter Demo](https://img.shields.io/badge/Recruiter%20Demo-3%20Min%20Walkthrough-success)](docs/RECRUITER_DEMO.md)
 
@@ -500,11 +500,11 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 
 | Check | Command | Description | Status |
 |---|---|---|---|
-| **Unit & Integration Tests** | `npm test` | Runs 280 Vitest tests across 11 suites covering graph algorithms, heap priority, OpenTelemetry pipelines, telemetry provenance, and AI investigation | **280 / 280 Passing (100%)** |
+| **Unit & Integration Tests** | `npm test` | Runs 321 Vitest tests across 11 suites covering graph algorithms, heap priority, OpenTelemetry pipelines, telemetry provenance, child-process isolation, and AI investigation | **321 / 321 Passing (100%)** |
 | **Algorithmic Benchmark** | `npm run test:benchmark` | Evaluates graph traversal, cycle detection, PriorityQueue, sliding window, and RCA scoring heuristics | **22 / 22 Passing (100%)** |
 | **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology families (distinct from the 7 interactive failure scenarios in the simulator; results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Suite Scenarios Passing Acceptance Criteria (100% Top-1 / Top-3 on 65 Evaluable Failures)** |
 | **Browser E2E Automation** | `npm run test:browser` | Headless Chrome browser automation with isolated database and port lifecycle management | **9 / 9 Sections Passing (129 Assertions)** |
-| **Live Observability Smoke Test** | `npm run test:observability:live` | Genuine live external verification against Grafana Cloud OTLP, Prometheus Mimir, and Tempo | **Strict External Read-Back Verified** |
+| **Live Observability Smoke Test** | `npm run test:observability:live` | Rigorous 3-path live external verification runner against Grafana Cloud OTLP, Prometheus Mimir, and Tempo | **Path A Verified (OTLP); Path B/C Pending Backend/Storage** |
 | **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |

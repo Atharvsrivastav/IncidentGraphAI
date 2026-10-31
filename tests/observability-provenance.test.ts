@@ -6,6 +6,7 @@ import { mergeServiceMetrics, ServiceMapItem } from "@/lib/telemetry/mergeServic
 import { ObservedServiceMetric, DistributedTrace } from "@/lib/telemetry/types";
 import { PrometheusRegistry, sanitizeErrorMessage } from "../sample-services/shared/telemetry";
 import http from "http";
+import fs from "fs";
 import {
   validateRemoteWriteConfig,
   generatePrometheusConfig,
@@ -16,6 +17,7 @@ import {
   resetOrderFault,
   telemetry as orderTelemetry,
   server as orderServer,
+  safeTokenEquals,
 } from "../sample-services/order/server";
 import { startDisposableOrderService } from "../scripts/verify-live-observability";
 import YAML from "yaml";
@@ -2352,6 +2354,528 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       const res3 = validateGeneratedYaml(noScrape);
       expect(res3.valid).toBe(false);
       expect(res3.error).toContain("scrape_configs");
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.5: Final Telemetry Verification Integrity & Isolation
+  // =========================================================================
+
+  // 1. Tempo Search-Fallback Verification Bypass & Candidate Discovery
+  describe("Phase 2.5: Tempo Search-Fallback Verification Bypass & Candidate Discovery", () => {
+    const client = new JaegerClient();
+    const testTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const testVerificationId = "verify_tempo_2_5_abc";
+
+    it("search result with trace ID and span IDs cannot directly pass strict verification", () => {
+      // Raw Tempo search-trace summary object
+      const searchSummaryTrace: DistributedTrace = {
+        traceId: testTraceId,
+        rootServiceName: "order-service",
+        operationName: "HTTP POST /orders",
+        startTime: new Date().toISOString(),
+        durationMs: 45,
+        totalSpans: 2,
+        hasErrors: false,
+        servicesInvolved: ["order-service"],
+        rootSpan: null,
+        allSpans: [
+          {
+            spanId: "span111111111111",
+            traceId: testTraceId, // derived from summary
+            operationName: "HTTP POST /orders",
+            serviceName: "order-service",
+            startTimeUs: Date.now() * 1000,
+            durationMs: 45,
+            statusCode: "OK",
+            attributes: { "verification.id": testVerificationId },
+            depth: 0,
+            children: [],
+          },
+        ],
+        isFallback: false,
+        isSearchSummary: true, // Marked as search-derived summary
+      };
+
+      const outcome = client.verifyLiveTrace(searchSummaryTrace, testTraceId, testVerificationId);
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("Search-derived summary traces cannot be accepted");
+    });
+
+    it("search result can locate a candidate trace ID, followed by successful full detail retrieval and validation", () => {
+      // 1. Search candidate has trace ID
+      const candidateTraceId = testTraceId;
+
+      // 2. Full backend detail payload retrieved using candidate ID
+      const fullBackendDetailPayload = {
+        traceID: candidateTraceId,
+        batches: [
+          {
+            traceID: candidateTraceId,
+            resource: {
+              attributes: [{ key: "service.name", value: { stringValue: "order-service" } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceID: candidateTraceId,
+                    spanID: "span_full_detail_1",
+                    name: "HTTP POST /orders",
+                    startTimeUnixNano: "1700000000000000000",
+                    endTimeUnixNano: "1700000000050000000",
+                    status: { code: 1 },
+                    attributes: [
+                      { key: "verification.id", value: { stringValue: testVerificationId } },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const parsedFull = client.parseTempoTraceDetail(fullBackendDetailPayload, candidateTraceId, { allowFallback: false });
+      expect(parsedFull).not.toBeNull();
+      expect(parsedFull?.isSearchSummary).toBeFalsy();
+
+      const verifyOutcome = client.verifyLiveTrace(parsedFull, testTraceId, testVerificationId);
+      expect(verifyOutcome.valid).toBe(true);
+    });
+
+    it("rejects full detail response when root trace ID is missing", () => {
+      const payload = {
+        batches: [
+          {
+            traceID: testTraceId,
+            scopeSpans: [
+              {
+                spans: [{ traceID: testTraceId, spanID: "s1" }],
+              },
+            ],
+          },
+        ],
+      };
+      const res = client.parseTempoTraceDetail(payload, testTraceId, { allowFallback: false });
+      expect(res).toBeNull();
+    });
+
+    it("rejects full detail response when individual span trace ID is missing", () => {
+      const payload = {
+        traceID: testTraceId,
+        batches: [
+          {
+            traceID: testTraceId,
+            scopeSpans: [
+              {
+                spans: [{ spanID: "s1" }], // Missing span traceID
+              },
+            ],
+          },
+        ],
+      };
+      const res = client.parseTempoTraceDetail(payload, testTraceId, { allowFallback: false });
+      expect(res).toBeNull();
+    });
+
+    it("rejects full detail response with conflicting root, batch, or span identifiers", () => {
+      const payload = {
+        traceID: testTraceId,
+        batches: [
+          {
+            traceID: "different_batch_id_9999",
+            scopeSpans: [
+              {
+                spans: [{ traceID: testTraceId, spanID: "s1" }],
+              },
+            ],
+          },
+        ],
+      };
+      const res = client.parseTempoTraceDetail(payload, testTraceId, { allowFallback: false });
+      expect(res).toBeNull();
+    });
+
+    it("rejects full detail response with conflicting traceId and traceID aliases", () => {
+      const payload = {
+        traceID: testTraceId,
+        traceId: "conflicting_alias_trace_id_8888",
+        batches: [],
+      };
+      const res = client.parseTempoTraceDetail(payload, testTraceId, { allowFallback: false });
+      expect(res).toBeNull();
+    });
+
+    it("accepts valid full backend detail response", () => {
+      const payload = {
+        traceID: testTraceId,
+        batches: [
+          {
+            traceID: testTraceId,
+            scopeSpans: [
+              {
+                spans: [{ traceID: testTraceId, spanID: "s_valid_1" }],
+              },
+            ],
+          },
+        ],
+      };
+      const res = client.parseTempoTraceDetail(payload, testTraceId, { allowFallback: false });
+      expect(res).not.toBeNull();
+      expect(res?.traceId).toBe(testTraceId);
+      expect(res?.allSpans.length).toBe(1);
+    });
+
+    it("preserves fallback dashboard parsing without being accepted by live verification", () => {
+      const emptyPayload = {};
+      const fallbackTrace = client.parseTempoTraceDetail(emptyPayload, testTraceId, { allowFallback: true });
+      expect(fallbackTrace).not.toBeNull();
+      expect(fallbackTrace?.isFallback).toBe(true);
+
+      const outcome = client.verifyLiveTrace(fallbackTrace, testTraceId, testVerificationId);
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("fallback trace");
+    });
+  });
+
+  // 2. Bounded OpenTelemetry & Deterministic Prometheus TTL Cardinality
+  describe("Phase 2.5: Bounded OpenTelemetry & Deterministic Prometheus TTL Cardinality", () => {
+    it("accepts exactly 100 active IDs and rejects the 101st unique active ID", () => {
+      const registry = new PrometheusRegistry("test-service-cardinality");
+
+      for (let i = 1; i <= 100; i++) {
+        registry.recordRequest(1, {
+          verification_id: `v_unique_id_${String(i).padStart(3, "0")}`,
+          status: "200",
+        });
+      }
+      expect(registry.getActiveSyntheticVerificationIds().length).toBe(100);
+
+      expect(() => {
+        registry.recordRequest(1, {
+          verification_id: "v_unique_id_101",
+          status: "200",
+        });
+      }).toThrow(/cardinality ceiling \(100\) reached/);
+    });
+
+    it("repeated use of an existing active ID does not consume extra capacity", () => {
+      const registry = new PrometheusRegistry("test-service-repeated");
+
+      for (let i = 1; i <= 100; i++) {
+        registry.recordRequest(1, {
+          verification_id: `v_rep_id_${String(i).padStart(3, "0")}`,
+        });
+      }
+
+      // Record on already registered ID 50
+      expect(() => {
+        registry.recordRequest(5, {
+          verification_id: "v_rep_id_050",
+        });
+      }).not.toThrow();
+      expect(registry.getActiveSyntheticVerificationIds().length).toBe(100);
+    });
+
+    it("deterministic TTL expiry releases capacity for new registrations", () => {
+      const registry = new PrometheusRegistry("test-service-ttl");
+      const baseTime = 1000000;
+
+      // Fill 100 IDs at baseTime
+      for (let i = 1; i <= 100; i++) {
+        registry.recordRequest(1, {
+          verification_id: `v_ttl_id_${String(i).padStart(3, "0")}`,
+          _recordTimeMs: baseTime,
+        } as unknown as Record<string, unknown>);
+      }
+      expect(registry.getActiveSyntheticVerificationIds(baseTime).length).toBe(100);
+
+      // Fast forward past default TTL (5 minutes = 300,000ms)
+      const futureTime = baseTime + 301000;
+      const pruned = registry.pruneExpiredSyntheticIds(futureTime);
+      expect(pruned).toBe(100);
+      expect(registry.getActiveSyntheticVerificationIds(futureTime).length).toBe(0);
+
+      // Now registering a new unique ID succeeds
+      expect(() => {
+        registry.recordRequest(1, {
+          verification_id: "v_ttl_new_after_expire",
+          _recordTimeMs: futureTime,
+        } as unknown as Record<string, unknown>);
+      }).not.toThrow();
+      expect(registry.getActiveSyntheticVerificationIds(futureTime).length).toBe(1);
+    });
+
+    it("manual cleanup releases custom registry capacity and allows re-registering", () => {
+      const registry = new PrometheusRegistry("test-service-manual-clean");
+
+      for (let i = 1; i <= 100; i++) {
+        registry.recordRequest(1, {
+          verification_id: `v_manual_${String(i).padStart(3, "0")}`,
+        });
+      }
+      expect(registry.getActiveSyntheticVerificationIds().length).toBe(100);
+
+      // Clear single ID
+      const removed = registry.clearSyntheticVerificationId("v_manual_042");
+      expect(removed).toBe(true);
+      expect(registry.getActiveSyntheticVerificationIds().length).toBe(99);
+
+      // Register new unique ID
+      expect(() => {
+        registry.recordRequest(1, { verification_id: "v_manual_new_registered" });
+      }).not.toThrow();
+      expect(registry.getActiveSyntheticVerificationIds().length).toBe(100);
+
+      // Re-registering the previously cleared ID after clearing another
+      registry.clearSyntheticVerificationId("v_manual_001");
+      expect(() => {
+        registry.recordRequest(1, { verification_id: "v_manual_042" });
+      }).not.toThrow();
+    });
+
+    it("repeated register and cleanup cycles do not leak into OpenTelemetry metrics", () => {
+      // Verify that Prometheus registry contains exact verification_id label
+      // while OpenTelemetry counter uses bounded stable dimensions
+      const registry = new PrometheusRegistry("test-service-otel-bounds");
+
+      registry.recordRequest(1, {
+        verification_id: "v_exact_label_123",
+        status: "200",
+      });
+
+      const promFormat = registry.toPrometheusFormat();
+      expect(promFormat).toContain('verification_id="v_exact_label_123"');
+
+      // Clear releases Prometheus registry capacity
+      registry.clearSyntheticVerificationId("v_exact_label_123");
+      const clearedPromFormat = registry.toPrometheusFormat();
+      expect(clearedPromFormat).not.toContain('verification_id="v_exact_label_123"');
+    });
+  });
+
+  // 3. Dynamic-Port Prometheus Scrape & File-SD Integration
+  describe("Phase 2.5: Dynamic-Port Prometheus Scrape & File-SD Integration", () => {
+    it("generates Prometheus configuration containing order-service-dynamic job with file_sd_configs", () => {
+      const yamlStr = generatePrometheusConfig();
+      const parsed = YAML.parse(yamlStr);
+
+      const dynamicJob = parsed.scrape_configs.find(
+        (c: { job_name: string }) => c.job_name === "order-service-dynamic"
+      );
+      expect(dynamicJob).toBeDefined();
+      expect(dynamicJob.file_sd_configs).toBeDefined();
+      expect(dynamicJob.file_sd_configs.length).toBeGreaterThan(0);
+      expect(dynamicJob.file_sd_configs[0].files).toContain("/etc/prometheus/file_sd/*.json");
+    });
+  });
+
+  // 4. Real Process Isolation for Disposable Order Service
+  describe("Phase 2.5: Real Process Isolation for Disposable Order Service", () => {
+    it("runs disposable service in isolated child process without mutating parent process.env", async () => {
+      delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+      delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+
+      const ephemeralToken = "isolated_test_token_phase_2_5_abc";
+      const disposable = await startDisposableOrderService({
+        token: ephemeralToken,
+        registerPrometheusTarget: true,
+      });
+
+      try {
+        // 1. Parent process.env is NEVER modified
+        expect(process.env.ENABLE_TEST_METRIC_ENDPOINT).toBeUndefined();
+        expect(process.env.TEST_METRIC_ENDPOINT_TOKEN).toBeUndefined();
+
+        // 2. Child process received its own token and responds
+        expect(disposable.port).toBeGreaterThan(0);
+        expect(disposable.baseUrl).toBe(`http://localhost:${disposable.port}`);
+
+        const recordRes = await fetch(`${disposable.baseUrl}/test/record-metric`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": ephemeralToken,
+          },
+          body: JSON.stringify({
+            verification_id: "verify_child_process_123",
+            count: 1,
+            status: "test_verified",
+          }),
+        });
+        expect(recordRes.status).toBe(200);
+
+        // 3. File SD target registration file exists
+        if (disposable.targetFilePath) {
+          expect(fs.existsSync(disposable.targetFilePath)).toBe(true);
+        }
+      } finally {
+        // 4. Cleanup stops child process and removes target registration
+        const targetPath = disposable.targetFilePath;
+        await disposable.stop();
+        if (targetPath) {
+          expect(fs.existsSync(targetPath)).toBe(false);
+        }
+      }
+    });
+  });
+
+  // 5. Hardened Cleanup Endpoint Payload Handling and Authentication
+  describe("Phase 2.5: Hardened Cleanup Endpoint Payload Handling and Authentication", () => {
+    it("safeTokenEquals handles equal-length and different-length tokens in constant time without leaking length", () => {
+      const secret = "correct_secret_token_1234567890";
+
+      // Equal length invalid token
+      const equalLengthWrong = "wrong___secret_token_1234567890";
+      expect(equalLengthWrong.length).toBe(secret.length);
+      expect(safeTokenEquals(equalLengthWrong, secret)).toBe(false);
+
+      // Different length invalid tokens
+      expect(safeTokenEquals("short", secret)).toBe(false);
+      expect(safeTokenEquals("way_too_long_token_exceeding_secret_length_completely", secret)).toBe(false);
+      expect(safeTokenEquals("", secret)).toBe(false);
+      expect(safeTokenEquals(secret, "")).toBe(false);
+
+      // Correct token
+      expect(safeTokenEquals(secret, secret)).toBe(true);
+    });
+
+    describe("Cleanup endpoint HTTP contract", () => {
+      let boundServer: http.Server;
+      let testPort = 4001;
+
+      const sendReq = (options: {
+        method?: string;
+        headers?: Record<string, string>;
+        body?: string;
+        path?: string;
+      }): Promise<{ status: number; body: unknown }> => {
+        const headers = { ...(options.headers || {}) };
+        if (options.body && !headers["Content-Length"] && !headers["content-length"]) {
+          headers["Content-Length"] = String(Buffer.byteLength(options.body));
+        }
+        return new Promise((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: "127.0.0.1",
+              port: testPort,
+              path: options.path || "/test/record-metric",
+              method: options.method || "DELETE",
+              headers,
+            },
+            (res) => {
+              let data = "";
+              res.on("data", (chunk) => {
+                data += chunk;
+              });
+              res.on("end", () => {
+                try {
+                  resolve({ status: res.statusCode || 500, body: data ? JSON.parse(data) : {} });
+                } catch {
+                  resolve({ status: res.statusCode || 500, body: data });
+                }
+              });
+            }
+          );
+          req.on("error", reject);
+          if (options.body) req.write(options.body);
+          req.end();
+        });
+      };
+
+      beforeEach(async () => {
+        process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+        process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_cleanup_token_phase25";
+        (process.env as Record<string, string | undefined>).NODE_ENV = "test";
+
+        boundServer = orderServer;
+        if (!boundServer.listening) {
+          await new Promise<void>((resolve) => {
+            boundServer.listen(0, () => {
+              const addr = boundServer.address();
+              testPort = typeof addr === "object" && addr ? addr.port : 4001;
+              resolve();
+            });
+          });
+        } else {
+          const addr = boundServer.address();
+          testPort = typeof addr === "object" && addr ? addr.port : 4001;
+        }
+      });
+
+      it("returns 413 when cleanup payload exceeds 1024 bytes", async () => {
+        const oversizedBody = JSON.stringify({
+          verification_id: "verify_oversized_cleanup_test",
+          extra: "x".repeat(1100),
+        });
+
+        const res = await sendReq({
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": "secret_cleanup_token_phase25",
+          },
+          body: oversizedBody,
+        });
+        expect(res.status).toBe(413);
+        expect((res.body as Record<string, unknown>).error).toContain("Payload too large");
+      });
+
+      it("returns 400 when cleanup payload contains malformed JSON", async () => {
+        const res = await sendReq({
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": "secret_cleanup_token_phase25",
+          },
+          body: "{ invalid_json_payload: ",
+        });
+        expect(res.status).toBe(400);
+        expect((res.body as Record<string, unknown>).error).toContain("Invalid JSON payload");
+      });
+
+      it("returns 400 when verification_id fails regex validation", async () => {
+        const res = await sendReq({
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": "secret_cleanup_token_phase25",
+          },
+          body: JSON.stringify({ verification_id: "short" }), // < 8 characters
+        });
+        expect(res.status).toBe(400);
+        expect((res.body as Record<string, unknown>).error).toContain("Invalid verification_id");
+      });
+
+      it("returns 403 when endpoint is default-disabled", async () => {
+        delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+        const res = await sendReq({
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": "secret_cleanup_token_phase25",
+          },
+          body: JSON.stringify({ verification_id: "verify_valid_123" }),
+        });
+        expect(res.status).toBe(403);
+        expect((res.body as Record<string, unknown>).disabled).toBe(true);
+      });
+
+      it("returns 403 in production mode even if ENABLE_TEST_METRIC_ENDPOINT is true", async () => {
+        process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+        (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+        const res = await sendReq({
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": "secret_cleanup_token_phase25",
+          },
+          body: JSON.stringify({ verification_id: "verify_valid_123" }),
+        });
+        expect(res.status).toBe(403);
+        expect((res.body as Record<string, unknown>).disabled).toBe(true);
+      });
     });
   });
 });

@@ -131,67 +131,179 @@ export interface LiveVerificationReport {
   overallPassed: boolean;
 }
 
+import { spawn, ChildProcess } from "child_process";
+
 export interface DisposableServiceInstance {
-  server: import("http").Server;
+  process?: ChildProcess;
+  server?: import("http").Server;
   port: number;
   baseUrl: string;
   token: string;
+  targetFilePath?: string;
   stop: () => Promise<void>;
 }
 
 export async function startDisposableOrderService(options?: {
   port?: number;
   token?: string;
+  registerPrometheusTarget?: boolean;
 }): Promise<DisposableServiceInstance> {
   const token = options?.token || `verify_token_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+  const preferredPort = options?.port ?? 0;
 
-  process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
-  process.env.TEST_METRIC_ENDPOINT_TOKEN = token;
+  // Real Process Isolation: parent process.env is NEVER modified.
+  // Ephemeral credentials and endpoint enablement are passed ONLY to the isolated child process.
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PORT: String(preferredPort),
+    SAMPLE_ORDER_PORT: String(preferredPort),
+    ENABLE_TEST_METRIC_ENDPOINT: "true",
+    TEST_METRIC_ENDPOINT_TOKEN: token,
+    NODE_ENV: "test",
+  };
 
-  const { createOrderServer } = await import("../sample-services/order/server");
-  const server = createOrderServer();
+  const projectRoot = path.resolve(__dirname, "..");
+  const childScript = `
+    import { createOrderServer } from "./sample-services/order/server.ts";
+    const server = createOrderServer();
+    const tryListen = (targetPort, isFallback) => {
+      server.once("error", (err) => {
+        if (!isFallback && err && (err.code === "EADDRINUSE" || err.code === "EACCES")) {
+          server.removeAllListeners("error");
+          tryListen(0, true);
+        } else {
+          process.stderr.write("[ERROR:" + (err ? err.message : "unknown") + "]\\n");
+          process.exit(1);
+        }
+      });
+      server.listen(targetPort, () => {
+        const addr = server.address();
+        const p = typeof addr === "object" && addr ? addr.port : 0;
+        process.stdout.write("[DISPOSABLE_ORDER_SERVICE_PORT:" + p + "]\\n");
+      });
+    };
+    tryListen(${preferredPort}, false);
+  `;
 
-  const preferredPort = options?.port;
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", "-e", childScript],
+    {
+      cwd: projectRoot,
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
+
+  const cleanupChild = (): void => {
+    if (targetFilePath && fs.existsSync(targetFilePath)) {
+      try {
+        fs.unlinkSync(targetFilePath);
+      } catch {
+        // Ignore
+      }
+    }
+    if (!child.killed) {
+      try {
+        child.kill("SIGTERM");
+        setTimeout(() => {
+          if (!child.killed) {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // Ignore
+            }
+          }
+        }, 1000).unref();
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
   let boundPort: number;
-
   try {
     boundPort = await new Promise<number>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(preferredPort ?? 0, () => {
-        const addr = server.address();
-        const p = typeof addr === "object" && addr ? addr.port : 0;
-        resolve(p);
+      const timeout = setTimeout(() => {
+        cleanupChild();
+        reject(new Error("Timeout waiting for disposable order-service child process to start"));
+      }, 10000);
+
+      let stdoutBuffer = "";
+
+      const onData = (chunk: Buffer) => {
+        stdoutBuffer += chunk.toString("utf8");
+        const match = stdoutBuffer.match(/\[DISPOSABLE_ORDER_SERVICE_PORT:(\d+)\]/);
+        if (match) {
+          clearTimeout(timeout);
+          child.stdout?.removeListener("data", onData);
+          resolve(Number(match[1]));
+        }
+      };
+
+      child.stdout?.on("data", onData);
+
+      child.once("error", (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`Failed to spawn disposable order-service child process: ${err.message}`));
+      });
+
+      child.once("exit", (code, signal) => {
+        clearTimeout(timeout);
+        reject(new Error(`Disposable order-service child process exited prematurely with code ${code}, signal ${signal}`));
       });
     });
-  } catch {
-    server.removeAllListeners("error");
-    boundPort = await new Promise<number>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, () => {
-        const addr = server.address();
-        const p = typeof addr === "object" && addr ? addr.port : 0;
-        resolve(p);
-      });
-    });
+  } catch (err) {
+    cleanupChild();
+    throw err;
   }
 
   const baseUrl = `http://localhost:${boundPort}`;
 
+  // File-based Service Discovery: register dynamic target for Prometheus
+  let targetFilePath: string | undefined;
+  if (options?.registerPrometheusTarget !== false) {
+    try {
+      const fileSdDir = path.resolve(projectRoot, "docker", "file_sd");
+      if (!fs.existsSync(fileSdDir)) {
+        fs.mkdirSync(fileSdDir, { recursive: true });
+      }
+      targetFilePath = path.join(fileSdDir, `disposable-order-${boundPort}.json`);
+      const targetPayload = [
+        {
+          targets: [
+            `host.docker.internal:${boundPort}`,
+            `127.0.0.1:${boundPort}`,
+          ],
+          labels: {
+            job: "order-service-dynamic",
+            service: "order-service",
+            instance: `order-service-${boundPort}`,
+          },
+        },
+      ];
+      fs.writeFileSync(targetFilePath, JSON.stringify(targetPayload, null, 2), "utf8");
+    } catch {
+      // Non-fatal if directory is readonly
+    }
+  }
+
   const stop = async () => {
-    delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
-    delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
-    if (server.listening) {
+    cleanupChild();
+    if (!child.killed) {
       await new Promise<void>((resolve) => {
-        server.close(() => resolve());
+        child.once("exit", () => resolve());
+        setTimeout(resolve, 500);
       });
     }
   };
 
   return {
-    server,
+    process: child,
     port: boundPort,
     baseUrl,
     token,
+    targetFilePath,
     stop,
   };
 }
@@ -460,19 +572,23 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
     } else {
       console.log(`  ✓ Local Prometheus instance (${localPrometheusUrl}) is online.`);
 
-      // Verify target scrape health using Prometheus targets API
+      // Verify target scrape health using Prometheus targets API (poll up to 5s for file_sd refresh)
       let targetUp = false;
-      try {
-        const targetsRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
-        if (targetsRes.ok) {
-          const targetsJson = await targetsRes.json() as { data?: { activeTargets?: Array<{ discoveredLabels?: Record<string, string>; health?: string; scrapeUrl?: string }> } };
-          const activeTargets = targetsJson.data?.activeTargets || [];
-          targetUp = activeTargets.some(
-            (t) => (t.scrapeUrl?.includes(`:${orderServicePort}`) || t.discoveredLabels?.["__address__"]?.includes(`:${orderServicePort}`)) && t.health === "up"
-          );
+      for (let tAttempt = 1; tAttempt <= 5; tAttempt++) {
+        try {
+          const targetsRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
+          if (targetsRes.ok) {
+            const targetsJson = await targetsRes.json() as { data?: { activeTargets?: Array<{ discoveredLabels?: Record<string, string>; health?: string; scrapeUrl?: string }> } };
+            const activeTargets = targetsJson.data?.activeTargets || [];
+            targetUp = activeTargets.some(
+              (t) => (t.scrapeUrl?.includes(`:${orderServicePort}`) || t.discoveredLabels?.["__address__"]?.includes(`:${orderServicePort}`)) && t.health === "up"
+            );
+            if (targetUp) break;
+          }
+        } catch {
+          // non-fatal
         }
-      } catch {
-        // targets check non-fatal
+        if (!targetUp && tAttempt < 5) await sleep(1000);
       }
 
       // Confirm local Prometheus has actually scraped the exact verification ID
@@ -647,21 +763,30 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
         break;
       }
 
-      // 2. Query recent traces for verification service
+      // 2. Query recent traces as candidate discovery only
       const traceQueryRes = await tempoClient.getRecentTracesDetailed("incidentgraph-verification-runner", 10);
-      if (traceQueryRes.success) {
-        const found = traceQueryRes.traces.find((t) => {
-          const searchVerify = tempoClient.verifyLiveTrace(t, generatedTraceId, uniqueTraceVerificationId);
-          return searchVerify.valid;
+      if (traceQueryRes.success && traceQueryRes.traces.length > 0) {
+        // Extract candidate trace IDs matching the generated trace ID
+        const candidateTraces = traceQueryRes.traces.filter((t) => {
+          const normCandidate = t.traceId.toLowerCase().replace(/^0+/, "");
+          const normGen = generatedTraceId.toLowerCase().replace(/^0+/, "");
+          return normCandidate === normGen || t.traceId.toLowerCase() === generatedTraceId.toLowerCase();
         });
-        if (found) {
-          traceVerified = true;
-          report.tracesResult.status = "PASSED";
-          report.tracesResult.queryLatencyMs = Date.now() - tempoQueryStart;
-          report.tracesResult.details = `Trace retrieved successfully from Tempo backend search (matched trace ID ${generatedTraceId}).`;
-          console.log(`  ✓ [PASS] Trace confirmed in Tempo search on attempt ${attempt} (${report.tracesResult.queryLatencyMs}ms total).`);
-          break;
+
+        for (const candidate of candidateTraces) {
+          // Fetch full backend trace detail using exact candidate ID with allowFallback: false
+          const fullDetailTrace = await tempoClient.getTraceById(candidate.traceId, { allowFallback: false });
+          const fullVerify = tempoClient.verifyLiveTrace(fullDetailTrace, generatedTraceId, uniqueTraceVerificationId);
+          if (fullVerify.valid && fullDetailTrace) {
+            traceVerified = true;
+            report.tracesResult.status = "PASSED";
+            report.tracesResult.queryLatencyMs = Date.now() - tempoQueryStart;
+            report.tracesResult.details = `Trace retrieved via candidate discovery followed by full Tempo detail verification (matched trace ID ${generatedTraceId}, ${fullDetailTrace.allSpans.length} verified real span(s)).`;
+            console.log(`  ✓ [PASS] Trace candidate retrieved and verified via full backend detail on attempt ${attempt} (${report.tracesResult.queryLatencyMs}ms total).`);
+            break;
+          }
         }
+        if (traceVerified) break;
       }
 
       if (attempt === 1) {

@@ -1,6 +1,6 @@
 # IncidentGraph AI — Root-Cause Engine Robustness Benchmark Report
 
-> **Benchmark Run Timestamp:** `2026-10-31T11:41:57.529Z`<br/>
+> **Benchmark Run Timestamp:** `2026-10-31T12:32:39.123Z`<br/>
 > **Fixed Seed:** `42` (100% Deterministic & Reproducible)<br/>
 > **Environment:** Node.js / TypeScript (Zero Cloud Dependencies)<br/>
 > **Total Scenarios Evaluated:** 117 reproducible test suites across 5 topology families
@@ -18,7 +18,7 @@
 | **Ambiguous Incident Inconclusive Rate** | **70.59%** | [53.83%, 83.17%] | ≥ 60.0% | Inconclusive verdicts / 34 ambiguous/noisy scenarios | PASS |
 | **Suite Non-Conclusive Verdict Rate** | **35.9%** | [27.78%, 44.91%] | ≤ 40.0% | Non-conclusive outcomes / 117 total scenarios | PASS |
 | **Mean Execution Latency** | **0.14 ms** | N/A | < 10.0 ms | Pure algorithm execution duration | PASS |
-| **P95 Execution Latency** | **0.29 ms** | N/A | < 25.0 ms | 95th percentile execution duration | PASS |
+| **P95 Execution Latency** | **0.26 ms** | N/A | < 25.0 ms | 95th percentile execution duration | PASS |
 
 ---
 
@@ -56,14 +56,14 @@ To prevent ambiguity and metric distortion, all 117 benchmark scenarios are stri
 | Failure Category | Total | EvalFail | Healthy | Recovery | Ambiguous | Top-1 | Top-3 | Inconcl | Pass Rate | Mean Time |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `HEALTHY` | 13 | 0 | 13 | 0 | 0 | **N/A** | N/A | 13 | 100% | 0.11 ms |
-| `SINGLE_POINT_FAILURE` | 23 | 23 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.12 ms |
-| `CASCADING_OUTAGE` | 21 | 21 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.47 ms |
-| `MULTI_SERVICE_FAILURE` | 10 | 0 | 0 | 0 | 10 | **N/A** | N/A | 0 | 100% | 0.05 ms |
+| `SINGLE_POINT_FAILURE` | 23 | 23 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.09 ms |
+| `CASCADING_OUTAGE` | 21 | 21 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.48 ms |
+| `MULTI_SERVICE_FAILURE` | 10 | 0 | 0 | 0 | 10 | **N/A** | N/A | 0 | 100% | 0.04 ms |
 | `DEPENDENCY_TIMEOUT` | 10 | 10 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.04 ms |
 | `NOISY_DATA` | 14 | 0 | 0 | 0 | 14 | **N/A** | N/A | 14 | 100% | 0.04 ms |
 | `CONTRADICTORY_SIGNALS` | 10 | 0 | 0 | 0 | 10 | **N/A** | N/A | 10 | 100% | 0.07 ms |
 | `TOPOLOGY_VARIATION` | 10 | 10 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.03 ms |
-| `RECOVERY_CYCLE` | 5 | 0 | 0 | 5 | 0 | **N/A** | N/A | 5 | 100% | 0.03 ms |
+| `RECOVERY_CYCLE` | 5 | 0 | 0 | 5 | 0 | **N/A** | N/A | 5 | 100% | 0.02 ms |
 | `EDGE_CASE` | 1 | 1 | 0 | 0 | 0 | **100%** | 100% | 0 | 100% | 0.05 ms |
 
 ---
@@ -74,9 +74,9 @@ To prevent ambiguity and metric distortion, all 117 benchmark scenarios are stri
 |---|---|
 | **Mean** | 0.14 ms |
 | **Median (P50)** | 0.04 ms |
-| **95th Percentile (P95)** | 0.29 ms |
+| **95th Percentile (P95)** | 0.26 ms |
 | **Minimum** | 0.01 ms |
-| **Maximum** | 7.8 ms |
+| **Maximum** | 8.39 ms |
 
 ---
 
@@ -87,7 +87,7 @@ To prevent ambiguity and metric distortion, all 117 benchmark scenarios are stri
 #### `scenario-02-postgres-latency` — PostgreSQL Latency Surge
 - **Category:** `CASCADING_OUTAGE`
 - **Predicted Root Cause:** `postgres-db` (Confidence: HIGH, Score: 85/100)
-- **Execution Time:** 7.8 ms
+- **Execution Time:** 8.39 ms
 - **Key Supporting Evidence:**
   - [STATUS_SIGNAL] Service is running in a DEGRADED health state.
   - [TELEMETRY_SPIKE] Severe latency surge: 682.75ms is 62.07x baseline (11ms).
@@ -97,7 +97,7 @@ To prevent ambiguity and metric distortion, all 117 benchmark scenarios are stri
 #### `scenario-03-postgres-outage` — PostgreSQL Cluster Outage
 - **Category:** `CASCADING_OUTAGE`
 - **Predicted Root Cause:** `postgres-db` (Confidence: HIGH, Score: 100/100)
-- **Execution Time:** 0.19 ms
+- **Execution Time:** 0.23 ms
 - **Key Supporting Evidence:**
   - [STATUS_SIGNAL] Service is completely DOWN and rejecting requests.
   - [TELEMETRY_SPIKE] Severe latency surge: 3000ms is 272.73x baseline (11ms).
@@ -108,7 +108,7 @@ To prevent ambiguity and metric distortion, all 117 benchmark scenarios are stri
 #### `scenario-04-payment-failure` — Payment Gateway Failure
 - **Category:** `SINGLE_POINT_FAILURE`
 - **Predicted Root Cause:** `payment-service` (Confidence: HIGH, Score: 100/100)
-- **Execution Time:** 0.06 ms
+- **Execution Time:** 0.07 ms
 - **Key Supporting Evidence:**
   - [STATUS_SIGNAL] Service is completely DOWN and rejecting requests.
   - [TELEMETRY_SPIKE] Severe latency surge: 450ms is 6.92x baseline (65ms).
