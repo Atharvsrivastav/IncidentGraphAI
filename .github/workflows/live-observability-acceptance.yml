@@ -1,0 +1,106 @@
+name: Live Observability Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Optional acceptance trigger description'
+        required: false
+        default: 'Production-Grade External Telemetry Acceptance Run'
+        type: string
+
+concurrency:
+  group: live-observability-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: External Telemetry Acceptance (Paths A, B & C)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: "file:./dev.db"
+      NEXT_TELEMETRY_DISABLED: "1"
+      PROMETHEUS_URL: "http://localhost:9090"
+      GRAFANA_CLOUD_OTLP_ENDPOINT: ${{ secrets.GRAFANA_CLOUD_OTLP_ENDPOINT }}
+      GRAFANA_CLOUD_INSTANCE_ID: ${{ secrets.GRAFANA_CLOUD_INSTANCE_ID }}
+      GRAFANA_CLOUD_INGESTION_TOKEN: ${{ secrets.GRAFANA_CLOUD_INGESTION_TOKEN }}
+      GRAFANA_CLOUD_PROMETHEUS_URL: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_URL }}
+      GRAFANA_CLOUD_PROMETHEUS_USER: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_USER }}
+      GRAFANA_CLOUD_PROMETHEUS_TOKEN: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_TOKEN }}
+      GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL }}
+      GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER }}
+      GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN: ${{ secrets.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN }}
+      GRAFANA_CLOUD_TEMPO_URL: ${{ secrets.GRAFANA_CLOUD_TEMPO_URL }}
+      GRAFANA_CLOUD_TEMPO_USER: ${{ secrets.GRAFANA_CLOUD_TEMPO_USER }}
+      GRAFANA_CLOUD_TEMPO_TOKEN: ${{ secrets.GRAFANA_CLOUD_TEMPO_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Verify Configuration Prerequisites
+        run: |
+          echo "=== Auditing Telemetry Environment Configuration ==="
+          mask_status() {
+            local val="$1"
+            local name="$2"
+            if [ -n "$val" ]; then
+              echo "  ✓ $name: [CONFIGURED]"
+            else
+              echo "  ⚠ $name: [MISSING / UNCONFIGURED]"
+            fi
+          }
+          mask_status "$GRAFANA_CLOUD_OTLP_ENDPOINT" "GRAFANA_CLOUD_OTLP_ENDPOINT"
+          mask_status "$GRAFANA_CLOUD_INSTANCE_ID" "GRAFANA_CLOUD_INSTANCE_ID"
+          mask_status "$GRAFANA_CLOUD_INGESTION_TOKEN" "GRAFANA_CLOUD_INGESTION_TOKEN"
+          mask_status "$GRAFANA_CLOUD_PROMETHEUS_URL" "GRAFANA_CLOUD_PROMETHEUS_URL"
+          mask_status "$GRAFANA_CLOUD_PROMETHEUS_TOKEN" "GRAFANA_CLOUD_PROMETHEUS_TOKEN"
+          mask_status "$GRAFANA_CLOUD_TEMPO_URL" "GRAFANA_CLOUD_TEMPO_URL"
+          mask_status "$GRAFANA_CLOUD_TEMPO_TOKEN" "GRAFANA_CLOUD_TEMPO_TOKEN"
+          mask_status "$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL" "GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL"
+          mask_status "$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN" "GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN"
+
+      - name: Start Prometheus Container
+        run: |
+          echo "Starting containerized Prometheus for local scraping & remote-write..."
+          mkdir -p docker/file_sd
+          docker compose up -d prometheus
+          echo "Waiting for Prometheus healthy endpoint..."
+          for i in {1..30}; do
+            if curl -s http://localhost:9090/-/healthy | grep -q "Prometheus Server is Healthy"; then
+              echo "✓ Prometheus server is healthy and responding."
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run Live Telemetry Verification Suite
+        run: npx tsx scripts/verify-live-observability.ts
+
+      - name: Teardown Disposable Docker & Discovery Resources
+        if: always()
+        run: |
+          echo "Cleaning up containerized services and file-based targets..."
+          docker compose down -v --remove-orphans || true
+          rm -rf docker/file_sd/disposable-order-*.json || true
+
+      - name: Upload Live Acceptance Markdown Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-observability-acceptance-report
+          path: reports/live-observability-acceptance.md
+          if-no-files-found: ignore

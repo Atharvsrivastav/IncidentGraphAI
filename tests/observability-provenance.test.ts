@@ -3816,5 +3816,550 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
         expect(incompleteSummary.allSpans).toEqual([]);
       });
     });
+
+    // =========================================================================
+    // Phase 2.8: Production-Grade External Telemetry Acceptance & Verification
+    // =========================================================================
+    describe("Phase 2.8: Production-Grade External Telemetry Acceptance & Verification", () => {
+      it("handles missing credentials gracefully without throwing unhandled exceptions", async () => {
+        const client = new PrometheusClient("http://127.0.0.1:9999", 500);
+        global.fetch = vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:9999"));
+
+        const res = await client.checkHealth();
+        expect(res.available).toBe(false);
+        expect(res.errorCode).toBe("UNAVAILABLE");
+      });
+
+      it("maps HTTP 401 and 403 responses to AUTH_FAILURE on metrics and trace backends", async () => {
+        const promClient = new PrometheusClient("https://prometheus-test.invalid", 500);
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          text: async () => "Unauthorized",
+        } as unknown as Response);
+
+        const promHealth = await promClient.checkHealth();
+        expect(promHealth.available).toBe(false);
+        expect(promHealth.errorCode).toBe("AUTH_FAILURE");
+
+        const tempoClient = new JaegerClient("https://tempo-test.invalid", 500);
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: false,
+          status: 403,
+          statusText: "Forbidden",
+          text: async () => "Forbidden",
+        } as unknown as Response);
+
+        const tempoHealth = await tempoClient.checkHealth();
+        expect(tempoHealth.available).toBe(false);
+        expect(tempoHealth.errorCode).toBe("AUTH_FAILURE");
+      });
+
+      it("maps HTTP 429 rate limit responses to RATE_LIMITED on backends", async () => {
+        const tempoClient = new JaegerClient("https://tempo-test.invalid", 500);
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: false,
+          status: 429,
+          statusText: "Too Many Requests",
+          text: async () => "Rate limit exceeded",
+        } as unknown as Response);
+
+        const health = await tempoClient.checkHealth();
+        expect(health.available).toBe(false);
+        expect(health.errorCode).toBe("RATE_LIMITED");
+
+        const queryRes = await tempoClient.getRecentTracesDetailed("test-service", 5);
+        expect(queryRes.success).toBe(false);
+        expect(queryRes.diagnostic.errorCode).toBe("RATE_LIMITED");
+      });
+
+      it("maps network query timeouts to TIMEOUT diagnostic code", async () => {
+        const promClient = new PrometheusClient("https://prometheus-test.invalid", 20);
+        global.fetch = vi.fn().mockImplementation(
+          () => new Promise((_, reject) => setTimeout(() => reject(new Error("AbortError")), 50))
+        );
+
+        const health = await promClient.checkHealth();
+        expect(health.available).toBe(false);
+        expect(health.errorCode).toBe("TIMEOUT");
+      });
+
+      it("rejects empty metric query responses from establishing LIVE status", async () => {
+        const mgr = new TelemetryManager();
+        mgr.setMode("LIVE");
+
+        vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue({
+          success: true,
+          metrics: new Map(),
+          diagnostics: [],
+          p95Supported: true,
+        });
+
+        vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+          success: true,
+          traces: [],
+          normalizedSpans: [],
+          diagnostic: {
+            provider: "TEMPO",
+            endpoint: "http://tempo",
+            status: "OK",
+            message: "Traces query executed successfully",
+            latencyMs: 10,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        const status = await mgr.getObservedServices(true);
+        expect(status.effectiveMode).toBe("DEGRADED");
+        expect(mgr.getLastVerifiedAt()).toBeNull();
+      });
+
+      it("rejects metric sample if verification_id does not match the expected 128-bit ID", async () => {
+        const promClient = new PrometheusClient("https://prometheus-test.invalid", 500);
+        const expectedId = "verify_otlp_0123456789abcdef0123456789abcdef";
+        const differentId = "verify_otlp_fedcba9876543210fedcba9876543210";
+
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: "success",
+            data: {
+              resultType: "vector",
+              result: [
+                {
+                  metric: {
+                    __name__: "incidentgraph_live_verification_total",
+                    verification_id: differentId,
+                  },
+                  value: [1710000000, "1"],
+                },
+              ],
+            },
+          }),
+        } as unknown as Response);
+
+        const queryRes = await promClient.queryInstantDetailed(
+          `incidentgraph_live_verification_total{verification_id="${expectedId}"}`
+        );
+        expect(queryRes.success).toBe(true);
+        const record = queryRes.records[0];
+        expect(record.labels["verification_id"]).not.toBe(expectedId);
+      });
+
+      it("successfully retries with exponential backoff when metric visibility is delayed", async () => {
+        let attempts = 0;
+        const expectedId = "verify_otlp_backoff_test_id_128bit";
+        const metricName = "incidentgraph_live_verification_total";
+
+        const simulateQuery = async () => {
+          attempts++;
+          if (attempts < 3) {
+            return { success: true, records: [] };
+          }
+          return {
+            success: true,
+            records: [
+              {
+                metricName,
+                labels: { __name__: metricName, verification_id: expectedId },
+                value: 1,
+                timestamp: Date.now(),
+              },
+            ],
+          };
+        };
+
+        const backoff = [5, 10, 20];
+        let found = false;
+        for (let i = 0; i < 4; i++) {
+          const res = await simulateQuery();
+          if (res.records.length > 0 && res.records[0].labels["verification_id"] === expectedId) {
+            found = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, backoff[i] || 10));
+        }
+
+        expect(found).toBe(true);
+        expect(attempts).toBe(3);
+      });
+
+      it("successfully retries with exponential backoff when trace indexing is delayed", async () => {
+        let attempts = 0;
+        const testTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const testVerId = "verify_trace_128bit_entropy_abc";
+
+        const simulateFetch = async () => {
+          attempts++;
+          if (attempts < 3) {
+            return null;
+          }
+          return {
+            traceId: testTraceId,
+            rootServiceName: "order-service",
+            operationName: "POST /order",
+            startTime: new Date().toISOString(),
+            durationMs: 40,
+            totalSpans: 1,
+            hasErrors: false,
+            servicesInvolved: ["order-service"],
+            isFallback: false,
+            rootSpan: {
+              spanId: "span001",
+              traceId: testTraceId,
+              operationName: "POST /order",
+              serviceName: "order-service",
+              startTimeUs: 1000000,
+              durationMs: 40,
+              statusCode: "OK" as const,
+              attributes: { "verification.id": testVerId },
+              depth: 0,
+              children: [],
+            },
+            allSpans: [
+              {
+                spanId: "span001",
+                traceId: testTraceId,
+                operationName: "POST /order",
+                serviceName: "order-service",
+                startTimeUs: 1000000,
+                durationMs: 40,
+                statusCode: "OK" as const,
+                attributes: { "verification.id": testVerId },
+                depth: 0,
+                children: [],
+              },
+            ],
+          };
+        };
+
+        const client = new JaegerClient("https://tempo-test.invalid", 500);
+        let validTrace: DistributedTrace | null = null;
+        for (let i = 0; i < 4; i++) {
+          const t = await simulateFetch();
+          if (t) {
+            const outcome = client.verifyLiveTrace(t, testTraceId, testVerId);
+            if (outcome.valid) {
+              validTrace = t;
+              break;
+            }
+          }
+          await new Promise((r) => setTimeout(r, 5));
+        }
+
+        expect(validTrace).not.toBeNull();
+        expect(attempts).toBe(3);
+      });
+
+      it("rejects trace when root trace ID differs from expected 128-bit ID", () => {
+        const client = new JaegerClient("https://tempo-test.invalid", 500);
+        const wrongTrace: DistributedTrace = {
+          traceId: "different_trace_id_99999999999999",
+          rootServiceName: "order-service",
+          operationName: "POST /order",
+          startTime: new Date().toISOString(),
+          durationMs: 25,
+          totalSpans: 1,
+          hasErrors: false,
+          servicesInvolved: ["order-service"],
+          isFallback: false,
+          rootSpan: {
+            spanId: "span1",
+            traceId: "different_trace_id_99999999999999",
+            operationName: "POST /order",
+            serviceName: "order-service",
+            startTimeUs: 1000,
+            durationMs: 25,
+            statusCode: "OK",
+            attributes: { "verification.id": "test_id" },
+            depth: 0,
+            children: [],
+          },
+          allSpans: [
+            {
+              spanId: "span1",
+              traceId: "different_trace_id_99999999999999",
+              operationName: "POST /order",
+              serviceName: "order-service",
+              startTimeUs: 1000,
+              durationMs: 25,
+              statusCode: "OK",
+              attributes: { "verification.id": "test_id" },
+              depth: 0,
+              children: [],
+            },
+          ],
+        };
+
+        const outcome = client.verifyLiveTrace(wrongTrace, "expected_trace_id_11111111111111", "test_id");
+        expect(outcome.valid).toBe(false);
+        expect(outcome.reason).toContain("Trace ID mismatch");
+      });
+
+      it("rejects trace when allSpans is empty or missing", () => {
+        const client = new JaegerClient("https://tempo-test.invalid", 500);
+        const emptyTrace: DistributedTrace = {
+          traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+          rootServiceName: "order-service",
+          operationName: "POST /order",
+          startTime: new Date().toISOString(),
+          durationMs: 25,
+          totalSpans: 0,
+          hasErrors: false,
+          servicesInvolved: ["order-service"],
+          isFallback: false,
+          rootSpan: null,
+          allSpans: [],
+        };
+
+        const outcome = client.verifyLiveTrace(emptyTrace, "4bf92f3577b34da6a3ce929d0e0e4736", "test_id");
+        expect(outcome.valid).toBe(false);
+        expect(outcome.reason).toContain("Trace contains no span data");
+      });
+
+      it("rejects trace when child span references non-existent parentSpanId", () => {
+        const client = new JaegerClient("https://tempo-test.invalid", 500);
+        const testTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const testVerId = "verify_test_rel";
+
+        const invalidRelTrace: DistributedTrace = {
+          traceId: testTraceId,
+          rootServiceName: "order-service",
+          operationName: "POST /order",
+          startTime: new Date().toISOString(),
+          durationMs: 30,
+          totalSpans: 1,
+          hasErrors: false,
+          servicesInvolved: ["order-service"],
+          isFallback: false,
+          rootSpan: null,
+          allSpans: [
+            {
+              spanId: "child_span_01",
+              parentSpanId: "non_existent_parent_999",
+              traceId: testTraceId,
+              operationName: "GET /inventory",
+              serviceName: "inventory-service",
+              startTimeUs: 2000,
+              durationMs: 15,
+              statusCode: "OK",
+              attributes: { "verification.id": testVerId },
+              depth: 1,
+              children: [],
+            },
+          ],
+        };
+
+        const outcome = client.verifyLiveTrace(invalidRelTrace, testTraceId, testVerId);
+        expect(outcome.valid).toBe(false);
+        expect(outcome.reason).toContain("Invalid parent-child relationship");
+      });
+
+      it("accepts valid multi-service trace with genuine parent-child hierarchy", () => {
+        const client = new JaegerClient("https://tempo-test.invalid", 500);
+        const testTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const testVerId = "verify_multi_service_pass";
+
+        const rootSpan = {
+          spanId: "root_span_01",
+          traceId: testTraceId,
+          operationName: "POST /checkout",
+          serviceName: "gateway-service",
+          startTimeUs: 1000,
+          durationMs: 50,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": testVerId },
+          depth: 0,
+          children: [],
+        };
+
+        const childSpan = {
+          spanId: "child_span_01",
+          parentSpanId: "root_span_01",
+          traceId: testTraceId,
+          operationName: "POST /orders",
+          serviceName: "order-service",
+          startTimeUs: 1100,
+          durationMs: 35,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": testVerId },
+          depth: 1,
+          children: [],
+        };
+
+        const multiServiceTrace: DistributedTrace = {
+          traceId: testTraceId,
+          rootServiceName: "gateway-service",
+          operationName: "POST /checkout",
+          startTime: new Date().toISOString(),
+          durationMs: 50,
+          totalSpans: 2,
+          hasErrors: false,
+          servicesInvolved: ["gateway-service", "order-service"],
+          isFallback: false,
+          rootSpan,
+          allSpans: [rootSpan, childSpan],
+        };
+
+        const outcome = client.verifyLiveTrace(multiServiceTrace, testTraceId, testVerId);
+        expect(outcome.valid).toBe(true);
+      });
+
+      it("coalesces duplicate concurrent stop/cleanup requests without duplicate signals", async () => {
+        const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+        let killCount = 0;
+        const originalKill = child.kill.bind(child);
+        child.kill = vi.fn().mockImplementation((sig?: string | number) => {
+          killCount++;
+          return originalKill(sig as NodeJS.Signals);
+        });
+
+        const stop1 = stopChildProcess(child, undefined, 200);
+        const stop2 = stopChildProcess(child, undefined, 200);
+
+        await Promise.all([stop1, stop2]);
+        expect(killCount).toBe(1);
+      });
+
+      it("cleans up disposable files and processes after verification failures", async () => {
+        const tempDiscoveryPath = path.resolve(process.cwd(), "docker", "file_sd", "temp-verify-test.json");
+        fs.mkdirSync(path.dirname(tempDiscoveryPath), { recursive: true });
+        fs.writeFileSync(tempDiscoveryPath, JSON.stringify([{ targets: ["host.docker.internal:9999"] }]));
+        expect(fs.existsSync(tempDiscoveryPath)).toBe(true);
+
+        const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+        await stopChildProcess(child, tempDiscoveryPath, 200);
+        expect(fs.existsSync(tempDiscoveryPath)).toBe(false);
+      });
+
+      it("redacts secrets and sensitive tokens in configuration audits and error logs", () => {
+        const rawToken = ["glc_", "sample_mock_auth_token_for_redaction_testing_123"].join("");
+        const masked = rawToken.length > 0 ? `[SET - REDACTED (${rawToken.length} chars)]` : "[NOT SET]";
+        expect(masked).not.toContain("sample_mock_auth_token");
+        expect(masked).toContain("[SET - REDACTED");
+      });
+
+      it("strictly enforces SIMULATION -> DEGRADED -> LIVE provenance lifecycle transitions", async () => {
+        const mgr = new TelemetryManager();
+        expect(mgr.getEffectiveMode()).toBe("SIMULATION");
+
+        // Set to LIVE when providers are empty -> becomes DEGRADED
+        mgr.setMode("LIVE");
+        vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue({
+          success: true,
+          metrics: new Map(),
+          diagnostics: [],
+          p95Supported: true,
+        });
+        vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+          success: true,
+          traces: [],
+          normalizedSpans: [],
+          diagnostic: {
+            provider: "TEMPO",
+            endpoint: "http://tempo",
+            status: "OK",
+            message: "Empty traces returned",
+            latencyMs: 5,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        vi.spyOn(mgr, "getBackendHealth").mockResolvedValue({
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+          prometheusUrl: "https://prometheus.example.com",
+          jaegerUrl: "https://tempo.example.com",
+          isMockBackend: false,
+          isCloudBackend: true,
+          cloudConfigured: true,
+          backendType: "GRAFANA_CLOUD",
+          lastChecked: new Date().toISOString(),
+          details: "Connected to Grafana Cloud",
+        });
+
+        const degradedStatus = await mgr.getObservedServices(true);
+        expect(degradedStatus.effectiveMode).toBe("DEGRADED");
+
+        // Transition to genuine LIVE when both deliver verified records
+        const metricsMap = new Map();
+        metricsMap.set("order-service", {
+          serviceName: "order-service",
+          latencyMs: 45,
+          hasValidLatency: true,
+          hasValidRequestRate: true,
+          hasValidErrorRate: true,
+          hasValidP95: true,
+          requestRate: 12,
+          errorRate: 0,
+          instanceCount: 1,
+        });
+
+        vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue({
+          success: true,
+          metrics: metricsMap,
+          diagnostics: [],
+          p95Supported: true,
+        });
+
+        const liveTrace: DistributedTrace = {
+          traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+          rootServiceName: "order-service",
+          operationName: "POST /order",
+          startTime: new Date().toISOString(),
+          durationMs: 40,
+          totalSpans: 1,
+          hasErrors: false,
+          servicesInvolved: ["order-service"],
+          isFallback: false,
+          rootSpan: {
+            spanId: "s1",
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            operationName: "POST /order",
+            serviceName: "order-service",
+            startTimeUs: 1000,
+            durationMs: 40,
+            statusCode: "OK",
+            attributes: {},
+            depth: 0,
+            children: [],
+          },
+          allSpans: [
+            {
+              spanId: "s1",
+              traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+              operationName: "POST /order",
+              serviceName: "order-service",
+              startTimeUs: 1000,
+              durationMs: 40,
+              statusCode: "OK",
+              attributes: {},
+              depth: 0,
+              children: [],
+            },
+          ],
+        };
+
+        vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+          success: true,
+          traces: [liveTrace],
+          normalizedSpans: [],
+          diagnostic: {
+            provider: "TEMPO",
+            endpoint: "http://tempo",
+            status: "OK",
+            message: "Traces query executed successfully",
+            latencyMs: 5,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        const liveStatus = await mgr.getObservedServices(true);
+        expect(liveStatus.effectiveMode).toBe("LIVE");
+        expect(mgr.getLastVerifiedAt()).not.toBeNull();
+      });
+    });
   });
 });

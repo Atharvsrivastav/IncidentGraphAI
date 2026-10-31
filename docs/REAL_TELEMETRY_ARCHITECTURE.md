@@ -476,14 +476,27 @@ In `sample-services/shared/telemetry.ts`:
 - Exporters never overwrite each other's status or error details.
 - Error messages are sanitized via `sanitizeErrorMessage()` to redact `Bearer` tokens, `Basic` tokens, `glc_` keys, and passwords before logging or storing.
 
-### I. Current External Verification Status & Remaining Blockers
+### I. External Telemetry Acceptance & Verification Model (Phase 2.8 Hardened)
 
-IncidentGraph AI distinguishes between deterministic local/CI test suites and genuine external cloud verification:
-1. **Local Test Suites (100% Passing):** All 354 unit and integration tests across 11 suites pass locally and in GitHub Actions CI with zero external secrets. Includes Phase 2.7 real Node.js operating-system child process lifecycle tests (cooperative SIGTERM exit, uncooperative SIGKILL escalation, concurrent stop coalescing, idempotent stops on already-exited processes, and OS process table verification via `process.kill(pid, 0)` throwing `ESRCH`).
+IncidentGraph AI establishes an explicit verification status model separating deterministic local CI tests from genuine cloud backend verification:
+
+| State | Meaning |
+| :--- | :--- |
+| `PASSED` | Exact backend read-back verified with matching identifier, values, and hierarchy |
+| `FAILED` | Verification attempted against backend and an actual operational failure occurred |
+| `NOT_VERIFIED` | Credentials, backend, Docker engine, or environment unavailable |
+| `PENDING` | Backend ingestion, OTLP ingestion pipeline, or trace block indexing is still in progress |
+| `SKIPPED` | Workflow intentionally did not execute the test |
+
+> [!IMPORTANT]
+> The verification harness strictly prohibits converting `NOT_VERIFIED`, `PENDING`, or `SKIPPED` into `PASSED`.
+
+#### Current Acceptance Verification Evidence
+1. **Local Test Suites (100% Passing):** All 370 unit and integration tests across 11 suites pass locally and in CI with zero external secrets. Includes Phase 2.8 regression and security tests covering missing credentials, 401/403/429 status codes, network timeouts, empty metric vectors, wrong verification IDs, delayed visibility, trace hierarchy validation, parent-child integrity, duplicate requests, resource cleanup, secret redaction, and accurate provenance transitions.
 2. **Algorithmic Benchmark (`npm run test:benchmark`):** 22 tests passing covering core graph algorithms.
 3. **Root-Cause Robustness Benchmark (`npm run benchmark`):** 117/117 reproducible scenarios passing (100% Top-1 hit rate, 0% false-positive rate on healthy workloads).
 4. **Local Configuration Validation (`npm run config:check`):** Successfully verifies environment variables, ports, and live connectivity probes to Grafana Cloud Prometheus and Tempo query engines.
-5. **Path A (Direct OTLP Metrics):** Verified via live OTLP export and PromQL read-back confirming the exact synthetic metric and verification identifier in Grafana Cloud Mimir.
-6. **Path B (Prometheus Remote-Write):** Currently reported as **`NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE`** because local Docker Prometheus is not running on this host, dynamic scrape discovery requires the container, and remote-write credentials are unset in local environment. This is an external environment blocker until dedicated remote-write credentials and a running Prometheus instance are provisioned.
-7. **Path C (Tempo Distributed Traces):** Currently reported as **`NOT VERIFIED`** pending Tempo block storage propagation and trace indexing delay (up to 10 minutes in free-tier cloud configurations). Search-derived summaries and fallback traces are strictly rejected in live verification.
-8. **Simulation Provenance:** In Simulation Mode, the application truthfully reports `source: "SIMULATION"`, `provenance: "DISABLED"` with zero external network calls. `MOCK_EMULATION` is only assigned when mock observability servers (`x-observability-provider: mock-observability-server`) are active during local testing.
+5. **Path A (Direct OTLP Metrics to Grafana Cloud):** **`PASSED`**. Generates a 128-bit cryptographic verification identifier (`verify_otlp_<32hex>`), exports temporary verification metric via OTLP HTTPS, and queries Grafana Cloud Prometheus/Mimir using the exact identifier. PromQL read-back confirms the exact metric name, verification ID, value, and positive timestamp.
+6. **Path B (Prometheus Scrape & Remote-Write):** **`NOT_VERIFIED`** on local Windows workstation without Docker Engine. Dedicated GitHub Actions workflow `.github/workflows/live-observability-acceptance.yml` executes on Linux with Docker Compose and file-based dynamic target discovery (`file_sd_configs`). When Docker Engine is absent on a runner host, the system truthfully reports `NOT_VERIFIED` without substituting mocked responses.
+7. **Path C (Grafana Cloud Tempo Distributed Traces):** **`PASSED`**. Generates a 128-bit random trace ID and multi-service distributed trace (`verification-gateway-service` -> `verification-order-service`) with W3C TraceContext propagation. Decodes Grafana Cloud Tempo Protobuf base64 byte arrays into lowercase hex IDs. Retrieves complete trace detail by backend ID (strictly rejecting search summaries and fallbacks). Verifies root span ID, individual span IDs, parent-child relationships, service names, timestamps, durations, and attributes.
+8. **Simulation Provenance:** In Simulation Mode, the application truthfully reports `source: "SIMULATION"`, `provenance: "DISABLED"` with zero external network calls. `MOCK_EMULATION` is assigned only when mock observability servers (`x-observability-provider: mock-observability-server`) are active during local testing.

@@ -24,7 +24,7 @@ import fs from "fs";
 import path from "path";
 import http from "http";
 import crypto from "crypto";
-import { trace, SpanStatusCode } from "@opentelemetry/api";
+import { trace, context, SpanStatusCode } from "@opentelemetry/api";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -84,7 +84,19 @@ async function isHttpEndpointReachable(urlStr: string, timeoutMs: number = 2000)
   });
 }
 
-export type LivePipelineStatus = "PASSED" | "FAILED" | "NOT_VERIFIED" | "NOT_VERIFIED_AWAITING_CONFIG";
+export async function isDockerAvailable(): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn("docker", ["info"], { stdio: "ignore" });
+      proc.on("error", () => resolve(false));
+      proc.on("close", (code) => resolve(code === 0));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+export type LivePipelineStatus = "PASSED" | "FAILED" | "NOT_VERIFIED" | "PENDING" | "SKIPPED";
 
 export interface LiveVerificationReport {
   timestamp: string;
@@ -404,6 +416,42 @@ export async function startDisposableOrderService(options?: {
   };
 }
 
+export function generateMarkdownReport(report: LiveVerificationReport): string {
+  const lines: string[] = [];
+  lines.push("# 🔬 IncidentGraphAI — Live Telemetry Acceptance & Verification Report");
+  lines.push("");
+  lines.push(`- **Execution Timestamp**: \`${report.timestamp}\``);
+  lines.push(`- **Overall Verdict**: ${report.overallPassed ? "✅ **PASSED**" : "⚠️ **UNVERIFIED / INCOMPLETE**"}`);
+  lines.push("");
+  lines.push("## Telemetry Pipelines Acceptance Summary");
+  lines.push("");
+  lines.push("| Pipeline | Target Provider | Status | Verification ID / Marker | Export Latency | Query Latency | Evidence & Details |");
+  lines.push("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |");
+
+  const statusBadge = (s: LivePipelineStatus) => {
+    switch (s) {
+      case "PASSED": return "✅ `PASSED`";
+      case "FAILED": return "❌ `FAILED`";
+      case "NOT_VERIFIED": return "⚠️ `NOT_VERIFIED`";
+      case "PENDING": return "⏳ `PENDING`";
+      case "SKIPPED": return "⏭️ `SKIPPED`";
+    }
+  };
+
+  lines.push(`| **Path A: Direct OTLP Metrics** | Grafana Cloud Prometheus | ${statusBadge(report.directOtlpMetricsResult.status)} | \`${report.directOtlpMetricsResult.verificationId || "N/A"}\` | ${report.directOtlpMetricsResult.exportLatencyMs}ms | ${report.directOtlpMetricsResult.queryLatencyMs}ms | ${report.directOtlpMetricsResult.details} |`);
+  lines.push(`| **Path B: Scrape & Remote-Write** | Containerized Prometheus → Grafana Cloud | ${statusBadge(report.prometheusRemoteWriteResult.status)} | \`${report.prometheusRemoteWriteResult.verificationId || "N/A"}\` | N/A | ${report.prometheusRemoteWriteResult.queryLatencyMs}ms | ${report.prometheusRemoteWriteResult.details} |`);
+  lines.push(`| **Path C: Distributed Traces** | Grafana Cloud Tempo | ${statusBadge(report.tracesResult.status)} | \`${report.tracesResult.verificationId || report.tracesResult.traceId || "N/A"}\` | ${report.tracesResult.exportLatencyMs}ms | ${report.tracesResult.queryLatencyMs}ms | ${report.tracesResult.details} |`);
+  lines.push("");
+  lines.push("## Configuration Audit");
+  lines.push("");
+  lines.push(`- **OTLP Ingestion Configured**: ${report.configAudit.hasOtlp ? "Yes" : "No"}`);
+  lines.push(`- **Prometheus Query Configured**: ${report.configAudit.hasPrometheus ? "Yes" : "No"}`);
+  lines.push(`- **Tempo Query Configured**: ${report.configAudit.hasTempo ? "Yes" : "No"}`);
+  lines.push(`- **Remote-Write Dedicated Token Configured**: ${report.configAudit.hasRemoteWrite ? "Yes" : "No"}`);
+  lines.push("");
+  return lines.join("\n");
+}
+
 export async function runLiveObservabilityVerification(): Promise<LiveVerificationReport> {
   console.log("\n===============================================================================");
   console.log("   IncidentGraph AI — Genuine Live Observability Verification Suite (v2.1)");
@@ -448,7 +496,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   const isFullyConfigured = hasOtlp && hasProm && hasTempo;
 
   const directOtlpResult = {
-    status: "NOT_VERIFIED_AWAITING_CONFIG" as LivePipelineStatus,
+    status: "NOT_VERIFIED" as LivePipelineStatus,
     metricName: "incidentgraph_live_verification_total",
     verificationId: "",
     exportLatencyMs: 0,
@@ -457,7 +505,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   };
 
   const prometheusRemoteWriteResult = {
-    status: "NOT_VERIFIED_AWAITING_CONFIG" as LivePipelineStatus,
+    status: "NOT_VERIFIED" as LivePipelineStatus,
     metricName: "http_requests_total",
     verificationId: "",
     scrapeConfirmed: false,
@@ -467,7 +515,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   };
 
   const tracesResult = {
-    status: "NOT_VERIFIED_AWAITING_CONFIG" as LivePipelineStatus,
+    status: "NOT_VERIFIED" as LivePipelineStatus,
     traceId: "",
     verificationId: "",
     exportLatencyMs: 0,
@@ -491,6 +539,8 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
     overallPassed: false,
   };
 
+  const projectRoot = path.resolve(__dirname, "..");
+
   if (!isFullyConfigured) {
     console.log("\n⚠  NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE");
     console.log("   Missing required Grafana Cloud environment variables in .env.");
@@ -498,6 +548,21 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
     report.directOtlpMetricsResult.details = "NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Missing Grafana Cloud credentials";
     report.prometheusRemoteWriteResult.details = "NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Missing Grafana Cloud credentials";
     report.tracesResult.details = "NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Missing Grafana Cloud credentials";
+
+    const mdReport = generateMarkdownReport(report);
+    try {
+      const reportsDir = path.resolve(projectRoot, "reports");
+      if (!fs.existsSync(reportsDir)) {
+        fs.mkdirSync(reportsDir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(reportsDir, "live-observability-acceptance.md"), mdReport, "utf8");
+      if (process.env.GITHUB_STEP_SUMMARY) {
+        fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, "\n" + mdReport + "\n", "utf8");
+      }
+    } catch {
+      // Non-fatal
+    }
+
     return report;
   }
 
@@ -509,12 +574,12 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   // 2. Metrics Verification: Path A (Direct OTLP Ingestion)
   // ---------------------------------------------------------------------------
   console.log("\n--- 2. Metrics Verification (Path A: Direct OpenTelemetry -> Grafana Cloud OTLP) ---");
-  const uniqueMetricId = `verify_otlp_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+  const uniqueMetricId = `verify_otlp_${crypto.randomBytes(16).toString("hex")}`;
   const metricName = "incidentgraph_live_verification_total";
   report.directOtlpMetricsResult.verificationId = uniqueMetricId;
 
   console.log(`  Generating unique synthetic test metric: ${metricName}`);
-  console.log(`  Verification Identifier: ${uniqueMetricId}`);
+  console.log(`  Verification Identifier (128-bit): ${uniqueMetricId}`);
 
   const metricResource = resourceFromAttributes({
     [ATTR_SERVICE_NAME]: "incidentgraph-verification-runner",
@@ -568,20 +633,24 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   console.log("  Querying Grafana Cloud Prometheus PromQL engine to confirm ingestion receipt...");
 
   let metricVerified = false;
-  const maxAttempts = 10;
+  const promBackoff = [2000, 3000, 5000, 7000, 10000, 12000];
+  const maxAttempts = promBackoff.length + 1;
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const queryRes = await promClient.queryInstantDetailed(
-        `${metricName}{verification_id="${uniqueMetricId}"}`
+        `{verification_id="${uniqueMetricId}"}`
       );
       if (queryRes.success && queryRes.records.length > 0) {
         const record = queryRes.records[0];
         const actualMetricName = record.labels["__name__"] || record.metricName;
-        if ((actualMetricName === metricName || actualMetricName.startsWith(metricName)) && Number(record.value) >= 1) {
+        const matchesExactId = record.labels["verification_id"] === uniqueMetricId;
+        const hasValidTimestamp = typeof record.timestamp === "number" && record.timestamp > 0;
+        if (actualMetricName.includes("incidentgraph_live_verification") && matchesExactId && Number(record.value) >= 1 && hasValidTimestamp) {
           metricVerified = true;
           report.directOtlpMetricsResult.status = "PASSED";
           report.directOtlpMetricsResult.queryLatencyMs = Date.now() - promQueryStart;
-          report.directOtlpMetricsResult.details = `Ingestion confirmed: received ${queryRes.records.length} sample(s) with matching verification ID and value ${record.value}.`;
+          report.directOtlpMetricsResult.details = `Ingestion confirmed: received sample with exact verification ID ${uniqueMetricId}, metric name ${actualMetricName}, value ${record.value}, and timestamp ${record.timestamp}.`;
           console.log(`  ✓ [PASS] Direct OTLP ingestion confirmed in Prometheus on attempt ${attempt} (${report.directOtlpMetricsResult.queryLatencyMs}ms total).`);
           break;
         }
@@ -600,8 +669,9 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
       }
     }
     if (!metricVerified && attempt < maxAttempts) {
-      console.log(`    ↳ Indexing in progress... waiting for ingestion propagation (attempt ${attempt}/${maxAttempts})`);
-      await sleep(3000);
+      const waitMs = promBackoff[attempt - 1] || 3000;
+      console.log(`    ↳ Indexing in progress... waiting ${waitMs}ms (attempt ${attempt}/${maxAttempts})`);
+      await sleep(waitMs);
     }
   }
 
@@ -622,148 +692,156 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   let disposableService: DisposableServiceInstance | null = null;
 
   try {
-    console.log("  Starting isolated disposable order-service instance with dynamic port allocation...");
-    disposableService = await startDisposableOrderService();
-    const testAuthToken = disposableService.token;
-    const orderServiceBase = disposableService.baseUrl;
-    const orderServicePort = disposableService.port;
-    console.log(`  ✓ Disposable order-service bound to isolated port ${disposableService.port}.`);
-
-    // Record synthetic metric via actual running sample-service HTTP endpoint with test authentication
-    console.log(`  Emitting synthetic metric to ${orderServiceBase}/test/record-metric with verification_id: ${uniqueRwId}`);
-    const postRes = await fetch(`${orderServiceBase}/test/record-metric`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-test-token": testAuthToken,
-      },
-      body: JSON.stringify({
-        verification_id: uniqueRwId,
-        count: 1,
-        status: "test_verified",
-      }),
-    });
-
-    if (!postRes.ok) {
-      throw new Error(`Failed to record metric via order-service HTTP endpoint: status ${postRes.status}`);
-    }
-
-    // Confirm that the real /metrics endpoint exposes the metric
-    const metricsRes = await fetch(`${orderServiceBase}/metrics`);
-    const metricsText = await metricsRes.text();
-    if (!metricsText.includes(`verification_id="${uniqueRwId}"`)) {
-      throw new Error("Synthetic metric was not exposed by order-service /metrics endpoint");
-    }
-    console.log("  ✓ Confirmed synthetic metric is exposed on order-service /metrics endpoint.");
-
-    // Check local Prometheus availability
-    const localPrometheusUrl = process.env.PROMETHEUS_URL || "http://localhost:9090";
-    const isLocalPrometheusUp = await isHttpEndpointReachable(`${localPrometheusUrl}/-/healthy`, 2000);
-
-    if (!isLocalPrometheusUp) {
+    const dockerUp = await isDockerAvailable();
+    if (!dockerUp) {
       report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
       report.prometheusRemoteWriteResult.scrapeConfirmed = false;
-      report.prometheusRemoteWriteResult.details = `Local Prometheus instance (${localPrometheusUrl}) is offline. Scrape and remote-write could not be verified. State: Prometheus unavailable.`;
-      console.log(`  ℹ [Prometheus unavailable] Local Prometheus (${localPrometheusUrl}) is offline.`);
+      report.prometheusRemoteWriteResult.details = "Docker engine unavailable on this runner host. Isolated containerized Prometheus scraping and remote-write verification preserved as NOT_VERIFIED.";
+      console.log("  ℹ [Docker unavailable] Docker engine is not available on this host. Path B preserved as NOT_VERIFIED without mock substitution.");
     } else {
-      console.log(`  ✓ Local Prometheus instance (${localPrometheusUrl}) is online.`);
+      console.log("  Starting isolated disposable order-service instance with dynamic port allocation...");
+      disposableService = await startDisposableOrderService();
+      const testAuthToken = disposableService.token;
+      const orderServiceBase = disposableService.baseUrl;
+      const orderServicePort = disposableService.port;
+      console.log(`  ✓ Disposable order-service bound to isolated port ${disposableService.port}.`);
 
-      // Verify target scrape health using Prometheus targets API (poll up to 5s for file_sd refresh)
-      let targetUp = false;
-      for (let tAttempt = 1; tAttempt <= 5; tAttempt++) {
-        try {
-          const targetsRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
-          if (targetsRes.ok) {
-            const targetsJson = await targetsRes.json() as { data?: { activeTargets?: Array<{ discoveredLabels?: Record<string, string>; health?: string; scrapeUrl?: string }> } };
-            const activeTargets = targetsJson.data?.activeTargets || [];
-            targetUp = activeTargets.some(
-              (t) => (t.scrapeUrl?.includes(`:${orderServicePort}`) || t.discoveredLabels?.["__address__"]?.includes(`:${orderServicePort}`)) && t.health === "up"
-            );
-            if (targetUp) break;
-          }
-        } catch {
-          // non-fatal
-        }
-        if (!targetUp && tAttempt < 5) await sleep(1000);
+      // Record synthetic metric via actual running sample-service HTTP endpoint with test authentication
+      console.log(`  Emitting synthetic metric to ${orderServiceBase}/test/record-metric with verification_id: ${uniqueRwId}`);
+      const postRes = await fetch(`${orderServiceBase}/test/record-metric`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-test-token": testAuthToken,
+        },
+        body: JSON.stringify({
+          verification_id: uniqueRwId,
+          count: 1,
+          status: "test_verified",
+        }),
+      });
+
+      if (!postRes.ok) {
+        throw new Error(`Failed to record metric via order-service HTTP endpoint: status ${postRes.status}`);
       }
 
-      // Confirm local Prometheus has actually scraped the exact verification ID
-      console.log("  Querying local Prometheus to confirm actual scrape of verification ID...");
-      let localScraped = false;
-      for (let attempt = 1; attempt <= 6; attempt++) {
-        try {
-          const promLocalRes = await fetch(
-            `${localPrometheusUrl}/api/v1/query?query=${encodeURIComponent(`http_requests_total{verification_id="${uniqueRwId}"}`)}`
-          );
-          if (promLocalRes.ok) {
-            const promJson = await promLocalRes.json() as { data?: { result?: Array<{ value?: [number, string] }> } };
-            const results = promJson.data?.result || [];
-            if (results.length > 0 && Number(results[0].value?.[1]) >= 1) {
-              localScraped = true;
-              break;
-            }
-          }
-        } catch {
-          // Retry
-        }
-        if (attempt < 6) await sleep(2000);
+      // Confirm that the real /metrics endpoint exposes the metric
+      const metricsRes = await fetch(`${orderServiceBase}/metrics`);
+      const metricsText = await metricsRes.text();
+      if (!metricsText.includes(`verification_id="${uniqueRwId}"`)) {
+        throw new Error("Synthetic metric was not exposed by order-service /metrics endpoint");
       }
+      console.log("  ✓ Confirmed synthetic metric is exposed on order-service /metrics endpoint.");
 
-      if (!localScraped) {
+      // Check local Prometheus availability
+      const localPrometheusUrl = process.env.PROMETHEUS_URL || "http://localhost:9090";
+      const isLocalPrometheusUp = await isHttpEndpointReachable(`${localPrometheusUrl}/-/healthy`, 2000);
+
+      if (!isLocalPrometheusUp) {
         report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
         report.prometheusRemoteWriteResult.scrapeConfirmed = false;
-        report.prometheusRemoteWriteResult.details = `Target scrape unconfirmed: local Prometheus has not scraped verification ID within polling window (target health: ${targetUp ? "UP" : "PENDING/DOWN"}). State: Target not scraped.`;
-        console.log(`  ℹ [Target not scraped] Metric exposed on /metrics, but local Prometheus scrape was not observed within window.`);
+        report.prometheusRemoteWriteResult.details = `Local Prometheus instance (${localPrometheusUrl}) is offline. Scrape and remote-write could not be verified. State: Prometheus unavailable.`;
+        console.log(`  ℹ [Prometheus unavailable] Local Prometheus (${localPrometheusUrl}) is offline.`);
       } else {
-        report.prometheusRemoteWriteResult.scrapeConfirmed = true;
-        console.log(`  ✓ [Local scrape succeeded] Local Prometheus confirmed scrape of verification ID.`);
+        console.log(`  ✓ Local Prometheus instance (${localPrometheusUrl}) is online.`);
 
-        // Now evaluate remote-write
-        if (!hasRemoteWrite) {
-          report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
-          report.prometheusRemoteWriteResult.details = `NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Local Prometheus scrape confirmed, but remote-write is not configured: ${rwValidation.reason}. State: Remote-write not configured.`;
-          console.log(`  ℹ [Remote-write not configured] NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: ${rwValidation.reason}.`);
-        } else {
-          console.log("  Querying Grafana Cloud Prometheus to confirm remote-write delivery...");
-          const rwQueryStart = Date.now();
-          let rwVerified = false;
-          let rwFailed = false;
-          let rwErrorMsg = "";
-
-          for (let attempt = 1; attempt <= 6; attempt++) {
-            try {
-              const rwRes = await promClient.queryInstantDetailed(
-                `http_requests_total{verification_id="${uniqueRwId}",service="order-service"}`
+        // Verify target scrape health using Prometheus targets API (poll up to 5s for file_sd refresh)
+        let targetUp = false;
+        for (let tAttempt = 1; tAttempt <= 5; tAttempt++) {
+          try {
+            const targetsRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
+            if (targetsRes.ok) {
+              const targetsJson = await targetsRes.json() as { data?: { activeTargets?: Array<{ discoveredLabels?: Record<string, string>; health?: string; scrapeUrl?: string }> } };
+              const activeTargets = targetsJson.data?.activeTargets || [];
+              targetUp = activeTargets.some(
+                (t) => (t.scrapeUrl?.includes(`:${orderServicePort}`) || t.discoveredLabels?.["__address__"]?.includes(`:${orderServicePort}`)) && t.health === "up"
               );
-              if (rwRes.success && rwRes.records.length > 0) {
-                const record = rwRes.records[0];
-                if (Number(record.value) >= 1) {
-                  rwVerified = true;
-                  report.prometheusRemoteWriteResult.status = "PASSED";
-                  report.prometheusRemoteWriteResult.queryLatencyMs = Date.now() - rwQueryStart;
-                  report.prometheusRemoteWriteResult.details = `External Grafana Cloud read-back confirmed: matched exact metric, verification ID ${uniqueRwId}, service order-service, and value ${record.value}.`;
-                  console.log(`  ✓ [External Grafana Cloud read-back confirmed] Remote-write verified in Grafana Cloud TSDB (${report.prometheusRemoteWriteResult.queryLatencyMs}ms).`);
-                  break;
-                }
-              }
-            } catch (err: unknown) {
-              rwFailed = true;
-              rwErrorMsg = err instanceof Error ? err.message : String(err);
+              if (targetUp) break;
             }
-            if (!rwVerified && attempt < 6) {
-              await sleep(2500);
-            }
+          } catch {
+            // non-fatal
           }
+          if (!targetUp && tAttempt < 5) await sleep(1000);
+        }
 
-          if (!rwVerified) {
-            if (rwFailed) {
-              report.prometheusRemoteWriteResult.status = "FAILED";
-              report.prometheusRemoteWriteResult.details = `Remote-write delivery failed: ${rwErrorMsg}. State: Remote-write delivery failed.`;
-              console.log(`  ✗ [Remote-write delivery failed] Query to Grafana Cloud TSDB failed: ${rwErrorMsg}`);
-            } else {
-              report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
-              report.prometheusRemoteWriteResult.details = "Remote-write delivery pending: local Prometheus scraped metric, but remote-written metric was not confirmed in Grafana Cloud TSDB within window. State: Remote-write delivery pending.";
-              console.log("  ℹ [Remote-write delivery pending] Awaiting Grafana Cloud TSDB ingestion confirmation.");
+        // Confirm local Prometheus has actually scraped the exact verification ID
+        console.log("  Querying local Prometheus to confirm actual scrape of verification ID...");
+        let localScraped = false;
+        for (let attempt = 1; attempt <= 6; attempt++) {
+          try {
+            const promLocalRes = await fetch(
+              `${localPrometheusUrl}/api/v1/query?query=${encodeURIComponent(`http_requests_total{verification_id="${uniqueRwId}"}`)}`
+            );
+            if (promLocalRes.ok) {
+              const promJson = await promLocalRes.json() as { data?: { result?: Array<{ value?: [number, string] }> } };
+              const results = promJson.data?.result || [];
+              if (results.length > 0 && Number(results[0].value?.[1]) >= 1) {
+                localScraped = true;
+                break;
+              }
+            }
+          } catch {
+            // Retry
+          }
+          if (attempt < 6) await sleep(2000);
+        }
+
+        if (!localScraped) {
+          report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+          report.prometheusRemoteWriteResult.scrapeConfirmed = false;
+          report.prometheusRemoteWriteResult.details = `Target scrape unconfirmed: local Prometheus has not scraped verification ID within polling window (target health: ${targetUp ? "UP" : "PENDING/DOWN"}). State: Target not scraped.`;
+          console.log(`  ℹ [Target not scraped] Metric exposed on /metrics, but local Prometheus scrape was not observed within window.`);
+        } else {
+          report.prometheusRemoteWriteResult.scrapeConfirmed = true;
+          console.log(`  ✓ [Local scrape succeeded] Local Prometheus confirmed scrape of verification ID.`);
+
+          // Now evaluate remote-write
+          if (!hasRemoteWrite) {
+            report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+            report.prometheusRemoteWriteResult.details = `NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Local Prometheus scrape confirmed, but remote-write is not configured: ${rwValidation.reason}. State: Remote-write not configured.`;
+            console.log(`  ℹ [Remote-write not configured] NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: ${rwValidation.reason}.`);
+          } else {
+            console.log("  Querying Grafana Cloud Prometheus to confirm remote-write delivery...");
+            const rwQueryStart = Date.now();
+            let rwVerified = false;
+            let rwFailed = false;
+            let rwErrorMsg = "";
+
+            for (let attempt = 1; attempt <= 6; attempt++) {
+              try {
+                const rwRes = await promClient.queryInstantDetailed(
+                  `http_requests_total{verification_id="${uniqueRwId}",service="order-service"}`
+                );
+                if (rwRes.success && rwRes.records.length > 0) {
+                  const record = rwRes.records[0];
+                  if (Number(record.value) >= 1) {
+                    rwVerified = true;
+                    report.prometheusRemoteWriteResult.status = "PASSED";
+                    report.prometheusRemoteWriteResult.queryLatencyMs = Date.now() - rwQueryStart;
+                    report.prometheusRemoteWriteResult.details = `External Grafana Cloud read-back confirmed: matched exact metric, verification ID ${uniqueRwId}, service order-service, and value ${record.value}.`;
+                    console.log(`  ✓ [External Grafana Cloud read-back confirmed] Remote-write verified in Grafana Cloud TSDB (${report.prometheusRemoteWriteResult.queryLatencyMs}ms).`);
+                    break;
+                  }
+                }
+              } catch (err: unknown) {
+                rwFailed = true;
+                rwErrorMsg = err instanceof Error ? err.message : String(err);
+              }
+              if (!rwVerified && attempt < 6) {
+                await sleep(2500);
+              }
+            }
+
+            if (!rwVerified) {
+              if (rwFailed) {
+                report.prometheusRemoteWriteResult.status = "FAILED";
+                report.prometheusRemoteWriteResult.details = `Remote-write delivery failed: ${rwErrorMsg}. State: Remote-write delivery failed.`;
+                console.log(`  ✗ [Remote-write delivery failed] Query to Grafana Cloud TSDB failed: ${rwErrorMsg}`);
+              } else {
+                report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+                report.prometheusRemoteWriteResult.details = "Remote-write delivery pending: local Prometheus scraped metric, but remote-written metric was not confirmed in Grafana Cloud TSDB within window. State: Remote-write delivery pending.";
+                console.log("  ℹ [Remote-write delivery pending] Awaiting Grafana Cloud TSDB ingestion confirmation.");
+              }
             }
           }
         }
@@ -789,7 +867,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   // 4. Traces Verification: Strict Tempo Trace Verification
   // ---------------------------------------------------------------------------
   console.log("\n--- 4. Distributed Trace Ingestion Verification (Strict Tempo) ---");
-  const uniqueTraceVerificationId = `verify_trace_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
+  const uniqueTraceVerificationId = `verify_trace_${Date.now().toString(36)}_${crypto.randomBytes(16).toString("hex")}`;
   report.tracesResult.verificationId = uniqueTraceVerificationId;
 
   const traceResource = resourceFromAttributes({
@@ -811,24 +889,45 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   tracerProvider.register();
 
   const tracer = trace.getTracer("live-verification-tracer", "1.0.0");
-  const span = tracer.startSpan("live-verification-span");
-  span.setAttribute("verification.id", uniqueTraceVerificationId);
-  span.setAttribute("service.name", "incidentgraph-verification-runner");
-  span.setAttribute("test.type", "external-ingestion-smoke-test");
-  span.setStatus({ code: SpanStatusCode.OK });
 
-  const generatedTraceId = span.spanContext().traceId;
+  // 1. Root span
+  const rootSpan = tracer.startSpan("live-verification-root-gateway", {
+    attributes: {
+      "verification.id": uniqueTraceVerificationId,
+      "service.name": "verification-gateway-service",
+      "test.type": "external-ingestion-acceptance",
+    },
+  });
+  rootSpan.setStatus({ code: SpanStatusCode.OK });
+
+  const generatedTraceId = rootSpan.spanContext().traceId;
   report.tracesResult.traceId = generatedTraceId;
-  console.log(`  Generated test trace with ID: ${generatedTraceId}`);
-  console.log(`  Verification Identifier: ${uniqueTraceVerificationId}`);
+  console.log(`  Generated multi-service test trace with ID: ${generatedTraceId}`);
+  console.log(`  Verification Identifier (128-bit): ${uniqueTraceVerificationId}`);
+
+  // 2. Child span linked via W3C Trace Context propagation
+  const ctx = trace.setSpan(context.active(), rootSpan);
+  const childSpan = tracer.startSpan(
+    "live-verification-child-order",
+    {
+      attributes: {
+        "verification.id": uniqueTraceVerificationId,
+        "service.name": "verification-order-service",
+        "test.type": "external-ingestion-acceptance",
+      },
+    },
+    ctx
+  );
+  childSpan.setStatus({ code: SpanStatusCode.OK });
 
   const traceExportStart = Date.now();
-  span.end();
+  childSpan.end();
+  rootSpan.end();
 
   try {
     await tracerProvider.forceFlush();
     report.tracesResult.exportLatencyMs = Date.now() - traceExportStart;
-    console.log(`  ✓ Trace successfully exported via OTLP HTTPS to Grafana Cloud Tempo (${report.tracesResult.exportLatencyMs}ms).`);
+    console.log(`  ✓ Multi-service trace successfully exported via OTLP HTTPS to Grafana Cloud Tempo (${report.tracesResult.exportLatencyMs}ms).`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     report.tracesResult.status = "FAILED";
@@ -842,7 +941,10 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   console.log("  Querying Grafana Cloud Tempo API (Strict mode: Fallbacks rejected, exact trace ID & verification ID required)...");
 
   let traceVerified = false;
-  for (let attempt = 1; attempt <= 6; attempt++) {
+  const tempoBackoff = [2000, 3000, 4000, 6000, 8000, 10000, 12000];
+  const maxTempoAttempts = tempoBackoff.length + 1;
+
+  for (let attempt = 1; attempt <= maxTempoAttempts; attempt++) {
     try {
       // 1. Direct fetch by Trace ID with allowFallback: false
       const directTrace = await tempoClient.getTraceById(generatedTraceId, { allowFallback: false });
@@ -853,7 +955,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
         report.tracesResult.status = "PASSED";
         report.tracesResult.queryLatencyMs = Date.now() - tempoQueryStart;
         report.tracesResult.details = `Trace retrieved directly via Tempo Trace ID API (matched trace ID ${generatedTraceId}, ${directTrace.allSpans.length} verified real span(s)).`;
-        console.log(`  ✓ [PASS] Trace confirmed in Tempo via Trace ID on attempt ${attempt} (${report.tracesResult.queryLatencyMs}ms total).`);
+        console.log(`  ✓ [PASS] Multi-service trace confirmed in Tempo via Trace ID on attempt ${attempt} (${report.tracesResult.queryLatencyMs}ms total, ${directTrace.allSpans.length} spans verified).`);
         break;
       }
 
@@ -890,14 +992,15 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
         }
       }
     } catch (err: unknown) {
-      if (attempt === 6) {
+      if (attempt === maxTempoAttempts) {
         report.tracesResult.status = "FAILED";
         report.tracesResult.details = `Tempo read-back failed: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
-    if (!traceVerified && attempt < 6) {
-      console.log(`    ↳ Propagating in Tempo block storage... waiting (attempt ${attempt}/6)`);
-      await sleep(2500);
+    if (!traceVerified && attempt < maxTempoAttempts) {
+      const waitMs = tempoBackoff[attempt - 1] || 5000;
+      console.log(`    ↳ Propagating in Tempo block storage... waiting ${waitMs}ms (attempt ${attempt}/${maxTempoAttempts})`);
+      await sleep(waitMs);
     }
   }
 
@@ -973,6 +1076,20 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
 
   console.log(`   Final Verdict: ${finalVerdictBadge}`);
   console.log("===============================================================================\n");
+
+  const mdReport = generateMarkdownReport(report);
+  try {
+    const reportsDir = path.resolve(projectRoot, "reports");
+    if (!fs.existsSync(reportsDir)) {
+      fs.mkdirSync(reportsDir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(reportsDir, "live-observability-acceptance.md"), mdReport, "utf8");
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, "\n" + mdReport + "\n", "utf8");
+    }
+  } catch {
+    // Non-fatal
+  }
 
   return report;
 }

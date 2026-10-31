@@ -53,6 +53,28 @@ export interface TraceQueryDetailedResult {
   diagnostic: ProviderDiagnostic;
 }
 
+export function decodeTempoId(id?: string): string | undefined {
+  if (!id || typeof id !== "string") return undefined;
+  const trimmed = id.trim();
+  if (trimmed.length === 0) return undefined;
+  // If already 16 or 32 hex chars, lowercase and return
+  if (/^[0-9a-fA-F]{16}$/.test(trimmed) || /^[0-9a-fA-F]{32}$/.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  // If base64-encoded bytes (16 bytes for trace ID or 8 bytes for span ID)
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed)) {
+    try {
+      const buf = Buffer.from(trimmed, "base64");
+      if (buf.length === 16 || buf.length === 8) {
+        return buf.toString("hex").toLowerCase();
+      }
+    } catch {
+      // Non-base64 fallback
+    }
+  }
+  return trimmed;
+}
+
 export class JaegerClient {
   private baseUrl: string;
   private timeoutMs: number;
@@ -312,6 +334,32 @@ export class JaegerClient {
         return parsed;
       }
       if (json.batches || json.resourceSpans || json.spans || json.traceID || json.traceId) {
+        // If top-level traceID/traceId is missing on cloud Tempo backend, extract from genuine backend spans
+        if (this.isCloud && !json.traceID && !json.traceId && (json.batches || json.resourceSpans)) {
+          const rawBatches = (json.batches || json.resourceSpans) as Array<{
+            traceId?: string;
+            traceID?: string;
+            scopeSpans?: Array<{
+              spans?: Array<{ traceId?: string; traceID?: string }>;
+            }>;
+          }>;
+          let candidateId: string | undefined;
+          for (const b of rawBatches) {
+            candidateId = decodeTempoId(b.traceID || b.traceId);
+            if (candidateId) break;
+            for (const sc of b.scopeSpans || []) {
+              for (const sp of sc.spans || []) {
+                candidateId = decodeTempoId(sp.traceID || sp.traceId);
+                if (candidateId) break;
+              }
+              if (candidateId) break;
+            }
+            if (candidateId) break;
+          }
+          if (candidateId) {
+            json.traceID = candidateId;
+          }
+        }
         return this.parseTempoTraceDetail(json, traceId, { allowFallback });
       }
       return null;
@@ -378,7 +426,27 @@ export class JaegerClient {
           reason: `Wrong individual span ID: Span ${span.spanId} trace ID mismatch: expected ${expectedTraceId}, got ${span.traceId}`,
         };
       }
+      if (!span.serviceName || span.serviceName.trim().length === 0) {
+        return { valid: false, reason: `Span ${span.spanId} is missing serviceName` };
+      }
+      if (typeof span.startTimeUs !== "number" || span.startTimeUs <= 0) {
+        return { valid: false, reason: `Span ${span.spanId} has invalid startTimeUs: ${span.startTimeUs}` };
+      }
+      if (typeof span.durationMs !== "number" || span.durationMs < 0) {
+        return { valid: false, reason: `Span ${span.spanId} has invalid durationMs: ${span.durationMs}` };
+      }
     }
+
+    // Validate parent-child references: any span with parentSpanId must reference an existing span in the trace
+    for (const span of trace.allSpans) {
+      if (span.parentSpanId && !seenSpanIds.has(span.parentSpanId)) {
+        return {
+          valid: false,
+          reason: `Invalid parent-child relationship: Span ${span.spanId} references non-existent parent span ${span.parentSpanId}`,
+        };
+      }
+    }
+
     const hasAttr = trace.allSpans.some(
       (s) =>
         s.attributes["verification.id"] === expectedVerificationId ||
@@ -491,8 +559,10 @@ export class JaegerClient {
     }
 
     const jsonRecord = json as Record<string, unknown>;
-    const jsonTraceID = typeof jsonRecord.traceID === "string" ? jsonRecord.traceID.trim() : "";
-    const jsonTraceId = typeof jsonRecord.traceId === "string" ? jsonRecord.traceId.trim() : "";
+    const rawJsonTraceID = typeof jsonRecord.traceID === "string" ? jsonRecord.traceID.trim() : "";
+    const rawJsonTraceId = typeof jsonRecord.traceId === "string" ? jsonRecord.traceId.trim() : "";
+    const jsonTraceID = decodeTempoId(rawJsonTraceID) || "";
+    const jsonTraceId = decodeTempoId(rawJsonTraceId) || "";
     if (!allowFallback && jsonTraceID && jsonTraceId && jsonTraceID.toLowerCase() !== jsonTraceId.toLowerCase()) {
       return null;
     }
@@ -517,8 +587,8 @@ export class JaegerClient {
           name?: string;
           startTimeUnixNano?: string;
           endTimeUnixNano?: string;
-          status?: { code?: number; message?: string };
-          attributes?: Array<{ key: string; value: { stringValue?: string; intValue?: number; boolValue?: boolean } }>;
+          status?: { code?: number | string; message?: string };
+          attributes?: Array<{ key: string; value: { stringValue?: string; intValue?: number; boolValue?: boolean; doubleValue?: number } }>;
         }>;
       }>;
     }>) || [];
@@ -537,8 +607,10 @@ export class JaegerClient {
       const serviceName = serviceAttr?.value?.stringValue || "unknown-service";
       services.add(serviceName);
 
-      const batchTraceID = typeof batch.traceID === "string" ? batch.traceID.trim() : "";
-      const batchTraceId = typeof batch.traceId === "string" ? batch.traceId.trim() : "";
+      const rawBatchTraceID = typeof batch.traceID === "string" ? batch.traceID.trim() : "";
+      const rawBatchTraceId = typeof batch.traceId === "string" ? batch.traceId.trim() : "";
+      const batchTraceID = decodeTempoId(rawBatchTraceID) || "";
+      const batchTraceId = decodeTempoId(rawBatchTraceId) || "";
       if (!allowFallback && batchTraceID && batchTraceId && batchTraceID.toLowerCase() !== batchTraceId.toLowerCase()) {
         return null;
       }
@@ -550,8 +622,10 @@ export class JaegerClient {
 
       for (const scope of batch.scopeSpans || []) {
         for (const rawSpan of scope.spans || []) {
-          const spanTraceID = typeof rawSpan.traceID === "string" ? rawSpan.traceID.trim() : "";
-          const spanTraceId = typeof rawSpan.traceId === "string" ? rawSpan.traceId.trim() : "";
+          const rawSpanTraceID = typeof rawSpan.traceID === "string" ? rawSpan.traceID.trim() : "";
+          const rawSpanTraceId = typeof rawSpan.traceId === "string" ? rawSpan.traceId.trim() : "";
+          const spanTraceID = decodeTempoId(rawSpanTraceID) || "";
+          const spanTraceId = decodeTempoId(rawSpanTraceId) || "";
 
           if (!allowFallback) {
             // Reject conflicting field spellings on the span
@@ -578,8 +652,10 @@ export class JaegerClient {
 
           const spanFinalTraceId = rawTraceId || (allowFallback ? requestedTraceId : "");
 
-          const spanSpanID = typeof rawSpan.spanID === "string" ? rawSpan.spanID.trim() : "";
-          const spanSpanId = typeof rawSpan.spanId === "string" ? rawSpan.spanId.trim() : "";
+          const rawSpanSpanID = typeof rawSpan.spanID === "string" ? rawSpan.spanID.trim() : "";
+          const rawSpanSpanId = typeof rawSpan.spanId === "string" ? rawSpan.spanId.trim() : "";
+          const spanSpanID = decodeTempoId(rawSpanSpanID) || "";
+          const spanSpanId = decodeTempoId(rawSpanSpanId) || "";
 
           if (!allowFallback) {
             if (spanSpanID && spanSpanId && spanSpanID.toLowerCase() !== spanSpanId.toLowerCase()) {
@@ -598,16 +674,16 @@ export class JaegerClient {
           if (!allowFallback && spanMap.has(sId)) {
             return null;
           }
-          const pId = rawSpan.parentSpanId || rawSpan.parentSpanID || undefined;
+          const pId = decodeTempoId(rawSpan.parentSpanId || rawSpan.parentSpanID) || undefined;
           const startMs = rawSpan.startTimeUnixNano ? Number(BigInt(rawSpan.startTimeUnixNano) / BigInt(1e6)) : Date.now();
           const endMs = rawSpan.endTimeUnixNano ? Number(BigInt(rawSpan.endTimeUnixNano) / BigInt(1e6)) : startMs + 10;
           const duration = Math.max(1, Math.round(endMs - startMs));
-          const isErr = rawSpan.status?.code === 2;
+          const isErr = rawSpan.status?.code === 2 || rawSpan.status?.code === "STATUS_CODE_ERROR";
           if (isErr) hasErrors = true;
 
           const attrs: Record<string, unknown> = { "service.name": serviceName };
           for (const a of rawSpan.attributes || []) {
-            attrs[a.key] = a.value.stringValue ?? a.value.intValue ?? a.value.boolValue;
+            attrs[a.key] = a.value.stringValue ?? a.value.intValue ?? a.value.boolValue ?? a.value.doubleValue;
           }
 
           const span: TraceSpan = {
