@@ -185,15 +185,22 @@ export async function startDisposableOrderService(options?: {
     tryListen(${preferredPort}, false);
   `;
 
+  const tsxCliPath = path.resolve(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const spawnArgs = fs.existsSync(tsxCliPath)
+    ? [tsxCliPath, "-e", childScript]
+    : ["--input-type=module", "--import", "tsx", "-e", childScript];
+
   const child = spawn(
     process.execPath,
-    ["--import", "tsx", "-e", childScript],
+    spawnArgs,
     {
       cwd: projectRoot,
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     }
   );
+
+  let targetFilePath: string | undefined;
 
   const cleanupChild = (): void => {
     if (targetFilePath && fs.existsSync(targetFilePath)) {
@@ -230,6 +237,7 @@ export async function startDisposableOrderService(options?: {
       }, 10000);
 
       let stdoutBuffer = "";
+      let stderrBuffer = "";
 
       const onData = (chunk: Buffer) => {
         stdoutBuffer += chunk.toString("utf8");
@@ -242,6 +250,9 @@ export async function startDisposableOrderService(options?: {
       };
 
       child.stdout?.on("data", onData);
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderrBuffer += chunk.toString("utf8");
+      });
 
       child.once("error", (err) => {
         clearTimeout(timeout);
@@ -250,7 +261,8 @@ export async function startDisposableOrderService(options?: {
 
       child.once("exit", (code, signal) => {
         clearTimeout(timeout);
-        reject(new Error(`Disposable order-service child process exited prematurely with code ${code}, signal ${signal}`));
+        const detail = stderrBuffer.trim() ? ` Stderr: ${stderrBuffer.trim()}` : "";
+        reject(new Error(`Disposable order-service child process exited prematurely with code ${code}, signal ${signal}.${detail}`));
       });
     });
   } catch (err) {
@@ -261,7 +273,6 @@ export async function startDisposableOrderService(options?: {
   const baseUrl = `http://localhost:${boundPort}`;
 
   // File-based Service Discovery: register dynamic target for Prometheus
-  let targetFilePath: string | undefined;
   if (options?.registerPrometheusTarget !== false) {
     try {
       const fileSdDir = path.resolve(projectRoot, "docker", "file_sd");

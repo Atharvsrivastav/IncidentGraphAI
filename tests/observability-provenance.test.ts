@@ -2804,6 +2804,15 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
         }
       });
 
+      afterEach(async () => {
+        delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+        delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+        (process.env as Record<string, string | undefined>).NODE_ENV = "test";
+        if (boundServer && boundServer.listening) {
+          await new Promise<void>((resolve) => boundServer.close(() => resolve()));
+        }
+      });
+
       it("returns 413 when cleanup payload exceeds 1024 bytes", async () => {
         const oversizedBody = JSON.stringify({
           verification_id: "verify_oversized_cleanup_test",
