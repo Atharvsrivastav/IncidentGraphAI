@@ -7,6 +7,7 @@ import { ObservedServiceMetric, DistributedTrace } from "@/lib/telemetry/types";
 import { PrometheusRegistry, sanitizeErrorMessage } from "../sample-services/shared/telemetry";
 import http from "http";
 import fs from "fs";
+import path from "path";
 import {
   validateRemoteWriteConfig,
   generatePrometheusConfig,
@@ -3027,6 +3028,7 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
           exitCode: number | null;
           signalCode: NodeJS.Signals | null;
           killed: boolean;
+          pid: number;
           kill: (signal?: NodeJS.Signals | number) => boolean;
           once: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
           removeListener: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
@@ -3036,6 +3038,7 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
           exitCode: null,
           signalCode: null,
           killed: false,
+          pid: 12345,
           kill: (signal?: NodeJS.Signals | number) => {
             const sigStr = String(signal ?? "SIGTERM");
             killSignals.push(sigStr);
@@ -3189,6 +3192,263 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
 
         await service.stop();
         expect(discovered).toBe(true);
+      });
+
+      it("validates docker-compose.yml host-gateway extra_hosts and file_sd volume mounting", () => {
+        const composePath = path.resolve(__dirname, "..", "docker-compose.yml");
+        expect(fs.existsSync(composePath)).toBe(true);
+        const composeContent = fs.readFileSync(composePath, "utf8");
+        const parsed = YAML.parse(composeContent) as {
+          services?: {
+            prometheus?: {
+              extra_hosts?: string[];
+              volumes?: string[];
+              ports?: string[];
+            };
+          };
+        };
+        expect(parsed.services?.prometheus).toBeDefined();
+        expect(parsed.services?.prometheus?.extra_hosts).toContain("host.docker.internal:host-gateway");
+        expect(parsed.services?.prometheus?.volumes).toContain("./docker/file_sd:/etc/prometheus/file_sd");
+        expect(parsed.services?.prometheus?.ports).toContain("9090:9090");
+      });
+    });
+
+    describe("6. Detailed TTL Boundary Conditions & Interleaved Expiry", () => {
+      it("evaluates exact boundary conditions: 1ms before TTL, exact TTL, and 1ms after TTL", () => {
+        const reg = new PrometheusRegistry("boundary-service");
+        let currentTime = 500000;
+        reg.setTimeProvider(() => currentTime);
+        const ttlMs = reg.getSyntheticIdTtlMs(); // 300,000ms
+
+        reg.recordRequest(1, { verification_id: "verify_boundary_exact" });
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["verify_boundary_exact"]);
+
+        // 1ms before TTL: 500000 + 300000 - 1 = 799999
+        currentTime = 500000 + ttlMs - 1;
+        const outBefore = reg.toPrometheusFormat();
+        expect(outBefore).toContain('verification_id="verify_boundary_exact"');
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(1);
+
+        // Exact TTL: 500000 + 300000 = 800000 (now - registeredAt >= ttl -> expires!)
+        currentTime = 500000 + ttlMs;
+        const outExact = reg.toPrometheusFormat();
+        expect(outExact).not.toContain('verification_id="verify_boundary_exact"');
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(0);
+
+        // 1ms after TTL: still expired
+        currentTime = 500000 + ttlMs + 1;
+        const outAfter = reg.toPrometheusFormat();
+        expect(outAfter).not.toContain('verification_id="verify_boundary_exact"');
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(0);
+      });
+
+      it("handles interleaved synthetic IDs with staggered registration and expiration times", () => {
+        const reg = new PrometheusRegistry("staggered-service");
+        let currentTime = 1000000;
+        reg.setTimeProvider(() => currentTime);
+        const ttl = 300000; // 5 min
+
+        // ID_A registered at T=1,000,000
+        reg.recordRequest(1, { verification_id: "id_alpha" });
+
+        // Advance 100s, register ID_B at T=1,100,000
+        currentTime += 100000;
+        reg.recordRequest(1, { verification_id: "id_beta" });
+
+        expect(reg.getActiveSyntheticVerificationIds().sort()).toEqual(["id_alpha", "id_beta"]);
+
+        // Advance to T=1,300,000 (elapsed for alpha = 300,000 -> expires; elapsed for beta = 200,000 -> retains)
+        currentTime = 1000000 + ttl;
+        const scrape1 = reg.toPrometheusFormat();
+        expect(scrape1).not.toContain('verification_id="id_alpha"');
+        expect(scrape1).toContain('verification_id="id_beta"');
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["id_beta"]);
+
+        // Advance to T=1,400,000 (elapsed for beta = 300,000 -> expires)
+        currentTime = 1100000 + ttl;
+        const scrape2 = reg.toPrometheusFormat();
+        expect(scrape2).not.toContain('verification_id="id_beta"');
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual([]);
+      });
+
+      it("refreshes registration timestamp and preserves metric count on repeated registrations", () => {
+        const reg = new PrometheusRegistry("refresh-service");
+        let currentTime = 2000000;
+        reg.setTimeProvider(() => currentTime);
+        const ttl = 300000;
+
+        reg.recordRequest(1, { verification_id: "id_refreshable" });
+        expect(reg.toPrometheusFormat()).toContain('verification_id="id_refreshable"} 1');
+
+        // Advance time by 200s (T=2,200,000) and re-register with count 2
+        currentTime += 200000;
+        reg.recordRequest(2, { verification_id: "id_refreshable" });
+        expect(reg.toPrometheusFormat()).toContain('verification_id="id_refreshable"} 3');
+
+        // At T=2,350,000: original registration (T=2,000,000) would have expired (350s > 300s),
+        // but refreshed registration (T=2,200,000) has only elapsed 150s, so it must still be active!
+        currentTime = 2000000 + 350000;
+        const scrapeMid = reg.toPrometheusFormat();
+        expect(scrapeMid).toContain('verification_id="id_refreshable"} 3');
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["id_refreshable"]);
+
+        // At T=2,500,000 (2,200,000 + 300,000): now it expires!
+        currentTime = 2200000 + ttl;
+        const scrapeFinal = reg.toPrometheusFormat();
+        expect(scrapeFinal).not.toContain('verification_id="id_refreshable"');
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual([]);
+      });
+
+      it("clearSyntheticVerificationId purges both active map and custom request registry", () => {
+        const reg = new PrometheusRegistry("cleanup-verify");
+        reg.recordRequest(3, { verification_id: "id_to_purge" });
+        expect(reg.getActiveSyntheticVerificationIds()).toContain("id_to_purge");
+        expect(reg.toPrometheusFormat()).toContain('verification_id="id_to_purge"} 3');
+
+        const removed = reg.clearSyntheticVerificationId("id_to_purge");
+        expect(removed).toBe(true);
+        expect(reg.getActiveSyntheticVerificationIds()).not.toContain("id_to_purge");
+        expect(reg.toPrometheusFormat()).not.toContain('verification_id="id_to_purge"');
+
+        // Calling again returns false
+        expect(reg.clearSyntheticVerificationId("id_to_purge")).toBe(false);
+      });
+    });
+
+    describe("7. Advanced Child Lifecycle: Graceful SIGTERM vs Forced SIGKILL", () => {
+      it("completes graceful shutdown when child terminates on SIGTERM without sending SIGKILL", async () => {
+        const { EventEmitter } = await import("events");
+        const emitter = new EventEmitter();
+        const killSignals: string[] = [];
+
+        interface MutableFakeChild {
+          exitCode: number | null;
+          signalCode: NodeJS.Signals | null;
+          killed: boolean;
+          pid: number;
+          kill: (signal?: NodeJS.Signals | number) => boolean;
+          once: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+        }
+
+        const gracefulChild: MutableFakeChild = {
+          exitCode: null,
+          signalCode: null,
+          killed: false,
+          pid: 12345,
+          kill: (signal?: NodeJS.Signals | number) => {
+            const sigStr = String(signal ?? "SIGTERM");
+            killSignals.push(sigStr);
+            if (sigStr === "SIGTERM") {
+              // Graceful exit within 20ms
+              setTimeout(() => {
+                gracefulChild.exitCode = 0;
+                gracefulChild.signalCode = "SIGTERM";
+                emitter.emit("exit", 0, "SIGTERM");
+                emitter.emit("close");
+              }, 20);
+            }
+            return true;
+          },
+          once: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.once(event, cb);
+            return gracefulChild as unknown as import("child_process").ChildProcess;
+          },
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.removeListener(event, cb);
+            return gracefulChild as unknown as import("child_process").ChildProcess;
+          },
+        };
+
+        // Grace period 200ms - graceful child terminates in 20ms
+        await stopChildProcess(gracefulChild as unknown as import("child_process").ChildProcess, undefined, 200);
+
+        // SIGKILL was NEVER dispatched because graceful SIGTERM succeeded
+        expect(killSignals).toEqual(["SIGTERM"]);
+        expect(gracefulChild.exitCode).toBe(0);
+      });
+
+      it("coalesces concurrent calls to stopChildProcess on the same child instance", async () => {
+        const { EventEmitter } = await import("events");
+        const emitter = new EventEmitter();
+        let killCount = 0;
+
+        interface MutableFakeChild {
+          exitCode: number | null;
+          signalCode: NodeJS.Signals | null;
+          killed: boolean;
+          pid: number;
+          kill: (signal?: NodeJS.Signals | number) => boolean;
+          once: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+        }
+
+        const fakeChild: MutableFakeChild = {
+          exitCode: null,
+          signalCode: null,
+          killed: false,
+          pid: 23456,
+          kill: () => {
+            killCount++;
+            setTimeout(() => {
+              fakeChild.exitCode = 0;
+              emitter.emit("exit", 0, null);
+              emitter.emit("close");
+            }, 30);
+            return true;
+          },
+          once: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.once(event, cb);
+            return fakeChild as unknown as import("child_process").ChildProcess;
+          },
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.removeListener(event, cb);
+            return fakeChild as unknown as import("child_process").ChildProcess;
+          },
+        };
+
+        const cp = fakeChild as unknown as import("child_process").ChildProcess;
+        // Concurrent stops
+        const [r1, r2, r3] = await Promise.all([
+          stopChildProcess(cp, undefined, 200),
+          stopChildProcess(cp, undefined, 200),
+          stopChildProcess(cp, undefined, 200),
+        ]);
+
+        expect(r1).toBeUndefined();
+        expect(r2).toBeUndefined();
+        expect(r3).toBeUndefined();
+        // Kill was only called once because calls were deduplicated
+        expect(killCount).toBe(1);
+      });
+
+      it("immediately completes stopChildProcess when child is already exited", async () => {
+        const { EventEmitter } = await import("events");
+        const emitter = new EventEmitter();
+        let killCalled = false;
+
+        const deadChild = {
+          exitCode: 0,
+          signalCode: null,
+          killed: true,
+          pid: 34567,
+          kill: () => {
+            killCalled = true;
+            return false;
+          },
+          once: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.once(event, cb);
+            return deadChild as unknown as import("child_process").ChildProcess;
+          },
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.removeListener(event, cb);
+            return deadChild as unknown as import("child_process").ChildProcess;
+          },
+        } as unknown as import("child_process").ChildProcess;
+
+        await stopChildProcess(deadChild);
+        expect(killCalled).toBe(false);
       });
     });
   });

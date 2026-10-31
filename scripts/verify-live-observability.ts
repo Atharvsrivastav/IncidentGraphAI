@@ -148,6 +148,8 @@ export function generateSecureToken(): string {
   return crypto.randomBytes(32).toString("hex");
 }
 
+const inFlightChildStops = new WeakMap<ChildProcess, Promise<void>>();
+
 export async function stopChildProcess(
   child: ChildProcess,
   targetFilePath?: string,
@@ -163,6 +165,8 @@ export async function stopChildProcess(
   }
 
   const isProcessAlive = (): boolean => {
+    if ((child as { _hasExited?: boolean })._hasExited) return false;
+    if (child.pid === undefined) return false;
     if (child.exitCode !== null || child.signalCode !== null) return false;
     return true;
   };
@@ -172,11 +176,21 @@ export async function stopChildProcess(
     return;
   }
 
-  await new Promise<void>((resolve) => {
+  // Idempotency: if stop is already running for this exact child process, share promise
+  const existing = inFlightChildStops.get(child);
+  if (existing) {
+    return existing;
+  }
+
+  const stopPromise = new Promise<void>((resolve) => {
+    let settled = false;
     let sigkillTimer: NodeJS.Timeout | null = null;
     let hardLimitTimer: NodeJS.Timeout | null = null;
 
     const onExitOrClose = () => {
+      if (settled) return;
+      settled = true;
+      (child as { _hasExited?: boolean })._hasExited = true;
       if (sigkillTimer) clearTimeout(sigkillTimer);
       if (hardLimitTimer) clearTimeout(hardLimitTimer);
       child.removeListener("exit", onExitOrClose);
@@ -214,7 +228,12 @@ export async function stopChildProcess(
       onExitOrClose();
     }, gracePeriodMs + 2000);
     hardLimitTimer.unref();
+  }).finally(() => {
+    inFlightChildStops.delete(child);
   });
+
+  inFlightChildStops.set(child, stopPromise);
+  return stopPromise;
 }
 
 export async function startDisposableOrderService(options?: {
@@ -274,6 +293,13 @@ export async function startDisposableOrderService(options?: {
     }
   );
 
+  child.once("exit", () => {
+    (child as { _hasExited?: boolean })._hasExited = true;
+  });
+  child.once("close", () => {
+    (child as { _hasExited?: boolean })._hasExited = true;
+  });
+
   let targetFilePath: string | undefined;
 
   let stopPromise: Promise<void> | null = null;
@@ -305,6 +331,10 @@ export async function startDisposableOrderService(options?: {
         }
       };
 
+      const onStderrData = (chunk: Buffer) => {
+        stderrBuffer += chunk.toString("utf8");
+      };
+
       const onError = (err: Error) => {
         cleanupListeners();
         reject(new Error(`Failed to spawn disposable order-service child process: ${err.message}`));
@@ -321,14 +351,13 @@ export async function startDisposableOrderService(options?: {
         resolvedOrRejected = true;
         clearTimeout(timeout);
         child.stdout?.removeListener("data", onData);
+        child.stderr?.removeListener("data", onStderrData);
         child.removeListener("error", onError);
         child.removeListener("exit", onEarlyExit);
       }
 
       child.stdout?.on("data", onData);
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderrBuffer += chunk.toString("utf8");
-      });
+      child.stderr?.on("data", onStderrData);
       child.once("error", onError);
       child.once("exit", onEarlyExit);
     });

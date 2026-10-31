@@ -131,16 +131,18 @@ export class PrometheusRegistry {
 
   public clearSyntheticVerificationId(verificationId: string): boolean {
     const trimmed = verificationId.trim();
-    if (!this.activeSyntheticIds.has(trimmed)) {
-      return false;
-    }
+    let removed = false;
     for (const key of Array.from(this.requests.keys())) {
       if (key.includes(`verification_id="${escapeLabelValue(trimmed)}"`)) {
         this.requests.delete(key);
+        removed = true;
       }
     }
-    this.activeSyntheticIds.delete(trimmed);
-    return true;
+    if (this.activeSyntheticIds.has(trimmed)) {
+      this.activeSyntheticIds.delete(trimmed);
+      removed = true;
+    }
+    return removed;
   }
 
   public recordRequest(count: number = 1, attributes?: MetricAttributes): void {
