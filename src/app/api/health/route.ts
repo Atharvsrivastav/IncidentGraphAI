@@ -3,6 +3,7 @@ import prisma from "@/lib/db/prisma";
 import { TelemetryManager } from "@/lib/telemetry/telemetryManager";
 import { getAIProviderStatus } from "@/lib/ai/providers/factory";
 import { ensureDatabaseSeeded } from "@/lib/db/ensure-seeded";
+import { validateDatabaseIsolation } from "@/lib/db/isolation-validator";
 
 export async function GET() {
   const startTime = Date.now();
@@ -53,12 +54,8 @@ export async function GET() {
   const dbProvider = dbUrl.startsWith("postgres://") || dbUrl.startsWith("postgresql://")
     ? "postgresql"
     : "sqlite";
-  const isExplicitIsolatedMode =
-    process.env.E2E_ISOLATED === "1" ||
-    process.env.E2E_ISOLATED === "true";
-  const isStrictDisposableDb =
-    /e2e-(?:isolated|ci)-[a-zA-Z0-9_\-]+\.db(?:[?#]|$)/i.test(dbUrl);
-  const isIsolated = Boolean(isExplicitIsolatedMode && isStrictDisposableDb);
+  const isolationResult = validateDatabaseIsolation(dbUrl, process.env.E2E_ISOLATED);
+  const isIsolated = isolationResult.isIsolated;
 
   return NextResponse.json(
     {

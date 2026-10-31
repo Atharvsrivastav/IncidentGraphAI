@@ -4,6 +4,9 @@ import fs from 'fs';
 import crypto from 'crypto';
 import net from 'net';
 
+const DISPOSABLE_DB_REGEX = /^e2e-(?:isolated|ci)-[a-zA-Z0-9_\-]+-[a-f0-9]{4,32}\.db$/i;
+const DB_SIDECAR_EXTENSIONS = ['', '-journal', '-wal', '-shm'];
+
 /**
  * Computes SHA-256 hash of a file if it exists.
  */
@@ -14,7 +17,7 @@ function computeFileHash(filePath) {
 }
 
 /**
- * Checks whether a given TCP port is open / available.
+ * Checks whether a given TCP port is available on localhost.
  */
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -40,15 +43,31 @@ async function findAvailablePort(preferredPort = 3000) {
 }
 
 /**
- * Checks if a process with given PID is still alive.
+ * Checks if a process with given PID is alive.
  */
 function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return e.code === 'EPERM'; // If EPERM, process exists; if ESRCH, process is dead
+    return e.code === 'EPERM'; // If EPERM, process exists and is alive
   }
+}
+
+/**
+ * Checks if any process in the process group is alive (POSIX).
+ */
+function isProcessGroupAlive(pid) {
+  if (process.platform === 'win32') {
+    return isProcessAlive(pid);
+  }
+  try {
+    const out = execSync(`pgrep -g ${pid} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
+    if (out.length > 0) return true;
+  } catch {
+    // Fall back to PID check
+  }
+  return isProcessAlive(pid);
 }
 
 /**
@@ -66,42 +85,30 @@ async function killProcessTree(pid, port) {
         // May already be stopped
       }
     } else {
-      // On POSIX, terminate the dedicated process group (-pid), fallback to direct kill
+      // On POSIX, terminate the process group (-pid), falling back to PID
       try {
         process.kill(-pid, 'SIGTERM');
       } catch {
-        try {
-          process.kill(pid, 'SIGTERM');
-        } catch {
-          // Process group already dead
-        }
+        try { process.kill(pid, 'SIGTERM'); } catch {}
       }
       try {
         execSync(`pkill -TERM -P ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
-      } catch {
-        // Ignored
-      }
+      } catch {}
     }
   } catch {
-    // Signal errors ignored
+    // Ignore initial signal failures
   }
 
-  // Verify process has actually stopped
+  // Verify process group and leader have actually terminated
   let stopped = false;
   for (let i = 0; i < 20; i++) {
-    let alive = false;
-    try {
-      alive = isProcessAlive(pid);
-    } catch {
-      alive = false;
-    }
-
-    if (!alive) {
+    const groupAlive = isProcessGroupAlive(pid);
+    if (!groupAlive) {
       stopped = true;
       break;
     }
 
-    // Escalate to SIGKILL if still alive after initial wait
+    // Escalate to SIGKILL after bounded grace period (500ms)
     if (i >= 5) {
       if (isWindows) {
         try { execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' }); } catch {}
@@ -113,7 +120,7 @@ async function killProcessTree(pid, port) {
       }
     }
 
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 100));
   }
 
   // Also verify port is released
@@ -124,7 +131,7 @@ async function killProcessTree(pid, port) {
         portReleased = true;
         break;
       }
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 100));
     }
   } else {
     portReleased = true;
@@ -138,12 +145,7 @@ async function killProcessTree(pid, port) {
  * Returns an array of any files that could NOT be deleted.
  */
 function cleanupDisposableDb(dbPath) {
-  const patterns = [
-    dbPath,
-    `${dbPath}-journal`,
-    `${dbPath}-wal`,
-    `${dbPath}-shm`,
-  ];
+  const patterns = DB_SIDECAR_EXTENSIONS.map((ext) => `${dbPath}${ext}`);
 
   for (const file of patterns) {
     if (fs.existsSync(file)) {
@@ -163,91 +165,238 @@ function cleanupDisposableDb(dbPath) {
   return patterns.filter((f) => fs.existsSync(f));
 }
 
+/**
+ * Records baseline state of developer database and its sidecars.
+ */
+function recordDevDbBaseline(prismaDir, baseDbName = 'dev.db') {
+  const baseline = {};
+  for (const ext of DB_SIDECAR_EXTENSIONS) {
+    const fileName = `${baseDbName}${ext}`;
+    const fullPath = path.join(prismaDir, fileName);
+    if (fs.existsSync(fullPath)) {
+      const stat = fs.statSync(fullPath);
+      const hash = computeFileHash(fullPath);
+      baseline[fileName] = {
+        exists: true,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        hash,
+      };
+    } else {
+      baseline[fileName] = {
+        exists: false,
+        size: 0,
+        mtimeMs: 0,
+        hash: null,
+      };
+    }
+  }
+  return baseline;
+}
+
+/**
+ * Verifies developer database and all sidecars against baseline.
+ * Returns array of detected integrity violations.
+ */
+function verifyDevDbIntegrity(prismaDir, baseline, baseDbName = 'dev.db') {
+  const violations = [];
+
+  for (const ext of DB_SIDECAR_EXTENSIONS) {
+    const fileName = `${baseDbName}${ext}`;
+    const fullPath = path.join(prismaDir, fileName);
+    const existsNow = fs.existsSync(fullPath);
+    const base = baseline[fileName] || { exists: false, size: 0, mtimeMs: 0, hash: null };
+
+    if (!base.exists && existsNow) {
+      violations.push(
+        `Artifact '${fileName}' did not exist before test, but was created during test execution.`
+      );
+      continue;
+    }
+
+    if (base.exists && !existsNow) {
+      violations.push(
+        `Artifact '${fileName}' existed before test, but was deleted during test execution.`
+      );
+      continue;
+    }
+
+    if (base.exists && existsNow) {
+      const statNow = fs.statSync(fullPath);
+      const hashNow = computeFileHash(fullPath);
+
+      if (statNow.size !== base.size) {
+        violations.push(
+          `Artifact '${fileName}' file size changed! Before: ${base.size} bytes, After: ${statNow.size} bytes.`
+        );
+      }
+      if (statNow.mtimeMs !== base.mtimeMs) {
+        violations.push(
+          `Artifact '${fileName}' modification time changed! Before: ${base.mtimeMs}, After: ${statNow.mtimeMs}.`
+        );
+      }
+      if (hashNow !== base.hash) {
+        violations.push(
+          `Artifact '${fileName}' SHA-256 hash changed! Before: ${base.hash}, After: ${hashNow}.`
+        );
+      }
+    }
+  }
+
+  return violations;
+}
+
+// Global lifecycle references for teardown
+let serverProcess = null;
+let targetPort = null;
+let dbFilePath = null;
+let dbFileName = null;
+let prismaDir = null;
+let devDbBaseline = null;
+let testExitCode = 1;
+
+let teardownRunning = false;
+let teardownCompleted = false;
+
+/**
+ * Idempotent, centralized teardown function executed on all exit paths.
+ */
+async function performTeardown({ exitCode = 0, signal = null, error = null } = {}) {
+  if (teardownCompleted) {
+    return testExitCode;
+  }
+  if (teardownRunning) {
+    while (teardownRunning) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return testExitCode;
+  }
+  teardownRunning = true;
+
+  try {
+    if (error) {
+      console.error('\n❌ Error encountered during runner execution:', error);
+      if (testExitCode === 0) testExitCode = 1;
+    }
+
+    if (signal) {
+      console.log(`\n[Runner] Handling signal ${signal}...`);
+      const signalCode = signal === 'SIGINT' ? 130 : 143;
+      if (testExitCode === 0) testExitCode = signalCode;
+    } else if (exitCode !== 0 && testExitCode === 0) {
+      testExitCode = exitCode;
+    }
+
+    // 1. Process tree / group shutdown and port release
+    if (serverProcess && serverProcess.pid) {
+      console.log(`\n[Cleanup] Shutting down Next.js server (PID: ${serverProcess.pid}, Port: ${targetPort})...`);
+      const killedCleanly = await killProcessTree(serverProcess.pid, targetPort);
+      if (killedCleanly) {
+        console.log(`  ✓ Next.js server process tree (PID: ${serverProcess.pid}) and port ${targetPort} verified cleanly stopped.`);
+      } else {
+        console.error(`❌ [Server Cleanup Failure] Next.js server or child processes may still be running (PID: ${serverProcess.pid})!`);
+        testExitCode = testExitCode !== 0 ? testExitCode : 1;
+      }
+    }
+
+    // 2. Disposable database and sidecar cleanup (fatal if leftover)
+    if (dbFilePath) {
+      console.log(`[Cleanup] Removing disposable database: ${dbFileName}`);
+      const remainingFiles = cleanupDisposableDb(dbFilePath);
+
+      if (remainingFiles.length === 0) {
+        console.log(`  ✓ Disposable database ${dbFileName} and all journal/WAL/SHM artifacts successfully deleted.`);
+      } else {
+        console.error(
+          `❌ [Fatal Cleanup Failure] Disposable database artifacts remain after cleanup retries:\n` +
+          `  ${remainingFiles.join('\n  ')}\n` +
+          `Failing test runner due to database cleanup invariant violation.`
+        );
+        testExitCode = testExitCode !== 0 ? testExitCode : 1;
+      }
+    }
+
+    // 3. Developer database and sidecar integrity check (fatal if violated)
+    if (devDbBaseline && prismaDir) {
+      const violations = verifyDevDbIntegrity(prismaDir, devDbBaseline, 'dev.db');
+      if (violations.length > 0) {
+        console.error(`❌ [Developer DB Integrity Violation] Integrity checks failed:\n  ${violations.join('\n  ')}`);
+        testExitCode = testExitCode !== 0 ? testExitCode : 1;
+      } else {
+        console.log(`  ✓ Developer database and all sidecars (prisma/dev.db*) verified 100% UNTOUCHED`);
+      }
+    }
+  } finally {
+    teardownCompleted = true;
+    teardownRunning = false;
+  }
+
+  return testExitCode;
+}
+
+// Bind process signals to the centralized teardown
+process.on('SIGINT', async () => {
+  await performTeardown({ signal: 'SIGINT' });
+  process.exit(testExitCode);
+});
+
+process.on('SIGTERM', async () => {
+  await performTeardown({ signal: 'SIGTERM' });
+  process.exit(testExitCode);
+});
+
 async function main() {
   console.log('================================================================');
   console.log('  IncidentGraph AI: Isolated Browser E2E Environment Runner     ');
   console.log('================================================================');
 
   const cwd = process.cwd();
-  const prismaDir = path.resolve(cwd, 'prisma');
-  const devDbPath = path.resolve(prismaDir, 'dev.db');
+  prismaDir = path.resolve(cwd, 'prisma');
 
-  // 1. Record developer DB baseline stats and SHA-256 hash if present
-  let devDbBefore = null;
-  if (fs.existsSync(devDbPath)) {
-    const stat = fs.statSync(devDbPath);
-    const hash = computeFileHash(devDbPath);
-    devDbBefore = { size: stat.size, mtime: stat.mtimeMs, hash };
-    console.log(`[Developer DB Guard] Recorded baseline: size=${stat.size} bytes, modified=${stat.mtime.toISOString()}`);
-    console.log(`  SHA-256: ${hash}`);
-  }
-
-  // 2. If BASE_URL is externally supplied, strictly verify or reject
+  // 1. External BASE_URL rejection: fail closed. The runner must own its database and server.
   if (process.env.BASE_URL) {
-    let healthData = null;
-    try {
-      const res = await fetch(`${process.env.BASE_URL}/api/health`);
-      if (res.ok) {
-        healthData = await res.json();
-      }
-    } catch (err) {
-      console.error(`❌ [External Server Rejection] Cannot connect to supplied BASE_URL at ${process.env.BASE_URL}/api/health: ${err.message}`);
-      process.exit(1);
-    }
-
-    if (!healthData || healthData.status !== 'healthy' || !healthData.database?.isIsolated) {
-      console.error(
-        `❌ [External Server Rejection] Target BASE_URL (${process.env.BASE_URL}) is not a verified isolated server.\n` +
-        `  Reported status: ${healthData?.status || 'unreachable'}\n` +
-        `  isIsolated:      ${Boolean(healthData?.database?.isIsolated)}\n` +
-        `  Services count:  ${healthData?.database?.servicesCount ?? 'unknown'}\n` +
-        `Destructive automated browser testing against unverified or non-isolated servers is prohibited.`
-      );
-      process.exit(1);
-    }
-
-    console.log(`[Runner] Detected verified isolated server at ${process.env.BASE_URL}`);
-    console.log(`  Database Provider: ${healthData.database.provider}, Services: ${healthData.database.servicesCount}, isIsolated: true`);
-    console.log('[Runner] Executing browser E2E test suite against existing isolated server...');
-
-    const testProc = spawn('node', ['tests/browser-e2e.mjs'], {
-      stdio: 'inherit',
-      shell: true,
-      env: { ...process.env, E2E_ISOLATED: '1' },
-    });
-
-    const code = await new Promise((resolve) => testProc.on('exit', resolve));
-    process.exit(code ?? 1);
+    console.error(
+      '❌ [External Server Rejection] Automated browser runner requires an owned, disposable database and server.\n' +
+      'External BASE_URL server reuse is not permitted. Please unset BASE_URL to let the runner manage its environment.'
+    );
+    process.exit(1);
   }
 
-  // 3. Generate unique disposable SQLite database adhering to strict naming convention: e2e-isolated-*
-  const uniqueId = `e2e-isolated-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const dbFileName = `${uniqueId}.db`;
-  const dbFilePath = path.join(prismaDir, dbFileName);
+  // 2. Record developer DB baseline stats and SHA-256 hash for dev.db and all sidecars
+  devDbBaseline = recordDevDbBaseline(prismaDir, 'dev.db');
+  console.log('[Developer DB Guard] Recorded baseline for dev.db and sidecars:');
+  for (const [name, rec] of Object.entries(devDbBaseline)) {
+    if (rec.exists) {
+      console.log(`  - ${name}: size=${rec.size} bytes, modified=${new Date(rec.mtimeMs).toISOString()}, sha256=${rec.hash}`);
+    } else {
+      console.log(`  - ${name}: (absent)`);
+    }
+  }
+
+  // 3. Generate unique disposable SQLite database adhering to strict naming convention: e2e-isolated-<runId>-<nonce>.db
+  const uniqueId = `e2e-isolated-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  dbFileName = `${uniqueId}.db`;
+  dbFilePath = path.join(prismaDir, dbFileName);
   const databaseUrl = `file:./${dbFileName}`;
 
-  console.log(`[Isolated DB] Creating temporary database: ${dbFileName}`);
+  if (!DISPOSABLE_DB_REGEX.test(dbFileName)) {
+    throw new Error(`Generated database name '${dbFileName}' failed format check against ${DISPOSABLE_DB_REGEX}`);
+  }
+
+  console.log(`[Isolated DB] Creating temporary database exclusively: ${dbFileName}`);
   console.log(`  Target path: ${dbFilePath}`);
   console.log(`  Prisma URL:  ${databaseUrl}`);
 
-  let serverProcess = null;
-  let targetPort = null;
-  let testExitCode = 1;
-
-  // Setup signal handlers for interrupted execution
-  const handleSignal = async (signal) => {
-    console.log(`\n[Runner] Received ${signal}. Forcing graceful cleanup...`);
-    if (serverProcess?.pid) {
-      await killProcessTree(serverProcess.pid, targetPort);
-    }
-    cleanupDisposableDb(dbFilePath);
-    process.exit(signal === 'SIGINT' ? 130 : 143);
-  };
-  process.on('SIGINT', () => handleSignal('SIGINT'));
-  process.on('SIGTERM', () => handleSignal('SIGTERM'));
+  // Create file exclusively to ensure no pre-existing file is reused
+  try {
+    const fd = fs.openSync(dbFilePath, 'wx');
+    fs.closeSync(fd);
+  } catch (err) {
+    throw new Error(`Failed to exclusively create disposable database file: ${err.message}`);
+  }
 
   try {
-    // 4. Push schema to isolated database
+    // 4. Apply Prisma schema to isolated database
     console.log('[Isolated DB] Applying Prisma schema (db push)...');
     execSync('npx prisma db push --skip-generate', {
       cwd,
@@ -354,74 +503,17 @@ async function main() {
       });
     });
 
+  } catch (err) {
+    await performTeardown({ error: err });
+    process.exit(testExitCode !== 0 ? testExitCode : 1);
   } finally {
-    // 9. Stop the server and verify process termination and port release
-    if (serverProcess && serverProcess.pid) {
-      console.log(`\n[Cleanup] Shutting down Next.js server (PID: ${serverProcess.pid}, Port: ${targetPort})...`);
-      const killedCleanly = await killProcessTree(serverProcess.pid, targetPort);
-      if (killedCleanly) {
-        console.log(`  ✓ Next.js server process tree (PID: ${serverProcess.pid}) and port ${targetPort} verified cleanly stopped.`);
-      } else {
-        console.error(`❌ [Server Cleanup Failure] Next.js server or child processes may still be running (PID: ${serverProcess.pid})!`);
-        if (testExitCode === 0) testExitCode = 1;
-      }
-    }
-
-    // 10. Clean up temporary database files and make any remaining file fatal
-    console.log(`[Cleanup] Removing disposable database: ${dbFileName}`);
-    const remainingFiles = cleanupDisposableDb(dbFilePath);
-
-    if (remainingFiles.length === 0) {
-      console.log(`  ✓ Disposable database ${dbFileName} and all journal/WAL/SHM artifacts successfully deleted.`);
-    } else {
-      console.error(
-        `❌ [Fatal Cleanup Failure] Disposable database artifacts remain after cleanup retries:\n` +
-        `  ${remainingFiles.join('\n  ')}\n` +
-        `Failing test runner due to database cleanup invariant violation.`
-      );
-      if (testExitCode === 0) {
-        testExitCode = 1;
-      }
-    }
-
-    // 11. Verify developer database remained 100% untouched (hash, size, mtime)
-    if (devDbBefore) {
-      if (!fs.existsSync(devDbPath)) {
-        console.error('❌ [Developer DB Integrity Violation] dev.db was deleted during test execution!');
-        if (testExitCode === 0) testExitCode = 1;
-      } else {
-        const statAfter = fs.statSync(devDbPath);
-        const hashAfter = computeFileHash(devDbPath);
-        let violation = false;
-
-        if (hashAfter !== devDbBefore.hash) {
-          console.error(`❌ [Developer DB Integrity Violation] dev.db SHA-256 hash changed!\n  Before: ${devDbBefore.hash}\n  After:  ${hashAfter}`);
-          violation = true;
-        }
-        if (statAfter.size !== devDbBefore.size) {
-          console.error(`❌ [Developer DB Integrity Violation] dev.db file size changed!\n  Before: ${devDbBefore.size} bytes\n  After:  ${statAfter.size} bytes`);
-          violation = true;
-        }
-        if (statAfter.mtimeMs !== devDbBefore.mtime) {
-          console.error(`❌ [Developer DB Integrity Violation] dev.db modification timestamp changed!\n  Before: ${devDbBefore.mtime}\n  After:  ${statAfter.mtimeMs}`);
-          violation = true;
-        }
-
-        if (violation) {
-          console.error('❌ Developer database was modified during testing. Failing runner.');
-          if (testExitCode === 0) testExitCode = 1;
-        } else {
-          console.log(`  ✓ Developer database (prisma/dev.db) verified 100% UNTOUCHED (hash: ${hashAfter})`);
-        }
-      }
-    }
-
-    console.log(`[Runner Completed] Exit code: ${testExitCode}\n`);
-    process.exit(testExitCode);
+    const finalCode = await performTeardown({ exitCode: testExitCode });
+    console.log(`[Runner Completed] Exit code: ${finalCode}\n`);
+    process.exit(finalCode);
   }
 }
 
-main().catch((err) => {
-  console.error('\n❌ Fatal error in isolated browser runner:', err);
-  process.exit(1);
+main().catch(async (err) => {
+  await performTeardown({ error: err });
+  process.exit(testExitCode !== 0 ? testExitCode : 1);
 });

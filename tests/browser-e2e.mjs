@@ -95,11 +95,12 @@ async function verifyServerAvailable(url) {
   }
 
   // Safety guard: prevent destructive automated tests from running against developer's normal database
-  if (!data.database?.isIsolated && !process.env.ALLOW_UNSAFE_NON_ISOLATED_DB) {
+  if (!data.database?.isIsolated) {
     throw new Error(
       `[Safety Guard Violation] Browser E2E suite requires an isolated disposable database.\n` +
       `Target server reports non-isolated database (${data.database?.provider || 'unknown'}).\n` +
-      `Run via 'npm run test:browser' or start server with an isolated disposable DATABASE_URL (e.g., E2E_ISOLATED=1).`
+      `Destructive testing against non-isolated databases is strictly prohibited.\n` +
+      `Run via 'npm run test:browser' to use an isolated disposable database.`
     );
   }
 
