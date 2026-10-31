@@ -16,6 +16,7 @@
     "test:browser:direct": "node tests/browser-e2e.mjs",
     "test:live": "tsx scripts/verify-live-pipeline.ts",
     "test:cloud": "tsx scripts/verify-cloud-pipeline.ts",
+    "test:observability:live": "tsx scripts/verify-live-observability.ts",
     "config:check": "tsx scripts/check-config.ts",
     "sample:start": "tsx sample-services/runner.ts",
     "sample:mock": "tsx sample-services/runner.ts",

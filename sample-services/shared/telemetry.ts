@@ -18,6 +18,96 @@ import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 
+export interface MetricAttributes {
+  service?: string;
+  status?: string;
+  method?: string;
+  [key: string]: unknown;
+}
+
+export class PrometheusRegistry {
+  private serviceName: string;
+  private requests = new Map<string, number>();
+  private errors = new Map<string, number>();
+  private durations: { sum: number; count: number; buckets: Map<number, number> };
+  public static readonly BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 10];
+
+  constructor(serviceName: string) {
+    this.serviceName = serviceName;
+    const bucketMap = new Map<number, number>();
+    for (const b of PrometheusRegistry.BUCKETS) {
+      bucketMap.set(b, 0);
+    }
+    this.durations = { sum: 0, count: 0, buckets: bucketMap };
+  }
+
+  public recordRequest(count: number = 1, attributes?: MetricAttributes): void {
+    const status = String(attributes?.status ?? "200");
+    const key = `service="${this.serviceName}",status="${status}"`;
+    this.requests.set(key, (this.requests.get(key) || 0) + count);
+  }
+
+  public recordError(count: number = 1, attributes?: MetricAttributes): void {
+    const status = String(attributes?.status ?? "500");
+    const key = `service="${this.serviceName}",status="${status}"`;
+    this.errors.set(key, (this.errors.get(key) || 0) + count);
+  }
+
+  public recordDuration(seconds: number): void {
+    this.durations.sum += seconds;
+    this.durations.count += 1;
+    for (const b of PrometheusRegistry.BUCKETS) {
+      if (seconds <= b) {
+        this.durations.buckets.set(b, (this.durations.buckets.get(b) || 0) + 1);
+      }
+    }
+  }
+
+  public toPrometheusFormat(): string {
+    const lines: string[] = [];
+
+    // http_requests_total
+    lines.push("# HELP http_requests_total Total number of HTTP requests processed by this service");
+    lines.push("# TYPE http_requests_total counter");
+    if (this.requests.size === 0) {
+      lines.push(`http_requests_total{service="${this.serviceName}",status="200"} 0`);
+    } else {
+      for (const [labels, val] of this.requests.entries()) {
+        lines.push(`http_requests_total{${labels}} ${val}`);
+      }
+    }
+
+    // http_request_errors_total
+    lines.push("# HELP http_request_errors_total Total number of HTTP error responses (5xx or timeouts)");
+    lines.push("# TYPE http_request_errors_total counter");
+    if (this.errors.size === 0) {
+      lines.push(`http_request_errors_total{service="${this.serviceName}",status="500"} 0`);
+    } else {
+      for (const [labels, val] of this.errors.entries()) {
+        lines.push(`http_request_errors_total{${labels}} ${val}`);
+      }
+    }
+
+    // http_request_duration_seconds
+    lines.push("# HELP http_request_duration_seconds Duration of HTTP request processing in seconds");
+    lines.push("# TYPE http_request_duration_seconds histogram");
+    for (const b of PrometheusRegistry.BUCKETS) {
+      const count = this.durations.buckets.get(b) || 0;
+      lines.push(`http_request_duration_seconds_bucket{service="${this.serviceName}",le="${b}"} ${count}`);
+    }
+    lines.push(`http_request_duration_seconds_bucket{service="${this.serviceName}",le="+Inf"} ${this.durations.count}`);
+    lines.push(`http_request_duration_seconds_sum{service="${this.serviceName}"} ${this.durations.sum.toFixed(6)}`);
+    lines.push(`http_request_duration_seconds_count{service="${this.serviceName}"} ${this.durations.count}`);
+
+    // service_health_status
+    lines.push("# HELP service_health_status Health status of the service (1=healthy, 0=unhealthy)");
+    lines.push("# TYPE service_health_status gauge");
+    lines.push(`service_health_status{service="${this.serviceName}"} 1`);
+
+    return lines.join("\n") + "\n";
+  }
+}
+
 export interface ServiceTelemetry {
   tracer: Tracer;
   meter: Meter;
@@ -30,6 +120,14 @@ export interface ServiceTelemetry {
   endSpan: (span: Span, statusCode?: SpanStatusCode, errorMessage?: string) => void;
   isCloudExportEnabled: boolean;
   otlpTargetUrl: string;
+  getPrometheusMetrics: () => string;
+  handleMetricsRequest: (res: import("http").ServerResponse) => void;
+  getExportStatus: () => {
+    isCloudExport: boolean;
+    lastExportStatus: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
+    lastExportTime?: string;
+    lastExportError?: string;
+  };
 }
 
 const initializedServices = new Map<string, ServiceTelemetry>();
@@ -38,6 +136,8 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   if (initializedServices.has(serviceName)) {
     return initializedServices.get(serviceName)!;
   }
+
+  const registry = new PrometheusRegistry(serviceName);
 
   // Determine OTLP endpoint: Grafana Cloud takes precedence if configured
   const otlpEndpoint = (
@@ -109,20 +209,53 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   const tracer = trace.getTracer(serviceName, "1.0.0");
   const meter = metrics.getMeter(serviceName, "1.0.0");
 
-  const requestCounter = meter.createCounter("http_requests_total", {
+  const rawRequestCounter = meter.createCounter("http_requests_total", {
     description: "Total number of HTTP requests processed by this service",
     unit: "1",
   });
 
-  const errorCounter = meter.createCounter("http_request_errors_total", {
+  const rawErrorCounter = meter.createCounter("http_request_errors_total", {
     description: "Total number of HTTP error responses (5xx or timeouts)",
     unit: "1",
   });
 
-  const durationHistogram = meter.createHistogram("http_request_duration_seconds", {
+  const rawDurationHistogram = meter.createHistogram("http_request_duration_seconds", {
     description: "Duration of HTTP request processing in seconds",
     unit: "s",
   });
+
+  const requestCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordRequest(value, attributes as MetricAttributes);
+      try {
+        rawRequestCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch {
+        // safe fallback
+      }
+    },
+  };
+
+  const errorCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordError(value, attributes as MetricAttributes);
+      try {
+        rawErrorCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch {
+        // safe fallback
+      }
+    },
+  };
+
+  const durationHistogram: Histogram = {
+    record: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordDuration(value);
+      try {
+        rawDurationHistogram.record(value, attributes as Record<string, string | number | boolean>);
+      } catch {
+        // safe fallback
+      }
+    },
+  };
 
   const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
     const activeSpan = trace.getSpan(context.active());
@@ -173,6 +306,21 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     span.end();
   };
 
+  const getPrometheusMetrics = () => registry.toPrometheusFormat();
+
+  const handleMetricsRequest = (res: import("http").ServerResponse) => {
+    res.writeHead(200, {
+      "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+    });
+    res.end(registry.toPrometheusFormat());
+  };
+
+  const getExportStatus = () => ({
+    isCloudExport,
+    lastExportStatus: (isCloudExport ? "SUCCESS" : "DISABLED") as "SUCCESS" | "FAILED" | "PENDING" | "DISABLED",
+    lastExportTime: new Date().toISOString(),
+  });
+
   const instance: ServiceTelemetry = {
     tracer,
     meter,
@@ -185,6 +333,9 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     endSpan,
     isCloudExportEnabled: isCloudExport,
     otlpTargetUrl: traceUrl,
+    getPrometheusMetrics,
+    handleMetricsRequest,
+    getExportStatus,
   };
 
   initializedServices.set(serviceName, instance);

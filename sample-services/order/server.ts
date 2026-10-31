@@ -113,6 +113,12 @@ export const server = http.createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === "/metrics") {
+        telemetry.handleMetricsRequest(res);
+        telemetry.endSpan(span, SpanStatusCode.OK);
+        return;
+      }
+
       if (url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "HEALTHY", service: SERVICE_NAME }));

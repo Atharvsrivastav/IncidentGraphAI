@@ -37,6 +37,7 @@ export function Navigation() {
   const [requestedMode, setRequestedMode] = useState<TelemetryUIMode>("SIMULATION");
   const [effectiveMode, setEffectiveMode] = useState<TelemetryUIMode>("SIMULATION");
   const [backendType, setBackendType] = useState<string>("SIMULATION");
+  const [provenance, setProvenance] = useState<string>("DISABLED");
   const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
 
   const fetchStatus = useCallback(async () => {
@@ -66,6 +67,11 @@ export function Navigation() {
         setRequestedMode(req);
         if (modeData.health?.backendType) {
           setBackendType(modeData.health.backendType);
+        }
+        if (modeData.health?.provenance) {
+          setProvenance(modeData.health.provenance);
+        } else if (eff === "SIMULATION") {
+          setProvenance("DISABLED");
         }
       }
     } catch {
@@ -247,31 +253,29 @@ export function Navigation() {
               className={`h-2 w-2 rounded-full ${
                 systemStatus === "INCIDENT"
                   ? "bg-red-500 animate-pulse"
-                  : effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
-                  ? "bg-amber-500 animate-pulse"
-                  : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                  : provenance === "LIVE"
+                  ? "bg-emerald-400 animate-pulse"
+                  : provenance === "MOCK_EMULATION"
                   ? "bg-purple-400"
-                  : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
-                  ? "bg-sky-400"
-                  : requestedMode === "SIMULATION"
+                  : provenance === "LOCAL"
                   ? "bg-blue-400"
-                  : "bg-emerald-500"
+                  : provenance === "ERROR" || effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
+                  ? "bg-amber-500 animate-pulse"
+                  : "bg-slate-400"
               }`}
             />
             <span className="font-medium text-slate-300">
               {systemStatus === "INCIDENT"
                 ? `Active Incident (${activeScenario ?? (requestedMode === "SIMULATION" ? "Simulated" : "Live")})`
-                : effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
+                : provenance === "LIVE"
+                ? "LIVE: Grafana Cloud Verified"
+                : provenance === "MOCK_EMULATION"
+                ? "MOCK_EMULATION: Synthetic Telemetry"
+                : provenance === "LOCAL"
+                ? "LOCAL: Unverified Stack"
+                : provenance === "ERROR" || effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
                 ? "Telemetry Pipeline Degraded"
-                : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
-                ? "Mock Telemetry Emulation"
-                : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
-                ? "Grafana Cloud Telemetry"
-                : requestedMode === "LIVE" && backendType === "GENUINE_STACK"
-                ? "Genuine Local Telemetry"
-                : requestedMode === "SIMULATION"
-                ? "Simulation Mode"
-                : "All Systems Operational"}
+                : "Simulation Mode (Isolated)"}
             </span>
             {currentStep > 0 && requestedMode === "SIMULATION" && (
               <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-mono text-slate-400">

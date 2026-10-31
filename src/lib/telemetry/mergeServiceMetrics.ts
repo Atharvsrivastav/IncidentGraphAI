@@ -20,6 +20,7 @@ export interface ServiceMapItem {
   hasValidErrorRate?: boolean;
   hasValidRequestRate?: boolean;
   isObservedLive?: boolean;
+  provenance?: "LIVE" | "MOCK_EMULATION" | "LOCAL" | "DISABLED" | "ERROR";
   isStale?: boolean;
   lastObserved?: string;
 }
@@ -62,13 +63,13 @@ export function normalizeTelemetryMode(mode: string | null | undefined): Telemet
  * Merges raw database service definitions with live observed telemetry.
  *
  * Rules:
- * 1. SIMULATION mode preserves database simulation state with valid flags.
- * 2. LIVE / DEGRADED modes match observations by service ID.
+ * 1. SIMULATION mode preserves database simulation state with valid flags and DISABLED provenance.
+ * 2. LIVE / DEGRADED modes match observations by service ID and propagate explicit provenance.
  * 3. Applies latency ONLY when hasValidLatency === true.
  * 4. Applies error rate ONLY when hasValidErrorRate === true.
  * 5. Applies request rate ONLY when hasValidRequestRate === true.
  * 6. Missing metrics become null (displayed as N/A), NEVER manufactured zeroes or database baselines.
- * 7. If a topology service has no observation in LIVE/DEGRADED mode, its status is UNKNOWN.
+ * 7. If a topology service has no observation in LIVE/DEGRADED mode, its status is UNKNOWN and provenance is ERROR.
  */
 export function mergeServiceMetrics(
   dbServices: ServiceMapItem[],
@@ -78,6 +79,7 @@ export function mergeServiceMetrics(
   if (mode === "SIMULATION") {
     return dbServices.map((svc) => ({
       ...svc,
+      provenance: "DISABLED" as const,
       hasValidLatency: true,
       hasValidErrorRate: true,
       hasValidRequestRate: true,
@@ -88,7 +90,9 @@ export function mergeServiceMetrics(
 
   // LIVE or DEGRADED mode
   return dbServices.map((svc) => {
-    const observed = observedServices.find((o) => o.serviceId === svc.id);
+    const observed = observedServices.find(
+      (o) => o.serviceId === svc.id || o.serviceName === svc.name
+    );
 
     if (!observed) {
       // In LIVE or DEGRADED mode, an unobserved topology node must report UNKNOWN
@@ -96,6 +100,7 @@ export function mergeServiceMetrics(
       return {
         ...svc,
         status: "UNKNOWN",
+        provenance: "ERROR" as const,
         currentLatency: null,
         currentErrorRate: null,
         requestRate: null,
@@ -115,6 +120,7 @@ export function mergeServiceMetrics(
     return {
       ...svc,
       status: observed.status,
+      provenance: observed.provenance ?? (observed.source === "SIMULATION" ? "DISABLED" : "LIVE"),
       // Apply metrics ONLY when explicitly flagged as valid
       currentLatency: hasValidLatency ? observed.latencyMs : null,
       currentErrorRate: hasValidErrorRate ? observed.errorRate : null,

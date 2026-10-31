@@ -4,6 +4,7 @@ import { prometheusClient, ServiceMetricsSummary } from "./prometheusClient";
 import { jaegerClient } from "./jaegerClient";
 import {
   TelemetryMode,
+  TelemetryProvenanceState,
   BackendHealthStatus,
   ObservedServiceMetric,
   DistributedTrace,
@@ -109,6 +110,7 @@ export class TelemetryManager {
         isCloudBackend: false,
         cloudConfigured,
         backendType: "SIMULATION",
+        provenance: "DISABLED",
         lastChecked: new Date().toISOString(),
         lastIngestedAt: this.lastIngestedAt || undefined,
         details: "Simulation mode active. Live network telemetry probes are disabled.",
@@ -133,6 +135,21 @@ export class TelemetryManager {
       backendType = isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
     }
 
+    let provenance: TelemetryProvenanceState = "DISABLED";
+    if (this.requestedMode === "SIMULATION") {
+      provenance = "DISABLED";
+    } else if (isMock) {
+      provenance = "MOCK_EMULATION";
+    } else if (!promHealth.available && !jaegerHealth.available) {
+      provenance = cloudConfigured ? "ERROR" : "DISABLED";
+    } else if (!promHealth.available || !jaegerHealth.available) {
+      provenance = "ERROR";
+    } else if (isCloud && !isMock) {
+      provenance = (this.effectiveMode === "LIVE" && this.lastIngestedAt) ? "LIVE" : "LOCAL";
+    } else {
+      provenance = "LOCAL";
+    }
+
     const details = this.formatHealthDetails(cloudConfigured, isMock, promHealth, jaegerHealth);
 
     const status: BackendHealthStatus = {
@@ -144,8 +161,12 @@ export class TelemetryManager {
       isCloudBackend: isCloud,
       cloudConfigured,
       backendType,
+      provenance,
       lastChecked: new Date().toISOString(),
       lastIngestedAt: this.lastIngestedAt || undefined,
+      lastVerifiedAt: this.effectiveMode === "LIVE" && this.lastIngestedAt ? this.lastIngestedAt : undefined,
+      metricsIngested: promHealth.available,
+      tracesIngested: jaegerHealth.available,
       details,
     };
 
@@ -259,10 +280,12 @@ export class TelemetryManager {
     dbServices: Array<{ id: string; name: string; status: string; currentLatency: number; currentErrorRate: number; requestRate: number; updatedAt: Date }>,
     backendHealth: BackendHealthStatus
   ) {
+    backendHealth.provenance = "DISABLED";
     const observed: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
       source: "SIMULATION" as const,
+      provenance: "DISABLED" as const,
       status: s.status as "HEALTHY" | "DEGRADED" | "DOWN",
       latencyMs: s.currentLatency,
       hasValidLatency: true,
@@ -299,10 +322,13 @@ export class TelemetryManager {
     dbServices: Array<{ id: string; name: string }>,
     backendHealth: BackendHealthStatus
   ) {
+    const offlineProvenance: TelemetryProvenanceState = backendHealth.cloudConfigured ? "ERROR" : "DISABLED";
+    backendHealth.provenance = offlineProvenance;
     const unavailable: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
       source: "PROMETHEUS" as const,
+      provenance: offlineProvenance,
       status: "UNKNOWN" as const,
       latencyMs: 0,
       hasValidLatency: false,
@@ -344,6 +370,13 @@ export class TelemetryManager {
     hasTelemetryData: boolean,
     promQuerySuccess: boolean = true
   ) {
+    const liveProvenance: TelemetryProvenanceState = backendHealth.isMockBackend
+      ? "MOCK_EMULATION"
+      : backendHealth.isCloudBackend
+      ? (effectiveMode === "LIVE" ? "LIVE" : "ERROR")
+      : (effectiveMode === "LIVE" ? "LOCAL" : "ERROR");
+
+    backendHealth.provenance = liveProvenance;
     const topologyIds = new Set(dbServices.map((s) => s.id));
     const traceCountByService = new Map<string, number>();
 
@@ -374,6 +407,7 @@ export class TelemetryManager {
           serviceId: svc.id,
           serviceName: svc.name,
           source: traceCount > 0 ? "JAEGER" : "PROMETHEUS",
+          provenance: liveProvenance,
           status: "UNKNOWN",
           latencyMs: 0,
           hasValidLatency: false,
@@ -429,6 +463,7 @@ export class TelemetryManager {
         serviceId: svc.id,
         serviceName: svc.name,
         source: "PROMETHEUS",
+        provenance: liveProvenance,
         status,
         latencyMs: latency,
         hasValidLatency,
@@ -460,6 +495,7 @@ export class TelemetryManager {
           serviceId: serviceName,
           serviceName,
           source: "PROMETHEUS",
+          provenance: liveProvenance,
           status,
           latencyMs: hasValidLatency ? metric.latencyMs : 0,
           hasValidLatency,

@@ -1,5 +1,7 @@
 export type TelemetryMode = "SIMULATION" | "LIVE" | "DEGRADED" | "REAL";
 
+export type TelemetryProvenanceState = "LIVE" | "MOCK_EMULATION" | "LOCAL" | "DISABLED" | "ERROR";
+
 export interface BackendHealthStatus {
   prometheusAvailable: boolean;
   jaegerAvailable: boolean;
@@ -9,15 +11,20 @@ export interface BackendHealthStatus {
   isCloudBackend: boolean;
   cloudConfigured: boolean;
   backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" | "SIMULATION";
+  provenance?: TelemetryProvenanceState;
   details?: string;
   lastChecked: string;
   lastIngestedAt?: string;
+  lastVerifiedAt?: string;
+  metricsIngested?: boolean;
+  tracesIngested?: boolean;
 }
 
 export interface ObservedServiceMetric {
   serviceId: string;
   serviceName: string;
   source: "PROMETHEUS" | "JAEGER" | "SIMULATION";
+  provenance?: TelemetryProvenanceState;
   status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
   latencyMs: number;
   hasValidLatency?: boolean;

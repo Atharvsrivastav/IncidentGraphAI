@@ -11,7 +11,33 @@ scrape_configs:
           environment: 'development'
           cluster: 'local-sample-mesh'
 
+  # Scrape sample microservices exposing standard Prometheus /metrics
+  - job_name: 'incidentgraph-services'
+    scrape_interval: 5s
+    static_configs:
+      - targets:
+          - 'host.docker.internal:4000'
+          - 'host.docker.internal:4001'
+          - 'host.docker.internal:4002'
+          - 'host.docker.internal:4003'
+        labels:
+          environment: 'development'
+          cluster: 'local-sample-mesh'
+
   # Self-scrape Prometheus health metrics
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+
+# -----------------------------------------------------------------------------
+# Optional Grafana Cloud Remote-Write Integration:
+# When streaming metrics to Grafana Cloud Metrics, configure remote_write:
+# remote_write:
+#   - url: <GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL> # e.g. https://prometheus-prod-XX.../api/prom/push
+#     basic_auth:
+#       username: <GRAFANA_CLOUD_INSTANCE_ID>
+#       password: <GRAFANA_CLOUD_INGESTION_TOKEN>
+#     queue_config:
+#       max_samples_per_send: 500
+#       max_shards: 4
+#       batch_send_deadline: 5s

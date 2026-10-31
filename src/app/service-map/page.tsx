@@ -115,24 +115,24 @@ export default function ServiceMapPage() {
               Topology Visualization
             </span>
             {telemetryMode === "SIMULATION" ? (
-              <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono font-semibold text-slate-400 border border-slate-700">
-                ⚙ Simulation Mode
+              <span className="rounded bg-blue-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-blue-300 border border-blue-500/30">
+                PROVENANCE: DISABLED (Simulation)
               </span>
-            ) : telemetryMode === "DEGRADED" || backendHealth?.backendType === "UNAVAILABLE" ? (
-              <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30">
-                ⚠ Telemetry Pipeline Degraded
+            ) : backendHealth?.provenance === "LIVE" ? (
+              <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-500/30">
+                PROVENANCE: LIVE (Grafana Cloud Verified)
               </span>
-            ) : backendHealth?.backendType === "MOCK_EMULATION" ? (
+            ) : backendHealth?.provenance === "MOCK_EMULATION" ? (
               <span className="rounded bg-purple-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-purple-300 border border-purple-500/30">
-                ● Mock Telemetry Emulation
+                PROVENANCE: MOCK_EMULATION (Synthetic)
               </span>
-            ) : backendHealth?.backendType === "GRAFANA_CLOUD" ? (
-              <span className="rounded bg-sky-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-sky-300 border border-sky-500/30">
-                ☁ Grafana Cloud Telemetry
+            ) : backendHealth?.provenance === "LOCAL" ? (
+              <span className="rounded bg-blue-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-blue-300 border border-blue-500/30">
+                PROVENANCE: LOCAL (Unverified)
               </span>
             ) : (
-              <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-500/30">
-                ● Genuine Local Telemetry
+              <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/30">
+                PROVENANCE: ERROR (Degraded)
               </span>
             )}
           </div>
