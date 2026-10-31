@@ -1,4 +1,5 @@
 import { spawn, execSync } from 'child_process';
+import path from 'path';
 import {
   findAvailablePort,
   recordDevDbBaseline,
@@ -18,6 +19,30 @@ process.on('SIGTERM', async () => {
   const code = await runner.performTeardown({ signal: 'SIGTERM' });
   process.exit(code);
 });
+
+// Support IPC message interruption on Windows where POSIX signals are not natively propagated
+if (process.send) {
+  process.on('message', async (msg) => {
+    if (msg === 'SIGINT' || msg === 'SIGTERM') {
+      const code = await runner.performTeardown({ signal: msg });
+      process.exit(code);
+    }
+  });
+}
+
+// Support stdin trigger for test suites
+if (!process.stdin.isTTY) {
+  process.stdin.on('data', async (chunk) => {
+    const text = chunk.toString();
+    if (text.includes('TRIGGER_SIGINT')) {
+      const code = await runner.performTeardown({ signal: 'SIGINT' });
+      process.exit(code);
+    } else if (text.includes('TRIGGER_SIGTERM')) {
+      const code = await runner.performTeardown({ signal: 'SIGTERM' });
+      process.exit(code);
+    }
+  });
+}
 
 async function main() {
   console.log('================================================================');
@@ -57,29 +82,35 @@ async function main() {
 
   runner.state = 'STARTING';
 
-  // 4. Apply Prisma schema to isolated database
-  console.log('[Isolated DB] Applying Prisma schema (db push)...');
-  execSync('npx prisma db push --skip-generate', {
-    cwd: runner.cwd,
-    stdio: 'pipe',
-    env: {
-      ...process.env,
-      DATABASE_URL: runner.databaseUrl,
-    },
-  });
-  console.log('  ✓ Prisma schema successfully applied to disposable database');
+  const isFastBoot = process.env.E2E_FAST_BOOT === '1';
 
-  // 5. Seed isolated database with 7 services and dependencies
-  console.log('[Isolated DB] Seeding base topology and dependencies...');
-  execSync('npx tsx src/lib/db/seed.ts', {
-    cwd: runner.cwd,
-    stdio: 'pipe',
-    env: {
-      ...process.env,
-      DATABASE_URL: runner.databaseUrl,
-    },
-  });
-  console.log('  ✓ Disposable database seeded (7 services, 8 dependencies, IDLE simulation state)');
+  if (!isFastBoot) {
+    // 4. Apply Prisma schema to isolated database
+    console.log('[Isolated DB] Applying Prisma schema (db push)...');
+    execSync('npx prisma db push --skip-generate', {
+      cwd: runner.cwd,
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        DATABASE_URL: runner.databaseUrl,
+      },
+    });
+    console.log('  ✓ Prisma schema successfully applied to disposable database');
+
+    // 5. Seed isolated database with 7 services and dependencies
+    console.log('[Isolated DB] Seeding base topology and dependencies...');
+    execSync('npx tsx src/lib/db/seed.ts', {
+      cwd: runner.cwd,
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        DATABASE_URL: runner.databaseUrl,
+      },
+    });
+    console.log('  ✓ Disposable database seeded (7 services, 8 dependencies, IDLE simulation state)');
+  } else {
+    console.log('[Fast Boot Mode] Skipping schema push and seed for disposable signal test harness');
+  }
 
   // 6. Select port and start production Next.js server
   const preferredPort = parseInt(process.env.PORT || '3000', 10);
@@ -87,10 +118,45 @@ async function main() {
   const targetBaseUrl = `http://localhost:${runner.targetPort}`;
 
   const isWindows = process.platform === 'win32';
-  console.log(`[Next.js Server] Starting production server on port ${runner.targetPort}...`);
-  runner.serverProcess = spawn('npx', ['next', 'start', '-p', String(runner.targetPort)], {
+  const nextBin = path.join(runner.cwd, 'node_modules', 'next', 'dist', 'bin', 'next');
+
+  let serverExecutable = process.execPath;
+  let serverArgs;
+
+  if (isFastBoot) {
+    serverArgs = [
+      '-e',
+      `
+        const http = require('http');
+        const server = http.createServer((req, res) => {
+          if (req.url === '/api/health') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              status: 'healthy',
+              database: {
+                status: 'connected',
+                provider: 'sqlite',
+                servicesCount: 7,
+                isIsolated: true,
+              }
+            }));
+          } else {
+            res.writeHead(404);
+            res.end();
+          }
+        });
+        server.listen(${runner.targetPort}, '127.0.0.1');
+        setInterval(() => {}, 1000);
+      `
+    ];
+  } else {
+    serverArgs = [nextBin, 'start', '-p', String(runner.targetPort)];
+  }
+
+  console.log(`[Next.js Server] Starting server on port ${runner.targetPort}...`);
+  runner.serverProcess = spawn(serverExecutable, serverArgs, {
     cwd: runner.cwd,
-    shell: true,
+    shell: false,
     detached: !isWindows, // Creates dedicated process group on POSIX
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
@@ -102,6 +168,7 @@ async function main() {
       NEXT_TELEMETRY_DISABLED: '1',
     },
   });
+  runner.serverPgid = !isWindows ? runner.serverProcess.pid : null;
 
   runner.serverProcess.on('error', (err) => {
     console.error('❌ [Next.js Server Process Error]:', err);
@@ -144,11 +211,15 @@ async function main() {
 
   // 8. Execute Browser E2E Test Suite and track browser child process globally
   runner.state = 'TESTING';
-  console.log(`\n[Browser E2E] Launching browser test runner against ${targetBaseUrl}...`);
-  runner.browserTestProcess = spawn('node', ['tests/browser-e2e.mjs'], {
+  const testScript = process.env.E2E_TEST_SCRIPT || 'tests/browser-e2e.mjs';
+  const testScriptPath = path.resolve(runner.cwd, testScript);
+  console.log(`\n[Browser E2E] Launching browser test runner (${testScript}) against ${targetBaseUrl}...`);
+
+  runner.browserTestProcess = spawn(process.execPath, [testScriptPath], {
     cwd: runner.cwd,
-    shell: true,
-    stdio: 'inherit',
+    shell: false,
+    detached: !isWindows, // Creates dedicated process group on POSIX
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     env: {
       ...process.env,
       BASE_URL: targetBaseUrl,
@@ -156,11 +227,35 @@ async function main() {
       E2E_ISOLATED: '1',
     },
   });
+  runner.browserTestPgid = !isWindows ? runner.browserTestProcess.pid : null;
+
+  runner.browserTestProcess.stdout?.on('data', (d) => {
+    process.stdout.write(d);
+    if (process.send) {
+      process.send({ type: 'BROWSER_OUTPUT', data: d.toString() });
+    }
+  });
+
+  runner.browserTestProcess.on('message', (msg) => {
+    if (process.send) {
+      process.send(msg);
+    }
+  });
+
+  if (process.send) {
+    process.send({
+      type: 'RUNNER_READY',
+      browserPid: runner.browserTestProcess.pid,
+      serverPid: runner.serverProcess?.pid,
+      targetPort: runner.targetPort,
+      dbFilePath: runner.dbFilePath,
+    });
+  }
 
   const testCode = await new Promise((resolve) => {
     runner.browserTestProcess.on('exit', (code) => resolve(code ?? 1));
     runner.browserTestProcess.on('error', (err) => {
-      console.error('Failed to spawn browser-e2e.mjs:', err);
+      console.error('Failed to spawn browser test child process:', err);
       resolve(1);
     });
   });

@@ -3,13 +3,14 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import http from "http";
-import { spawn } from "child_process";
+import { spawn, type ChildProcess, type StdioOptions } from "child_process";
 import {
   createExclusiveDatabase,
   cleanupDisposableDb,
   recordDevDbBaseline,
   verifyDevDbIntegrity,
   isProcessAlive,
+  isProcessGroupAlive,
   killProcessTree,
   isPortAvailable,
   computeFileHash,
@@ -94,6 +95,46 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       expect(fs.existsSync(dbInfo.dbFilePath)).toBe(false);
       expect(fs.existsSync(`${dbInfo.dbFilePath}-wal`)).toBe(false);
       expect(fs.existsSync(`${dbInfo.dbFilePath}-shm`)).toBe(false);
+    });
+
+    it("2b. Exclusive-create close failure safely cleans up owned file without leaving orphan, preserves ownership knowledge, and does not delete on EEXIST", () => {
+      // 1. When closeSync fails on a newly created file:
+      let closeCalled = false;
+      let errorThrown: (Error & { dbFileOwned?: boolean; cleanupFailed?: boolean; dbFilePath?: string }) | null = null;
+      try {
+        createExclusiveDatabase(dummyPrismaDir, "e2e-isolated-close-fail-12345678.db", {
+          closeSync: () => {
+            closeCalled = true;
+            const err = new Error("EBADF: bad file descriptor") as Error & { code?: string };
+            err.code = "EBADF";
+            throw err;
+          },
+        });
+      } catch (err) {
+        errorThrown = err as Error & { dbFileOwned?: boolean; cleanupFailed?: boolean; dbFilePath?: string };
+      }
+
+      expect(closeCalled).toBe(true);
+      expect(errorThrown).toBeDefined();
+      expect(errorThrown?.message).toContain("Failed to close database file descriptor");
+      expect(errorThrown?.dbFileOwned).toBe(true);
+      expect(errorThrown?.cleanupFailed).toBe(false);
+      // Verify the owned file was cleaned up on close failure (no orphan)
+      expect(fs.existsSync(errorThrown?.dbFilePath || "")).toBe(false);
+
+      // 2. But EEXIST on a pre-existing file MUST NEVER delete the file!
+      const preExisting = path.join(dummyPrismaDir, "e2e-isolated-collision-preexist-9999.db");
+      fs.writeFileSync(preExisting, "PREEXISTING_DATA_PRESERVED");
+      let eexistError: (Error & { code?: string }) | null = null;
+      try {
+        createExclusiveDatabase(dummyPrismaDir, "e2e-isolated-collision-preexist-9999.db");
+      } catch (err) {
+        eexistError = err as Error & { code?: string };
+      }
+      expect(eexistError).toBeDefined();
+      expect(eexistError?.code).toBe("EEXIST");
+      expect(fs.existsSync(preExisting)).toBe(true);
+      expect(fs.readFileSync(preExisting, "utf8")).toBe("PREEXISTING_DATA_PRESERVED");
     });
 
     it("3. Failed primary DB deletion fails the runner teardown", async () => {
@@ -249,84 +290,359 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       expect(cleanupExecutions).toBe(3);
     });
 
-    it("13. Browser child process and nested child processes are terminated on teardown", async () => {
-      // Spawn a real long-running child process
-      const child = spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
-        stdio: "ignore",
-      });
-      const childPid = child.pid;
-      expect(isProcessAlive(childPid)).toBe(true);
+    it("13. Real nested child-process termination terminates both parent and nested worker", async () => {
+      // Spawn a real detached Node parent process which starts a nested worker process
+      const isWin = process.platform === "win32";
+      const parent = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import { spawn } from 'child_process';
+            const isWin = process.platform === 'win32';
+            const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+              stdio: 'ignore',
+              detached: !isWin,
+            });
+            console.log('PIDS:' + process.pid + ':' + worker.pid);
+            setInterval(() => {}, 1000);
+          `
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: ["ignore", "pipe", "ignore"],
+          detached: !isWin,
+        }
+      );
 
-      const runner = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
-      runner.browserTestProcess = child;
-
-      await runner.performTeardown({ signal: "SIGTERM" });
-
-      // Verify browser child process is dead
-      expect(isProcessAlive(childPid)).toBe(false);
-      expect(runner.browserTestProcess).toBeNull();
-    });
-
-    it("14. Server process group is verified stopped and port release is verified", async () => {
-      // Create a real listening server to simulate Next.js server on a port
-      const server = http.createServer((req, res) => res.end("ok"));
-      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-
-      expect(await isPortAvailable(port)).toBe(false);
-
-      // Close server and verify port release via killProcessTree verification logic
-      await new Promise((resolve) => server.close(resolve));
-      const cleanlyStopped = await killProcessTree(null, port);
-      expect(cleanlyStopped).toBe(true);
-      expect(await isPortAvailable(port)).toBe(true);
-    });
-
-    it("15. Real child process receiving real SIGINT exits with 130 and runs teardown", async () => {
-      // Spawn real Node child with signal listener simulating runner
-      const child = spawn("node", [
-        "--input-type=module",
-        "-e",
-        `
-          import { RunnerLifecycle } from './scripts/runner-core.mjs';
-          const runner = new RunnerLifecycle();
-          runner.state = 'TESTING';
-          process.stdin.on('data', (data) => {
-            if (data.toString().includes('TRIGGER_SIGINT')) {
-              process.emit('SIGINT');
-            }
-          });
-          process.on('SIGINT', async () => {
-            const code = await runner.performTeardown({ signal: 'SIGINT' });
-            process.exit(code);
-          });
-          console.log('READY');
-          setInterval(() => {}, 500);
-        `
-      ], {
-        cwd: process.cwd(),
-        stdio: ["pipe", "pipe", "ignore"],
-      });
-
-      await new Promise<void>((resolve) => {
-        child.stdout.on("data", (data) => {
-          if (data.toString().includes("READY")) resolve();
+      const [parentPid, workerPid] = await new Promise<[number, number]>((resolve) => {
+        parent.stdout.on("data", (d) => {
+          const match = d.toString().match(/PIDS:(\d+):(\d+)/);
+          if (match) {
+            resolve([parseInt(match[1], 10), parseInt(match[2], 10)]);
+          }
         });
       });
 
-      if (process.platform === "win32") {
-        child.stdin.write("TRIGGER_SIGINT\n");
+      // Confirm both parent and nested child worker are actively alive in the OS
+      expect(isProcessAlive(parentPid)).toBe(true);
+      expect(isProcessAlive(workerPid)).toBe(true);
+      expect(isProcessGroupAlive(parentPid)).toBe(true);
+
+      // Run actual production killProcessTree against parent process group
+      const stopped = await killProcessTree(parentPid);
+      expect(stopped).toBe(true);
+
+      // Verify both parent and nested child are terminated
+      expect(isProcessAlive(parentPid)).toBe(false);
+      expect(isProcessAlive(workerPid)).toBe(false);
+
+      // Verify the group has no surviving processes
+      expect(isProcessGroupAlive(parentPid)).toBe(false);
+    });
+
+    it("14. Real server process and port release terminates process group and releases port", async () => {
+      // Start an HTTP server in a separate detached child process
+      const isWin = process.platform === "win32";
+      const child = spawn(
+        process.execPath,
+        [
+          "-e",
+          `
+            const http = require('http');
+            const server = http.createServer((req, res) => res.end('ok'));
+            server.listen(0, '127.0.0.1', () => {
+              const port = server.address().port;
+              console.log('LISTENING:' + port);
+            });
+            setInterval(() => {}, 1000);
+          `
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: ["ignore", "pipe", "ignore"],
+          detached: !isWin,
+        }
+      );
+
+      const port = await new Promise<number>((resolve) => {
+        child.stdout.on("data", (d) => {
+          const match = d.toString().match(/LISTENING:(\d+)/);
+          if (match) {
+            resolve(parseInt(match[1], 10));
+          }
+        });
+      });
+
+      const childPid = child.pid!;
+      // Confirm server is listening and port is occupied
+      expect(isProcessAlive(childPid)).toBe(true);
+      expect(await isPortAvailable(port)).toBe(false);
+
+      // Invoke real production killProcessTree(child.pid, port)
+      const stopped = await killProcessTree(childPid, port);
+      expect(stopped).toBe(true);
+
+      // Verify the process group is terminated
+      expect(isProcessAlive(childPid)).toBe(false);
+      expect(isProcessGroupAlive(childPid)).toBe(false);
+
+      // Verify the port becomes available
+      expect(await isPortAvailable(port)).toBe(true);
+
+      // Assert cleanup fails if PID is missing or invalid
+      expect(await killProcessTree(null as unknown as number, port)).toBe(false);
+      expect(await killProcessTree(undefined as unknown as number, port)).toBe(false);
+      expect(await killProcessTree(-1, port)).toBe(false);
+    });
+
+    it("15. Full-runner SIGINT integration test terminates browser process tree, releases port, cleans up DB, and exits 130", async () => {
+      const devDbBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+      const isWin = process.platform === "win32";
+
+      const childEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        NODE_ENV: "test",
+        E2E_FAST_BOOT: "1",
+        E2E_TEST_SCRIPT: "tests/fixtures/interruptible-browser-test.mjs",
+      };
+      delete childEnv.BASE_URL;
+
+      const runnerChild: ChildProcess = spawn(
+        process.execPath,
+        ["scripts/run-browser-e2e.mjs"],
+        {
+          cwd: process.cwd(),
+          stdio: ["pipe", "pipe", "pipe", "ipc"] as StdioOptions,
+          env: childEnv,
+        }
+      );
+
+      let runnerDbPath: string | null = null;
+      let runnerPort: number | null = null;
+      let browserPid: number | null = null;
+      let workerPid: number | null = null;
+      let stderrOutput = "";
+
+      await new Promise<void>((resolve, reject) => {
+        let isReady = false;
+        const timeout = setTimeout(() => {
+          reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
+        }, 15000);
+
+        runnerChild.on("message", (msg: unknown) => {
+          const m = msg as {
+            type?: string;
+            dbFilePath?: string;
+            targetPort?: number;
+            browserPid?: number;
+            workerPid?: number;
+          } | null;
+          if (m && m.type === "RUNNER_READY") {
+            if (m.dbFilePath) runnerDbPath = m.dbFilePath;
+            if (m.targetPort) runnerPort = m.targetPort;
+          }
+          if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
+            if (m.browserPid) browserPid = m.browserPid;
+            if (m.workerPid) workerPid = m.workerPid;
+            isReady = true;
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+
+        runnerChild.stdout?.on("data", (data) => {
+          const str = data.toString();
+          const dbMatch = str.match(/Target path:\s*(.+)/);
+          if (dbMatch) runnerDbPath = dbMatch[1].trim();
+          const portMatch = str.match(/Starting server on port (\d+)/);
+          if (portMatch) runnerPort = parseInt(portMatch[1], 10);
+          const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
+          if (browserMatch && !isReady) {
+            browserPid = parseInt(browserMatch[1], 10);
+            workerPid = parseInt(browserMatch[2], 10);
+            isReady = true;
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+
+        runnerChild.stderr?.on("data", (d) => {
+          stderrOutput += d.toString();
+        });
+
+        runnerChild.on("exit", (code) => {
+          if (!isReady) {
+            clearTimeout(timeout);
+            reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
+          }
+        });
+      });
+
+      expect(browserPid).toBeGreaterThan(0);
+      expect(workerPid).toBeGreaterThan(0);
+      expect(isProcessAlive(browserPid!)).toBe(true);
+      expect(isProcessAlive(workerPid!)).toBe(true);
+      expect(runnerDbPath).not.toBeNull();
+      expect(fs.existsSync(runnerDbPath!)).toBe(true);
+
+      // Trigger real SIGINT interruption: on Windows use IPC/stdin, on POSIX use SIGINT signal
+      if (isWin) {
+        runnerChild.send("SIGINT");
       } else {
-        child.kill("SIGINT");
+        runnerChild.kill("SIGINT");
       }
 
       const exitCode = await new Promise((resolve) => {
-        child.on("exit", (code) => resolve(code));
+        runnerChild.on("exit", (code) => resolve(code));
       });
 
+      // Verify exit code 130
       expect(exitCode).toBe(130);
-    });
+
+      // Verify browser Node and worker descendants stopped
+      expect(isProcessAlive(browserPid!)).toBe(false);
+      expect(isProcessAlive(workerPid!)).toBe(false);
+
+      // Verify server process and port stopped
+      if (runnerPort) {
+        expect(await isPortAvailable(runnerPort)).toBe(true);
+      }
+
+      // Verify owned DB and all sidecars are removed
+      expect(fs.existsSync(runnerDbPath!)).toBe(false);
+      expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
+      expect(fs.existsSync(`${runnerDbPath}-shm`)).toBe(false);
+
+      // Verify developer DB and its sidecars remain unchanged
+      const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+      expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
+      expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
+    }, 20000);
+
+    it("16. Full-runner SIGTERM integration test terminates browser process tree, releases port, cleans up DB, and exits 143", async () => {
+      const devDbBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+      const isWin = process.platform === "win32";
+
+      const childEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        NODE_ENV: "test",
+        E2E_FAST_BOOT: "1",
+        E2E_TEST_SCRIPT: "tests/fixtures/interruptible-browser-test.mjs",
+      };
+      delete childEnv.BASE_URL;
+
+      const runnerChild: ChildProcess = spawn(
+        process.execPath,
+        ["scripts/run-browser-e2e.mjs"],
+        {
+          cwd: process.cwd(),
+          stdio: ["pipe", "pipe", "pipe", "ipc"] as StdioOptions,
+          env: childEnv,
+        }
+      );
+
+      let runnerDbPath: string | null = null;
+      let runnerPort: number | null = null;
+      let browserPid: number | null = null;
+      let workerPid: number | null = null;
+      let stderrOutput = "";
+
+      await new Promise<void>((resolve, reject) => {
+        let isReady = false;
+        const timeout = setTimeout(() => {
+          reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
+        }, 15000);
+
+        runnerChild.on("message", (msg: unknown) => {
+          const m = msg as {
+            type?: string;
+            dbFilePath?: string;
+            targetPort?: number;
+            browserPid?: number;
+            workerPid?: number;
+          } | null;
+          if (m && m.type === "RUNNER_READY") {
+            if (m.dbFilePath) runnerDbPath = m.dbFilePath;
+            if (m.targetPort) runnerPort = m.targetPort;
+          }
+          if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
+            if (m.browserPid) browserPid = m.browserPid;
+            if (m.workerPid) workerPid = m.workerPid;
+            isReady = true;
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+
+        runnerChild.stdout?.on("data", (data) => {
+          const str = data.toString();
+          const dbMatch = str.match(/Target path:\s*(.+)/);
+          if (dbMatch) runnerDbPath = dbMatch[1].trim();
+          const portMatch = str.match(/Starting server on port (\d+)/);
+          if (portMatch) runnerPort = parseInt(portMatch[1], 10);
+          const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
+          if (browserMatch && !isReady) {
+            browserPid = parseInt(browserMatch[1], 10);
+            workerPid = parseInt(browserMatch[2], 10);
+            isReady = true;
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+
+        runnerChild.stderr?.on("data", (d) => {
+          stderrOutput += d.toString();
+        });
+
+        runnerChild.on("exit", (code) => {
+          if (!isReady) {
+            clearTimeout(timeout);
+            reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
+          }
+        });
+      });
+
+      expect(browserPid).toBeGreaterThan(0);
+      expect(workerPid).toBeGreaterThan(0);
+      expect(isProcessAlive(browserPid!)).toBe(true);
+      expect(isProcessAlive(workerPid!)).toBe(true);
+      expect(runnerDbPath).not.toBeNull();
+      expect(fs.existsSync(runnerDbPath!)).toBe(true);
+
+      // Trigger SIGTERM
+      if (isWin) {
+        runnerChild.send("SIGTERM");
+      } else {
+        runnerChild.kill("SIGTERM");
+      }
+
+      const exitCode = await new Promise((resolve) => {
+        runnerChild.on("exit", (code) => resolve(code));
+      });
+
+      // Verify exit code 143
+      expect(exitCode).toBe(143);
+
+      // Verify browser Node and worker descendants stopped
+      expect(isProcessAlive(browserPid!)).toBe(false);
+      expect(isProcessAlive(workerPid!)).toBe(false);
+
+      // Verify server process and port stopped
+      if (runnerPort) {
+        expect(await isPortAvailable(runnerPort)).toBe(true);
+      }
+
+      // Verify owned DB and all sidecars are removed
+      expect(fs.existsSync(runnerDbPath!)).toBe(false);
+      expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
+
+      // Verify developer DB and its sidecars remain unchanged
+      const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+      expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
+      expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
+    }, 20000);
   });
 
   describe("4. Browser Safety Validation Guard & Isolation Rejection", () => {

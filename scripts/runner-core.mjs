@@ -44,9 +44,11 @@ export async function findAvailablePort(preferredPort = 3000) {
 
 /**
  * Checks if a process with given PID is alive.
+ * @param {number} pid
+ * @returns {boolean}
  */
 export function isProcessAlive(pid) {
-  if (!pid) return false;
+  if (!pid || typeof pid !== 'number' || isNaN(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -56,38 +58,95 @@ export function isProcessAlive(pid) {
 }
 
 /**
- * Checks if any process in the process group is alive (POSIX).
+ * Returns all descendant PIDs of a process on Windows.
+ * @param {number} pid
+ * @returns {number[]}
+ */
+export function getDescendantPidsWindows(pid) {
+  if (process.platform !== 'win32' || !pid || typeof pid !== 'number' || pid <= 0) return [];
+  try {
+    const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId | ConvertTo-Json -Compress"`;
+    const out = execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    if (!out) return [];
+    const procs = JSON.parse(out);
+    const procList = Array.isArray(procs) ? procs : [procs];
+    /** @type {Map<number, number[]>} */
+    const childrenMap = new Map();
+    for (const p of procList) {
+      const parent = p.ParentProcessId;
+      if (!childrenMap.has(parent)) childrenMap.set(parent, []);
+      childrenMap.get(parent).push(p.ProcessId);
+    }
+    const descendants = [];
+    const queue = [pid];
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      const children = childrenMap.get(curr) || [];
+      for (const ch of children) {
+        descendants.push(ch);
+        queue.push(ch);
+      }
+    }
+    return descendants;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Checks if any process in the process group or process tree is alive.
+ * @param {number} pid
+ * @returns {boolean}
  */
 export function isProcessGroupAlive(pid) {
-  if (!pid) return false;
+  if (!pid || typeof pid !== 'number' || isNaN(pid) || pid <= 0) return false;
   if (process.platform === 'win32') {
-    return isProcessAlive(pid);
+    if (isProcessAlive(pid)) return true;
+    const descendants = getDescendantPidsWindows(pid);
+    return descendants.some((dPid) => isProcessAlive(dPid));
+  }
+
+  // POSIX: verify dedicated process group (-pid)
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    if (e.code === 'EPERM') return true;
   }
   try {
     const out = execSync(`pgrep -g ${pid} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
     if (out.length > 0) return true;
-  } catch {
-    // Fall back to PID check
-  }
+  } catch {}
   return isProcessAlive(pid);
 }
 
 /**
  * Cross-platform process tree termination and verification.
+ * A missing or invalid PID must not count as proof of successful process termination.
  * @param {number | null} pid
  * @param {number | null} [port=null]
  * @returns {Promise<boolean>}
  */
 export async function killProcessTree(pid, port = null) {
-  if (!pid) return true;
+  if (pid === null || pid === undefined || typeof pid !== 'number' || isNaN(pid) || pid <= 0) {
+    console.error(`[killProcessTree] Invalid or missing PID: ${pid}`);
+    return false;
+  }
   const isWindows = process.platform === 'win32';
 
   try {
     if (isWindows) {
+      // Gather descendant PIDs before attempting termination
+      const descendants = getDescendantPidsWindows(pid);
       try {
         execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
       } catch {
-        // May already be stopped
+        // Leader may already be stopped
+      }
+      for (const dPid of descendants) {
+        if (isProcessAlive(dPid)) {
+          try { execSync(`taskkill /pid ${dPid} /F`, { stdio: 'ignore' }); } catch {}
+        }
       }
     } else {
       // On POSIX, terminate the process group (-pid), falling back to PID
@@ -113,12 +172,20 @@ export async function killProcessTree(pid, port = null) {
       break;
     }
 
-    // Escalate to SIGKILL after bounded grace period (500ms)
+    // Escalate to SIGKILL / taskkill after bounded grace period (500ms)
     if (i >= 5) {
       if (isWindows) {
         try { execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' }); } catch {}
+        const descendants = getDescendantPidsWindows(pid);
+        for (const dPid of descendants) {
+          if (isProcessAlive(dPid)) {
+            try { execSync(`taskkill /pid ${dPid} /F`, { stdio: 'ignore' }); } catch {}
+          }
+        }
       } else {
-        try { process.kill(-pid, 'SIGKILL'); } catch {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
           try { process.kill(pid, 'SIGKILL'); } catch {}
         }
         try { execSync(`pkill -KILL -P ${pid} 2>/dev/null || true`, { stdio: 'ignore' }); } catch {}
@@ -128,10 +195,10 @@ export async function killProcessTree(pid, port = null) {
     await new Promise((r) => setTimeout(r, 100));
   }
 
-  // Also verify port is released
+  // Also verify port is released independently
   let portReleased = false;
   if (port) {
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 20; i++) {
       if (await isPortAvailable(port)) {
         portReleased = true;
         break;
@@ -148,11 +215,13 @@ export async function killProcessTree(pid, port = null) {
 /**
  * Creates a unique disposable SQLite database exclusively.
  * Ownership is granted only if exclusive creation succeeds.
+ * Handles close failures safely without leaving untracked orphans.
  * @param {string} prismaDir
  * @param {string | null} [requestedName=null]
+ * @param {{ closeSync?: (fd: number) => void }} [options={}]
  * @returns {{ dbFileName: string, dbFilePath: string, databaseUrl: string, dbFileOwned: boolean }}
  */
-export function createExclusiveDatabase(prismaDir, requestedName = null) {
+export function createExclusiveDatabase(prismaDir, requestedName = null, options = {}) {
   const uniqueName = requestedName || `e2e-isolated-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.db`;
   const dbFileName = uniqueName.endsWith('.db') ? uniqueName : `${uniqueName}.db`;
   const dbFilePath = path.join(prismaDir, dbFileName);
@@ -169,13 +238,30 @@ export function createExclusiveDatabase(prismaDir, requestedName = null) {
   } catch (err) {
     const error = new Error(`Failed to exclusively create disposable database at ${dbFilePath}: ${err.message}`);
     error.code = err.code;
+    // NEVER delete an existing database on EEXIST!
     throw error;
   }
 
+  // The file was created by this runner process (owned).
+  // Handle close failures safely without leaving an untracked orphan.
+  const closeFn = options.closeSync || fs.closeSync;
   try {
-    fs.closeSync(fd);
-  } catch (err) {
-    throw new Error(`Failed to close database file descriptor: ${err.message}`);
+    closeFn(fd);
+  } catch (closeErr) {
+    // Attempt safe cleanup of that owned file
+    const remaining = cleanupDisposableDb(dbFilePath, true);
+    const cleanupFailed = remaining.length > 0;
+    const cleanupReport = cleanupFailed
+      ? `Failed to clean up owned file; remaining artifacts: ${remaining.join(', ')}`
+      : `Owned file was safely cleaned up.`;
+
+    const error = new Error(`Failed to close database file descriptor: ${closeErr.message}. ${cleanupReport}`);
+    error.code = closeErr.code;
+    error.dbFilePath = dbFilePath;
+    error.dbFileOwned = true;
+    error.cleanupFailed = cleanupFailed;
+    error.remainingArtifacts = remaining;
+    throw error;
   }
 
   return {
