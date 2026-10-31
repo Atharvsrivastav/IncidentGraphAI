@@ -44,7 +44,7 @@ try {
 
 import { PrometheusClient } from "../src/lib/telemetry/prometheusClient";
 import { JaegerClient } from "../src/lib/telemetry/jaegerClient";
-import { PrometheusRegistry } from "../sample-services/shared/telemetry";
+import { validateRemoteWriteConfig } from "./generate-prometheus-config";
 
 function maskSecret(val?: string): string {
   if (!val || val.trim().length === 0) return "[NOT SET]";
@@ -155,7 +155,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   const tempoUser = process.env.GRAFANA_CLOUD_TEMPO_USER?.trim() || otlpInstanceId;
   const tempoToken = process.env.GRAFANA_CLOUD_TEMPO_TOKEN?.trim();
 
-  const remoteWriteUrl = process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL?.trim();
+  const rwValidation = validateRemoteWriteConfig();
 
   console.log(`  OTLP HTTPS Endpoint  : ${otlpEndpoint ? otlpEndpoint : "[NOT SET]"}`);
   console.log(`  OTLP Instance ID     : ${maskSecret(otlpInstanceId)}`);
@@ -166,12 +166,12 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   console.log(`  Tempo Query URL      : ${tempoUrl ? tempoUrl : "[NOT SET]"}`);
   console.log(`  Tempo User ID        : ${maskSecret(tempoUser)}`);
   console.log(`  Tempo Read Token     : ${maskSecret(tempoToken)}`);
-  console.log(`  Prometheus Remote-Wr : ${remoteWriteUrl ? remoteWriteUrl : "[NOT SET - Optional local scrape mode]"}`);
+  console.log(`  Prometheus Remote-Wr : ${rwValidation.valid ? "[CONFIGURED - DEDICATED WRITE TOKEN SET]" : `[NOT CONFIGURED - ${rwValidation.reason}]`}`);
 
   const hasOtlp = Boolean(otlpEndpoint && otlpInstanceId && ingestToken);
   const hasProm = Boolean(promUrl && promUser && promToken);
   const hasTempo = Boolean(tempoUrl && tempoUser && tempoToken);
-  const hasRemoteWrite = Boolean(remoteWriteUrl && (promToken || ingestToken));
+  const hasRemoteWrite = rwValidation.valid;
   const isFullyConfigured = hasOtlp && hasProm && hasTempo;
 
   const directOtlpResult = {
@@ -340,63 +340,173 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   }
 
   // ---------------------------------------------------------------------------
-  // 3. Metrics Verification: Path B (Prometheus Scrape -> Remote-Write)
+  // 3. Metrics Verification: Path B (Sample-Service -> Prometheus Scrape -> Remote-Write)
   // ---------------------------------------------------------------------------
   console.log("\n--- 3. Metrics Verification (Path B: Sample-Service -> Prometheus Scrape -> Remote-Write) ---");
   const uniqueRwId = `verify_rw_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
   report.prometheusRemoteWriteResult.verificationId = uniqueRwId;
 
-  // Record metric into real sample-service registry
-  const serviceRegistry = new PrometheusRegistry("order-service");
-  serviceRegistry.recordRequest(1, { verification_id: uniqueRwId, status: "200" });
-  console.log(`  Recorded test metric in sample-service registry with verification_id: ${uniqueRwId}`);
+  const orderServicePort = Number(process.env.SAMPLE_ORDER_PORT) || 4001;
+  const orderServiceBase = `http://localhost:${orderServicePort}`;
+  let startedLocalOrderServer: import("http").Server | null = null;
 
-  if (!hasRemoteWrite) {
-    report.prometheusRemoteWriteResult.status = "NOT_VERIFIED_AWAITING_CONFIG";
-    report.prometheusRemoteWriteResult.details = "GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL is not configured in .env. Local Prometheus operation preserved.";
-    console.log("  ℹ Prometheus remote_write is not configured in environment (Local scrape mode active).");
-  } else {
-    // Check if local Prometheus is reachable
+  try {
+    const isServiceRunning = await isHttpEndpointReachable(`${orderServiceBase}/health`, 1500);
+    if (!isServiceRunning) {
+      console.log(`  Starting disposable order-service instance on port ${orderServicePort}...`);
+      const { server } = await import("../sample-services/order/server");
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(orderServicePort, () => resolve());
+      });
+      startedLocalOrderServer = server;
+    }
+
+    // Record synthetic metric via actual running sample-service HTTP endpoint
+    console.log(`  Emitting synthetic metric to ${orderServiceBase}/test/record-metric with verification_id: ${uniqueRwId}`);
+    const postRes = await fetch(`${orderServiceBase}/test/record-metric`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        verification_id: uniqueRwId,
+        count: 1,
+        status: "synthetic",
+      }),
+    });
+
+    if (!postRes.ok) {
+      throw new Error(`Failed to record metric via order-service HTTP endpoint: status ${postRes.status}`);
+    }
+
+    // Confirm that the real /metrics endpoint exposes the metric
+    const metricsRes = await fetch(`${orderServiceBase}/metrics`);
+    const metricsText = await metricsRes.text();
+    if (!metricsText.includes(`verification_id="${uniqueRwId}"`)) {
+      throw new Error("Synthetic metric was not exposed by order-service /metrics endpoint");
+    }
+    console.log("  ✓ Confirmed synthetic metric is exposed on order-service /metrics endpoint.");
+
+    // Check local Prometheus availability
     const localPrometheusUrl = process.env.PROMETHEUS_URL || "http://localhost:9090";
-    const isLocalPrometheusUp = await isHttpEndpointReachable(`${localPrometheusUrl}/-/healthy`);
+    const isLocalPrometheusUp = await isHttpEndpointReachable(`${localPrometheusUrl}/-/healthy`, 2000);
 
     if (!isLocalPrometheusUp) {
       report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
-      report.prometheusRemoteWriteResult.details = `Local Prometheus instance (${localPrometheusUrl}) is offline. Scrape and remote-write could not be verified.`;
-      console.log(`  ℹ Local Prometheus (${localPrometheusUrl}) is offline. Remote-write path reported separately as NOT_VERIFIED.`);
+      report.prometheusRemoteWriteResult.scrapeConfirmed = false;
+      report.prometheusRemoteWriteResult.details = `Local Prometheus instance (${localPrometheusUrl}) is offline. Scrape and remote-write could not be verified. State: Prometheus unavailable.`;
+      console.log(`  ℹ [Prometheus unavailable] Local Prometheus (${localPrometheusUrl}) is offline.`);
     } else {
-      report.prometheusRemoteWriteResult.scrapeConfirmed = true;
-      console.log(`  ✓ Local Prometheus instance (${localPrometheusUrl}) is online and scraping targets.`);
-      console.log("  Querying Grafana Cloud Prometheus to confirm remote-write ingestion...");
+      console.log(`  ✓ Local Prometheus instance (${localPrometheusUrl}) is online.`);
 
-      const rwQueryStart = Date.now();
-      let rwVerified = false;
-
-      for (let attempt = 1; attempt <= 4; attempt++) {
-        try {
-          const rwRes = await promClient.queryInstantDetailed(
-            `http_requests_total{verification_id="${uniqueRwId}"}`
+      // Verify target scrape health using Prometheus targets API
+      let targetUp = false;
+      try {
+        const targetsRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
+        if (targetsRes.ok) {
+          const targetsJson = await targetsRes.json() as { data?: { activeTargets?: Array<{ discoveredLabels?: Record<string, string>; health?: string; scrapeUrl?: string }> } };
+          const activeTargets = targetsJson.data?.activeTargets || [];
+          targetUp = activeTargets.some(
+            (t) => (t.scrapeUrl?.includes(`:${orderServicePort}`) || t.discoveredLabels?.["__address__"]?.includes(`:${orderServicePort}`)) && t.health === "up"
           );
-          if (rwRes.success && rwRes.records.length > 0) {
-            rwVerified = true;
-            report.prometheusRemoteWriteResult.status = "PASSED";
-            report.prometheusRemoteWriteResult.queryLatencyMs = Date.now() - rwQueryStart;
-            report.prometheusRemoteWriteResult.details = `Remote-write confirmed in Grafana Cloud TSDB (${rwRes.records.length} sample(s) received).`;
-            console.log(`  ✓ [PASS] Remote-write ingestion confirmed in Grafana Cloud TSDB (${report.prometheusRemoteWriteResult.queryLatencyMs}ms).`);
-            break;
-          }
-        } catch {
-          // Poll
         }
-        if (!rwVerified && attempt < 4) {
-          await sleep(2500);
-        }
+      } catch {
+        // targets check non-fatal
       }
 
-      if (!rwVerified) {
+      // Confirm local Prometheus has actually scraped the exact verification ID
+      console.log("  Querying local Prometheus to confirm actual scrape of verification ID...");
+      let localScraped = false;
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        try {
+          const promLocalRes = await fetch(
+            `${localPrometheusUrl}/api/v1/query?query=${encodeURIComponent(`http_requests_total{verification_id="${uniqueRwId}"}`)}`
+          );
+          if (promLocalRes.ok) {
+            const promJson = await promLocalRes.json() as { data?: { result?: Array<{ value?: [number, string] }> } };
+            const results = promJson.data?.result || [];
+            if (results.length > 0 && Number(results[0].value?.[1]) >= 1) {
+              localScraped = true;
+              break;
+            }
+          }
+        } catch {
+          // Retry
+        }
+        if (attempt < 6) await sleep(2000);
+      }
+
+      if (!localScraped) {
         report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
-        report.prometheusRemoteWriteResult.details = "Local Prometheus scraped metric, but remote-write ingestion was not confirmed in Grafana Cloud TSDB.";
-        console.log("  ℹ Remote-write metric scrape observed, but cloud read-back remained unconfirmed within test window.");
+        report.prometheusRemoteWriteResult.scrapeConfirmed = false;
+        report.prometheusRemoteWriteResult.details = `Target scrape unconfirmed: local Prometheus has not scraped verification ID within polling window (target health: ${targetUp ? "UP" : "PENDING/DOWN"}). State: Target not scraped.`;
+        console.log(`  ℹ [Target not scraped] Metric exposed on /metrics, but local Prometheus scrape was not observed within window.`);
+      } else {
+        report.prometheusRemoteWriteResult.scrapeConfirmed = true;
+        console.log(`  ✓ [Local scrape succeeded] Local Prometheus confirmed scrape of verification ID.`);
+
+        // Now evaluate remote-write
+        if (!hasRemoteWrite) {
+          report.prometheusRemoteWriteResult.status = "NOT_VERIFIED_AWAITING_CONFIG";
+          report.prometheusRemoteWriteResult.details = `Local Prometheus scrape confirmed, but remote-write is not configured: ${rwValidation.reason}. State: Remote-write not configured.`;
+          console.log(`  ℹ [Remote-write not configured] ${rwValidation.reason}.`);
+        } else {
+          console.log("  Querying Grafana Cloud Prometheus to confirm remote-write delivery...");
+          const rwQueryStart = Date.now();
+          let rwVerified = false;
+          let rwFailed = false;
+          let rwErrorMsg = "";
+
+          for (let attempt = 1; attempt <= 6; attempt++) {
+            try {
+              const rwRes = await promClient.queryInstantDetailed(
+                `http_requests_total{verification_id="${uniqueRwId}",service="order-service"}`
+              );
+              if (rwRes.success && rwRes.records.length > 0) {
+                const record = rwRes.records[0];
+                if (Number(record.value) >= 1) {
+                  rwVerified = true;
+                  report.prometheusRemoteWriteResult.status = "PASSED";
+                  report.prometheusRemoteWriteResult.queryLatencyMs = Date.now() - rwQueryStart;
+                  report.prometheusRemoteWriteResult.details = `External Grafana Cloud read-back confirmed: matched exact metric, verification ID ${uniqueRwId}, service order-service, and value ${record.value}.`;
+                  console.log(`  ✓ [External Grafana Cloud read-back confirmed] Remote-write verified in Grafana Cloud TSDB (${report.prometheusRemoteWriteResult.queryLatencyMs}ms).`);
+                  break;
+                }
+              }
+            } catch (err: unknown) {
+              rwFailed = true;
+              rwErrorMsg = err instanceof Error ? err.message : String(err);
+            }
+            if (!rwVerified && attempt < 6) {
+              await sleep(2500);
+            }
+          }
+
+          if (!rwVerified) {
+            if (rwFailed) {
+              report.prometheusRemoteWriteResult.status = "FAILED";
+              report.prometheusRemoteWriteResult.details = `Remote-write delivery failed: ${rwErrorMsg}. State: Remote-write delivery failed.`;
+              console.log(`  ✗ [Remote-write delivery failed] Query to Grafana Cloud TSDB failed: ${rwErrorMsg}`);
+            } else {
+              report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+              report.prometheusRemoteWriteResult.details = "Remote-write delivery pending: local Prometheus scraped metric, but remote-written metric was not confirmed in Grafana Cloud TSDB within window. State: Remote-write delivery pending.";
+              console.log("  ℹ [Remote-write delivery pending] Awaiting Grafana Cloud TSDB ingestion confirmation.");
+            }
+          }
+        }
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+    report.prometheusRemoteWriteResult.details = `Path B execution error: ${msg}`;
+    console.warn(`  Warning in Path B: ${msg}`);
+  } finally {
+    if (startedLocalOrderServer) {
+      try {
+        await new Promise<void>((resolve) => startedLocalOrderServer!.close(() => resolve()));
+        console.log("  Cleaned up disposable order-service instance.");
+      } catch {
+        // Ignore
       }
     }
   }

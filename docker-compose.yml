@@ -32,14 +32,18 @@ services:
     restart: unless-stopped
     environment:
       - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL
+      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER
       - GRAFANA_CLOUD_PROMETHEUS_USER
       - GRAFANA_CLOUD_INSTANCE_ID
+      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN
       - GRAFANA_CLOUD_PROMETHEUS_TOKEN
     entrypoint:
       - /bin/sh
       - -c
       - |
-        if [ -n "$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL" ] && [ -n "$$GRAFANA_CLOUD_PROMETHEUS_TOKEN" ]; then
+        RW_TOKEN="$${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN:-$$GRAFANA_CLOUD_PROMETHEUS_TOKEN}"
+        RW_USER="$${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER:-$${GRAFANA_CLOUD_PROMETHEUS_USER:-$$GRAFANA_CLOUD_INSTANCE_ID}}"
+        if [ -n "$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL" ] && [ -n "$$RW_TOKEN" ]; then
           echo "[Prometheus] Configuring Grafana Cloud remote-write integration..."
           cp /etc/prometheus/prometheus.yml /tmp/prometheus.yml
           cat <<EOF >> /tmp/prometheus.yml
@@ -47,8 +51,8 @@ services:
         remote_write:
           - url: "$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL"
             basic_auth:
-              username: "$${GRAFANA_CLOUD_PROMETHEUS_USER:-$$GRAFANA_CLOUD_INSTANCE_ID}"
-              password: "$$GRAFANA_CLOUD_PROMETHEUS_TOKEN"
+              username: "$$RW_USER"
+              password: "$$RW_TOKEN"
             queue_config:
               max_samples_per_send: 500
               max_shards: 4

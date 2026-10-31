@@ -4,7 +4,13 @@ import { JaegerClient } from "@/lib/telemetry/jaegerClient";
 import { TelemetryManager } from "@/lib/telemetry/telemetryManager";
 import { mergeServiceMetrics, ServiceMapItem } from "@/lib/telemetry/mergeServiceMetrics";
 import { ObservedServiceMetric } from "@/lib/telemetry/types";
-import { PrometheusRegistry } from "../sample-services/shared/telemetry";
+import { PrometheusRegistry, sanitizeErrorMessage } from "../sample-services/shared/telemetry";
+import {
+  validateRemoteWriteConfig,
+  generatePrometheusConfig,
+  validateGeneratedYaml,
+} from "../scripts/generate-prometheus-config";
+import { setOrderFault, resetOrderFault, telemetry as orderTelemetry } from "../sample-services/order/server";
 
 describe("Phase 6: Observability Provenance, Failure Handling & Security Verification", () => {
   const originalFetch = global.fetch;
@@ -591,8 +597,12 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       const registry = new PrometheusRegistry("order-service");
       expect(registry.getHealthStatus()).toBe(1);
 
-      // Verify health transitions
+      // Verify health transitions: 1 (HEALTHY), 0.5 (DEGRADED), 0 (DOWN)
       registry.setHealthStatus("DEGRADED");
+      expect(registry.getHealthStatus()).toBe(0.5);
+      expect(registry.toPrometheusFormat()).toContain('service_health_status{service="order-service"} 0.5');
+
+      registry.setHealthStatus("DOWN");
       expect(registry.getHealthStatus()).toBe(0);
       expect(registry.toPrometheusFormat()).toContain('service_health_status{service="order-service"} 0');
 
@@ -610,6 +620,9 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
     it("correct recovery from ERROR to verified LIVE when valid telemetry is received", async () => {
       const manager = new TelemetryManager();
       manager.setMode("LIVE");
+
+      vi.spyOn(PrometheusClient.prototype, "isCloudBackend").mockReturnValue(true);
+      vi.spyOn(JaegerClient.prototype, "isCloudBackend").mockReturnValue(true);
 
       // 1. Initial State: Backends offline -> ERROR
       vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({
@@ -687,6 +700,464 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       expect(recoveredObs.backendHealth.tracesIngested).toBe(true);
       expect(recoveredObs.backendHealth.provenance).toBe("LIVE");
       expect(recoveredObs.backendHealth.lastVerifiedAt).toBeDefined();
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.2: Strict Remote-Write Configuration Detection
+  // =========================================================================
+  describe("Phase 2.2: Remote-Write Configuration Detection & Permutations", () => {
+    it("detects URL absent", () => {
+      const res = validateRemoteWriteConfig({});
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("URL absent");
+    });
+
+    it("detects URL present but token absent", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "https://prometheus-prod-10.grafana.net/api/prom/push",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("token absent");
+    });
+
+    it("rejects OTLP ingestion token as remote-write credentials", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "https://prometheus-prod-10.grafana.net/api/prom/push",
+        GRAFANA_CLOUD_INGESTION_TOKEN: "glc_ingest_token_12345",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("OTLP ingestion credentials do not count as Prometheus remote-write credentials");
+    });
+
+    it("validates dedicated remote-write token and username", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "https://prometheus-prod-10.grafana.net/api/prom/push",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER: "1871065",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN: "glc_rw_token_abcde",
+      });
+      expect(res.valid).toBe(true);
+      expect(res.url).toBe("https://prometheus-prod-10.grafana.net/api/prom/push");
+      expect(res.user).toBe("1871065");
+      expect(res.hasDedicatedToken).toBe(true);
+    });
+
+    it("rejects invalid or malformed URL", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "not-a-valid-url",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN: "token123",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Invalid URL");
+    });
+
+    it("rejects non-http/https URL protocol", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "ftp://prometheus-prod.grafana.net/push",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN: "token123",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Invalid URL protocol");
+    });
+
+    it("detects missing username when URL and token are present", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "https://prometheus-prod-10.grafana.net/api/prom/push",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN: "glc_rw_token_abcde",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Missing username");
+    });
+
+    it("validates generated Prometheus YAML and detects malformed YAML indentation", () => {
+      const validYaml = generatePrometheusConfig({
+        remoteWriteUrl: "https://prometheus-prod-10.grafana.net/api/prom/push",
+        remoteWriteUser: "1871065",
+        remoteWriteToken: "glc_rw_token_abcde",
+      });
+      expect(validYaml).toContain("remote_write:");
+      expect(validYaml).toContain("url: \"https://prometheus-prod-10.grafana.net/api/prom/push\"");
+      expect(validYaml).toContain("username: \"1871065\"");
+
+      // Check YAML validator
+      const validation = validateGeneratedYaml(validYaml);
+      expect(validation.valid).toBe(true);
+
+      const tabBadYaml = "global:\n\tscrape_interval: 5s\nscrape_configs:\n";
+      const badValidation = validateGeneratedYaml(tabBadYaml);
+      expect(badValidation.valid).toBe(false);
+      expect(badValidation.error).toContain("tab indentation error");
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.2: Strict Telemetry Provenance Matrix
+  // =========================================================================
+  describe("Phase 2.2: Telemetry Provenance Matrix & Mode Transitions", () => {
+    it("reports LOCAL when only OTLP endpoint is configured and query backends are local", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      // Local backends (isCloudBackend returns false)
+      vi.spyOn(PrometheusClient.prototype, "isCloudBackend").mockReturnValue(false);
+      vi.spyOn(JaegerClient.prototype, "isCloudBackend").mockReturnValue(false);
+      vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: false });
+      vi.spyOn(JaegerClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: false });
+
+      const health = await manager.getBackendHealth(true);
+      expect(health.provenance).toBe("LOCAL");
+      expect(health.backendType).toBe("GENUINE_STACK");
+      expect(health.isCloudBackend).toBe(false);
+    });
+
+    it("reports LOCAL when only Grafana Cloud Prometheus is configured and Tempo is local (partial cloud)", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      vi.spyOn(PrometheusClient.prototype, "isCloudBackend").mockReturnValue(true);
+      vi.spyOn(JaegerClient.prototype, "isCloudBackend").mockReturnValue(false);
+      vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: true });
+      vi.spyOn(JaegerClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: false });
+
+      const health = await manager.getBackendHealth(true);
+      // Partial cloud must remain LOCAL, never LIVE
+      expect(health.provenance).toBe("LOCAL");
+      expect(health.isCloudBackend).toBe(false);
+    });
+
+    it("reports LOCAL when only Tempo is configured and Prometheus is local (partial cloud)", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      vi.spyOn(PrometheusClient.prototype, "isCloudBackend").mockReturnValue(false);
+      vi.spyOn(JaegerClient.prototype, "isCloudBackend").mockReturnValue(true);
+      vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: false });
+      vi.spyOn(JaegerClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: true });
+
+      const health = await manager.getBackendHealth(true);
+      expect(health.provenance).toBe("LOCAL");
+      expect(health.isCloudBackend).toBe(false);
+    });
+
+    it("reports ERROR when requested LIVE mode has one failing backend", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      vi.spyOn(PrometheusClient.prototype, "isCloudBackend").mockReturnValue(true);
+      vi.spyOn(JaegerClient.prototype, "isCloudBackend").mockReturnValue(true);
+      vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({ available: true, isCloud: true });
+      vi.spyOn(JaegerClient.prototype, "checkHealth").mockResolvedValue({ available: false, isCloud: true, error: "Tempo 503" });
+
+      const health = await manager.getBackendHealth(true);
+      expect(health.provenance).toBe("ERROR");
+    });
+
+    it("reports MOCK_EMULATION when in-process mock server is used", async () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+
+      vi.spyOn(PrometheusClient.prototype, "checkHealth").mockResolvedValue({ available: true, isMock: true });
+      vi.spyOn(JaegerClient.prototype, "checkHealth").mockResolvedValue({ available: true, isMock: true });
+
+      const health = await manager.getBackendHealth(true);
+      expect(health.provenance).toBe("MOCK_EMULATION");
+      expect(health.backendType).toBe("MOCK_EMULATION");
+    });
+
+    it("resets verification timestamps and ingested statuses upon mode transition", () => {
+      const manager = new TelemetryManager();
+      manager.setMode("LIVE");
+      expect(manager.getRequestedMode()).toBe("LIVE");
+      expect(manager.getEffectiveMode()).toBe("DEGRADED");
+
+      manager.setMode("SIMULATION");
+      expect(manager.getRequestedMode()).toBe("SIMULATION");
+      expect(manager.getEffectiveMode()).toBe("SIMULATION");
+      expect(manager.getLastIngestedAt()).toBeNull();
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.2: Hardened Tempo Trace Response Validation
+  // =========================================================================
+  describe("Phase 2.2: Hardened Tempo Trace Response Validation", () => {
+    const client = new JaegerClient();
+
+    it("validates matching trace ID and verification attribute successfully", () => {
+      const trace = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        rootServiceName: "order-service",
+        operationName: "HTTP POST /orders",
+        startTime: new Date().toISOString(),
+        durationMs: 45,
+        totalSpans: 1,
+        hasErrors: false,
+        servicesInvolved: ["order-service"],
+        rootSpan: null,
+        allSpans: [{
+          spanId: "00f067aa0ba902b7",
+          traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+          operationName: "HTTP POST /orders",
+          serviceName: "order-service",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 45,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": "test_verification_123" },
+          depth: 0,
+          children: [],
+        }],
+        isFallback: false,
+      };
+
+      const outcome = client.verifyLiveTrace(trace, "4bf92f3577b34da6a3ce929d0e0e4736", "test_verification_123");
+      expect(outcome.valid).toBe(true);
+    });
+
+    it("rejects mismatched root trace ID", () => {
+      const trace = {
+        traceId: "wrong-trace-id-9999",
+        rootServiceName: "order-service",
+        operationName: "HTTP POST /orders",
+        startTime: new Date().toISOString(),
+        durationMs: 45,
+        totalSpans: 1,
+        hasErrors: false,
+        servicesInvolved: ["order-service"],
+        rootSpan: null,
+        allSpans: [{
+          spanId: "sp1",
+          traceId: "wrong-trace-id-9999",
+          operationName: "HTTP POST /orders",
+          serviceName: "order-service",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 45,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": "test_verification_123" },
+          depth: 0,
+          children: [],
+        }],
+        isFallback: false,
+      };
+
+      const outcome = client.verifyLiveTrace(trace, "expected-trace-id-1111", "test_verification_123");
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("Trace ID mismatch");
+    });
+
+    it("rejects mismatched individual span trace ID", () => {
+      const trace = {
+        traceId: "expected-trace-id-1111",
+        rootServiceName: "order-service",
+        operationName: "HTTP POST /orders",
+        startTime: new Date().toISOString(),
+        durationMs: 45,
+        totalSpans: 1,
+        hasErrors: false,
+        servicesInvolved: ["order-service"],
+        rootSpan: null,
+        allSpans: [{
+          spanId: "sp1",
+          traceId: "different-span-trace-id-2222",
+          operationName: "HTTP POST /orders",
+          serviceName: "order-service",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 45,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": "test_verification_123" },
+          depth: 0,
+          children: [],
+        }],
+        isFallback: false,
+      };
+
+      const outcome = client.verifyLiveTrace(trace, "expected-trace-id-1111", "test_verification_123");
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("trace ID mismatch");
+    });
+
+    it("rejects missing verification attribute", () => {
+      const trace = {
+        traceId: "trace-abc",
+        rootServiceName: "order-service",
+        operationName: "HTTP POST",
+        startTime: new Date().toISOString(),
+        durationMs: 10,
+        totalSpans: 1,
+        hasErrors: false,
+        servicesInvolved: ["order-service"],
+        rootSpan: null,
+        allSpans: [{
+          spanId: "sp1",
+          traceId: "trace-abc",
+          operationName: "HTTP POST",
+          serviceName: "order-service",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 10,
+          statusCode: "OK" as const,
+          attributes: { unrelated: "value" },
+          depth: 0,
+          children: [],
+        }],
+        isFallback: false,
+      };
+
+      const outcome = client.verifyLiveTrace(trace, "trace-abc", "target-verification-id");
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("Verification attribute");
+    });
+
+    it("rejects synthesized fallback traces", () => {
+      const fallbackTrace = {
+        traceId: "fallback-trace",
+        rootServiceName: "api-gateway",
+        operationName: "Cloud Trace",
+        startTime: new Date().toISOString(),
+        durationMs: 45,
+        totalSpans: 1,
+        hasErrors: false,
+        servicesInvolved: ["api-gateway"],
+        rootSpan: null,
+        allSpans: [{
+          spanId: "sp1",
+          traceId: "fallback-trace",
+          operationName: "Cloud Trace",
+          serviceName: "api-gateway",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 45,
+          statusCode: "OK" as const,
+          attributes: { "verification.id": "my_id" },
+          depth: 0,
+          children: [],
+        }],
+        isFallback: true,
+      };
+
+      const outcome = client.verifyLiveTrace(fallbackTrace, "fallback-trace", "my_id");
+      expect(outcome.valid).toBe(false);
+      expect(outcome.reason).toContain("fallback trace");
+    });
+
+    it("parseTempoTraceDetail preserves backend returned trace ID without overwriting with requested ID", () => {
+      const backendPayload = {
+        traceID: "backend-actual-trace-9999",
+        batches: [{
+          resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+          scopeSpans: [{
+            spans: [{
+              traceId: "backend-actual-trace-9999",
+              spanId: "span-1234",
+              name: "processOrder",
+              attributes: [{ key: "verification.id", value: { stringValue: "verify_1" } }],
+            }],
+          }],
+        }],
+      };
+
+      const parsed = client.parseTempoTraceDetail(backendPayload, "caller-requested-trace-0000", { allowFallback: false });
+      expect(parsed).not.toBeNull();
+      // Crucial: traceId must NOT be overwritten with caller-requested-trace-0000!
+      expect(parsed?.traceId).toBe("backend-actual-trace-9999");
+      expect(parsed?.allSpans[0].traceId).toBe("backend-actual-trace-9999");
+    });
+
+    it("parseTempoTraceDetail with allowFallback: false returns null on empty batches or malformed JSON", () => {
+      expect(client.parseTempoTraceDetail({}, "req-1", { allowFallback: false })).toBeNull();
+      expect(client.parseTempoTraceDetail({ batches: [] }, "req-1", { allowFallback: false })).toBeNull();
+      expect(client.parseTempoTraceDetail(null as unknown as Record<string, unknown>, "req-1", { allowFallback: false })).toBeNull();
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.2: Service Health Gauge Semantics & Fault Cycles
+  // =========================================================================
+  describe("Phase 2.2: Service Health Gauge Semantics & Fault Cycles", () => {
+    it("strictly supports HEALTHY (1), DEGRADED (0.5), DOWN (0) and rejects invalid numeric values", () => {
+      const registry = new PrometheusRegistry("payment-service");
+
+      registry.setHealthStatus(1);
+      expect(registry.getHealthStatus()).toBe(1);
+
+      registry.setHealthStatus(0.5);
+      expect(registry.getHealthStatus()).toBe(0.5);
+
+      registry.setHealthStatus(0);
+      expect(registry.getHealthStatus()).toBe(0);
+
+      registry.setHealthStatus("DEGRADED");
+      expect(registry.getHealthStatus()).toBe(0.5);
+
+      registry.setHealthStatus("HEALTHY");
+      expect(registry.getHealthStatus()).toBe(1);
+
+      registry.setHealthStatus("DOWN");
+      expect(registry.getHealthStatus()).toBe(0);
+
+      // Boolean support
+      registry.setHealthStatus(true);
+      expect(registry.getHealthStatus()).toBe(1);
+      registry.setHealthStatus(false);
+      expect(registry.getHealthStatus()).toBe(0);
+
+      // Invalid numeric values must throw Error
+      expect(() => registry.setHealthStatus(2)).toThrow("Invalid numeric health status: 2");
+      expect(() => registry.setHealthStatus(-1)).toThrow("Invalid numeric health status: -1");
+      expect(() => registry.setHealthStatus(0.7)).toThrow("Invalid numeric health status: 0.7");
+      expect(() => registry.setHealthStatus(0.2)).toThrow("Invalid numeric health status: 0.2");
+    });
+
+    it("order-service fault injection cycle correctly transitions health gauge: normal -> degraded -> outage -> restored", () => {
+      // 1. Normal operation
+      resetOrderFault();
+      expect(orderTelemetry.getHealthStatus()).toBe(1);
+      expect(orderTelemetry.getPrometheusMetrics()).toContain("service_health_status{service=\"order-service\"} 1");
+
+      // 2. Degraded state: small delay, low failure rate
+      setOrderFault(800, 0.05);
+      expect(orderTelemetry.getHealthStatus()).toBe(0.5);
+      expect(orderTelemetry.getPrometheusMetrics()).toContain("service_health_status{service=\"order-service\"} 0.5");
+
+      // 3. Full outage: severe delay and high failure rate
+      setOrderFault(3000, 0.5);
+      expect(orderTelemetry.getHealthStatus()).toBe(0);
+      expect(orderTelemetry.getPrometheusMetrics()).toContain("service_health_status{service=\"order-service\"} 0");
+
+      // 4. Restoration: fault reset
+      resetOrderFault();
+      expect(orderTelemetry.getHealthStatus()).toBe(1);
+      expect(orderTelemetry.getPrometheusMetrics()).toContain("service_health_status{service=\"order-service\"} 1");
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.2: Export Tracking & Signal Separation
+  // =========================================================================
+  describe("Phase 2.2: Export Tracking & Signal Separation", () => {
+    it("sanitizeErrorMessage redacts Bearer tokens, Basic tokens, glc_ credentials, and passwords", () => {
+      const rawError1 = "Failed to export: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret";
+      expect(sanitizeErrorMessage(rawError1)).toBe("Failed to export: Bearer [REDACTED]");
+
+      const rawError2 = "Basic MTg3MTA2NTpnbGNfZmFrZV90b2tlbg==";
+      expect(sanitizeErrorMessage(rawError2)).toBe("Basic [REDACTED]");
+
+      const rawError3 = "Token glc_eyJvIjoiMTg3MTA2NSIsIm4iOiJpbmcifQ== invalid";
+      expect(sanitizeErrorMessage(rawError3)).not.toContain("glc_");
+      expect(sanitizeErrorMessage(rawError3)).toContain("[REDACTED_TOKEN]");
+
+      const rawError4 = "Connection failed with user=admin&password=SuperSecretPassword123!";
+      expect(sanitizeErrorMessage(rawError4)).not.toContain("SuperSecretPassword123!");
+      expect(sanitizeErrorMessage(rawError4)).toContain("password=[REDACTED]");
+    });
+
+    it("tracks metrics and traces export status independently without collision", () => {
+      const exportStatus = orderTelemetry.getExportStatus();
+      expect(exportStatus).toHaveProperty("metrics");
+      expect(exportStatus).toHaveProperty("traces");
+      expect(exportStatus.metrics).toHaveProperty("status");
+      expect(exportStatus.metrics).toHaveProperty("successCount");
+      expect(exportStatus.metrics).toHaveProperty("failureCount");
+      expect(exportStatus.traces).toHaveProperty("status");
+      expect(exportStatus.traces).toHaveProperty("successCount");
+      expect(exportStatus.traces).toHaveProperty("failureCount");
     });
   });
 });

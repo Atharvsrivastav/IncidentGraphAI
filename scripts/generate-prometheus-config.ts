@@ -5,7 +5,7 @@
  * - Scrapes sample microservices (ports 4000-4003)
  * - Scrapes Next.js application (/api/metrics on port 3000)
  * - Scrapes OpenTelemetry Collector (port 8889)
- * - Optionally configures secure Grafana Cloud Prometheus remote_write
+ * - Configures secure Grafana Cloud Prometheus remote_write with strict credential separation
  */
 
 import fs from "fs";
@@ -32,10 +32,97 @@ export interface PrometheusConfigOptions {
   };
 }
 
+export interface RemoteWriteValidationResult {
+  valid: boolean;
+  reason?: string;
+  url?: string;
+  user?: string;
+  hasDedicatedToken?: boolean;
+}
+
+/**
+ * Validates remote-write configuration with strict credential separation:
+ * - Remote-write URL must be present and valid HTTP/HTTPS URL
+ * - Dedicated write token (GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN or GRAFANA_CLOUD_PROMETHEUS_TOKEN) must be present
+ * - OTLP ingestion token (GRAFANA_CLOUD_INGESTION_TOKEN) must NOT automatically count as remote-write credentials
+ * - Username (GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER, GRAFANA_CLOUD_PROMETHEUS_USER, or GRAFANA_CLOUD_INSTANCE_ID) must be present
+ * - Never prints or leaks token contents
+ */
+export function validateRemoteWriteConfig(env: Record<string, string | undefined> = process.env): RemoteWriteValidationResult {
+  const rawUrl = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL;
+  if (!rawUrl || rawUrl.trim().length === 0) {
+    return { valid: false, reason: "URL absent (GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL is not set)" };
+  }
+
+  const url = rawUrl.trim();
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { valid: false, reason: `Invalid URL protocol: "${parsed.protocol}". Must be http: or https:` };
+    }
+  } catch {
+    return { valid: false, reason: `Invalid URL: "${url}" is malformed` };
+  }
+
+  // Dedicated write token
+  const writeToken = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN || env.GRAFANA_CLOUD_PROMETHEUS_TOKEN;
+  if (!writeToken || writeToken.trim().length === 0) {
+    if (env.GRAFANA_CLOUD_INGESTION_TOKEN && env.GRAFANA_CLOUD_INGESTION_TOKEN.trim().length > 0) {
+      return {
+        valid: false,
+        reason: "URL present with only OTLP ingestion token (OTLP ingestion credentials do not count as Prometheus remote-write credentials)",
+      };
+    }
+    return { valid: false, reason: "URL present but token absent (Dedicated write token required)" };
+  }
+
+  // Username
+  const user = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || env.GRAFANA_CLOUD_PROMETHEUS_USER || env.GRAFANA_CLOUD_INSTANCE_ID;
+  if (!user || user.trim().length === 0) {
+    return { valid: false, reason: "Missing username (Remote-write username or instance ID required)" };
+  }
+
+  return {
+    valid: true,
+    url,
+    user: user.trim(),
+    hasDedicatedToken: true,
+  };
+}
+
+/**
+ * Validates that generated Prometheus YAML is well-formed with basic syntax checks
+ */
+export function validateGeneratedYaml(yaml: string): { valid: boolean; error?: string } {
+  if (!yaml || yaml.trim().length === 0) {
+    return { valid: false, error: "Empty YAML string" };
+  }
+  const lines = yaml.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Reject tab characters in YAML indentation
+    if (/^\t+/.test(line)) {
+      return { valid: false, error: `YAML tab indentation error at line ${i + 1}` };
+    }
+  }
+  if (!yaml.includes("scrape_configs:")) {
+    return { valid: false, error: "Missing required 'scrape_configs:' section in Prometheus YAML" };
+  }
+  return { valid: true };
+}
+
 export function generatePrometheusConfig(options: PrometheusConfigOptions = {}): string {
-  const remoteWriteUrl = options.remoteWriteUrl || process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL;
-  const remoteWriteUser = options.remoteWriteUser || process.env.GRAFANA_CLOUD_PROMETHEUS_USER || process.env.GRAFANA_CLOUD_INSTANCE_ID;
-  const remoteWriteToken = options.remoteWriteToken || process.env.GRAFANA_CLOUD_PROMETHEUS_TOKEN;
+  const remoteWriteUrl = options.remoteWriteUrl !== undefined
+    ? options.remoteWriteUrl
+    : process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL;
+
+  const remoteWriteUser = options.remoteWriteUser !== undefined
+    ? options.remoteWriteUser
+    : (process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || process.env.GRAFANA_CLOUD_PROMETHEUS_USER || process.env.GRAFANA_CLOUD_INSTANCE_ID);
+
+  const remoteWriteToken = options.remoteWriteToken !== undefined
+    ? options.remoteWriteToken
+    : (process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN || process.env.GRAFANA_CLOUD_PROMETHEUS_TOKEN);
 
   const lines: string[] = [
     "global:",
@@ -80,7 +167,16 @@ export function generatePrometheusConfig(options: PrometheusConfigOptions = {}):
     "      - targets: ['localhost:9090']",
   ];
 
-  if (remoteWriteUrl && remoteWriteToken) {
+  if (remoteWriteUrl && remoteWriteUrl.trim().length > 0 && remoteWriteToken && remoteWriteToken.trim().length > 0) {
+    try {
+      const parsed = new URL(remoteWriteUrl.trim());
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error(`Invalid protocol ${parsed.protocol}`);
+      }
+    } catch (err: unknown) {
+      throw new Error(`Cannot generate remote_write config: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     lines.push(
       "",
       "# -----------------------------------------------------------------------------",
@@ -98,14 +194,19 @@ export function generatePrometheusConfig(options: PrometheusConfigOptions = {}):
     );
   }
 
-  return lines.join("\n") + "\n";
+  const generated = lines.join("\n") + "\n";
+  const validation = validateGeneratedYaml(generated);
+  if (!validation.valid) {
+    throw new Error(`Generated invalid Prometheus YAML: ${validation.error}`);
+  }
+  return generated;
 }
 
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"))) {
-  const remoteWriteUrl = process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL;
-  const hasToken = Boolean(process.env.GRAFANA_CLOUD_PROMETHEUS_TOKEN);
+  const validation = validateRemoteWriteConfig();
   console.log("=== IncidentGraph AI: Prometheus Configuration Status ===");
-  console.log(`Remote Write URL : ${remoteWriteUrl ? remoteWriteUrl : "[NOT SET - Local Only]"}`);
-  console.log(`Remote Write Auth: ${hasToken ? "[CONFIGURED - TOKEN SET]" : "[NOT SET]"}`);
+  console.log(`Remote Write URL : ${validation.url ? validation.url : "[NOT SET - Local Only]"}`);
+  console.log(`Remote Write Auth: ${validation.hasDedicatedToken ? "[CONFIGURED - DEDICATED TOKEN SET]" : "[NOT SET]"}`);
+  console.log(`Validation Status: ${validation.valid ? "VALID" : `INACTIVE / LOCAL ONLY (${validation.reason})`}`);
   console.log("Targets          : otel-collector:8889, services:4000-4003, app:3000/api/metrics, localhost:9090");
 }

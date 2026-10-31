@@ -7,9 +7,9 @@ const PORT = Number(process.env.SAMPLE_ORDER_PORT) || 4001;
 const INVENTORY_URL = process.env.SAMPLE_INVENTORY_URL || `http://localhost:${process.env.SAMPLE_INVENTORY_PORT || 4003}`;
 const PAYMENT_URL = process.env.SAMPLE_PAYMENT_URL || `http://localhost:${process.env.SAMPLE_PAYMENT_PORT || 4002}`;
 
-const SERVICE_NAME = "order-service";
-const telemetry = initServiceTelemetry(SERVICE_NAME);
-const db = SamplePostgresClient.getInstance();
+export const SERVICE_NAME = "order-service";
+export const telemetry = initServiceTelemetry(SERVICE_NAME);
+export const db = SamplePostgresClient.getInstance();
 
 let serviceDelayMs = 0;
 let serviceFailureRate = 0;
@@ -114,6 +114,36 @@ export const server = http.createServer(async (req, res) => {
           orderId: "ord_" + Date.now(),
           status: "CONFIRMED",
           amount: 99.00,
+        }));
+        telemetry.endSpan(span, SpanStatusCode.OK);
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/test/record-metric") {
+        let body = "";
+        for await (const chunk of req) {
+          body += chunk;
+        }
+        let parsed: { verification_id?: string; count?: number; status?: string } = {};
+        try {
+          if (body) parsed = JSON.parse(body);
+        } catch {
+          // ignore
+        }
+        const verificationId = parsed.verification_id || "verify_manual_" + Date.now();
+        const count = typeof parsed.count === "number" ? parsed.count : 1;
+        const status = parsed.status || "synthetic";
+
+        telemetry.recordSyntheticMetric(verificationId, count, status);
+        telemetry.log("info", "Recorded synthetic test metric via HTTP endpoint", { verificationId, count, status });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: true,
+          service: SERVICE_NAME,
+          verification_id: verificationId,
+          count,
+          status,
         }));
         telemetry.endSpan(span, SpanStatusCode.OK);
         return;

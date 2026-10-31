@@ -51,13 +51,21 @@ export class PrometheusRegistry {
 
   public setHealthStatus(status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN"): void {
     if (typeof status === "number") {
-      this.healthStatus = status <= 0 ? 0 : 1;
+      if (status === 1 || status === 0.5 || status === 0) {
+        this.healthStatus = status;
+      } else {
+        throw new Error(`Invalid numeric health status: ${status}. Must be 1 (HEALTHY), 0.5 (DEGRADED), or 0 (DOWN)`);
+      }
     } else if (typeof status === "boolean") {
       this.healthStatus = status ? 1 : 0;
     } else if (status === "HEALTHY") {
       this.healthStatus = 1;
-    } else {
+    } else if (status === "DEGRADED") {
+      this.healthStatus = 0.5;
+    } else if (status === "DOWN") {
       this.healthStatus = 0;
+    } else {
+      throw new Error(`Invalid health status value: ${String(status)}`);
     }
   }
 
@@ -138,12 +146,29 @@ export class PrometheusRegistry {
     lines.push(`http_request_duration_seconds_count{service="${escapeLabelValue(this.serviceName)}"} ${this.durations.count}`);
 
     // service_health_status
-    lines.push("# HELP service_health_status Health status of the service (1=healthy, 0=unhealthy)");
+    lines.push("# HELP service_health_status Health status of the service (1=healthy, 0.5=degraded, 0=down)");
     lines.push("# TYPE service_health_status gauge");
     lines.push(`service_health_status{service="${escapeLabelValue(this.serviceName)}"} ${this.healthStatus}`);
 
     return lines.join("\n") + "\n";
   }
+}
+
+export interface SignalExportStatus {
+  status: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
+  lastSuccessTime?: string;
+  lastFailureTime?: string;
+  lastError?: string;
+  successCount: number;
+  failureCount: number;
+}
+
+export function sanitizeErrorMessage(msg?: string): string | undefined {
+  if (!msg) return undefined;
+  return msg
+    .replace(/(Bearer|Basic)\s+[A-Za-z0-9+/=._-]+/gi, "$1 [REDACTED]")
+    .replace(/(glc_[A-Za-z0-9_-]+)/gi, "[REDACTED_TOKEN]")
+    .replace(/password=[^&\s]+/gi, "password=[REDACTED]");
 }
 
 export interface ServiceTelemetry {
@@ -158,12 +183,16 @@ export interface ServiceTelemetry {
   endSpan: (span: Span, statusCode?: SpanStatusCode, errorMessage?: string) => void;
   isCloudExportEnabled: boolean;
   otlpTargetUrl: string;
+  registry: PrometheusRegistry;
+  recordSyntheticMetric: (verificationId: string, count?: number, status?: string) => void;
   getPrometheusMetrics: () => string;
   handleMetricsRequest: (res: import("http").ServerResponse) => void;
   setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
   getHealthStatus: () => number;
   getExportStatus: () => {
     isCloudExport: boolean;
+    metrics: SignalExportStatus;
+    traces: SignalExportStatus;
     lastExportStatus: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
     lastExportTime?: string;
     lastExportError?: string;
@@ -217,11 +246,21 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     "deployment.environment": process.env.DEPLOYMENT_ENVIRONMENT || process.env.ENVIRONMENT || (isCloudExport ? "production-hosted" : "development"),
   });
 
-  // Track genuine exporter outcomes
-  const exportTracker = {
-    status: (isCloudExport ? "PENDING" : "DISABLED") as "SUCCESS" | "FAILED" | "PENDING" | "DISABLED",
-    lastTime: undefined as string | undefined,
-    lastError: undefined as string | undefined,
+  // Track genuine exporter outcomes independently
+  const metricTracker: SignalExportStatus = {
+    status: isCloudExport ? "PENDING" : "DISABLED",
+    lastSuccessTime: undefined,
+    lastFailureTime: undefined,
+    lastError: undefined,
+    successCount: 0,
+    failureCount: 0,
+  };
+
+  const traceTracker: SignalExportStatus = {
+    status: isCloudExport ? "PENDING" : "DISABLED",
+    lastSuccessTime: undefined,
+    lastFailureTime: undefined,
+    lastError: undefined,
     successCount: 0,
     failureCount: 0,
   };
@@ -238,14 +277,15 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   traceExporter.export = (spans, resultCallback) => {
     origTraceExport(spans, (result) => {
       if (result.code === 0) {
-        exportTracker.status = "SUCCESS";
-        exportTracker.lastTime = new Date().toISOString();
-        exportTracker.lastError = undefined;
-        exportTracker.successCount++;
+        traceTracker.status = "SUCCESS";
+        traceTracker.lastSuccessTime = new Date().toISOString();
+        traceTracker.lastError = undefined;
+        traceTracker.successCount++;
       } else {
-        exportTracker.status = "FAILED";
-        exportTracker.lastError = result.error?.message || "OTLP trace export failed";
-        exportTracker.failureCount++;
+        traceTracker.status = "FAILED";
+        traceTracker.lastFailureTime = new Date().toISOString();
+        traceTracker.lastError = sanitizeErrorMessage(result.error?.message || "OTLP trace export failed");
+        traceTracker.failureCount++;
       }
       resultCallback(result);
     });
@@ -269,14 +309,15 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   metricExporter.export = (metricsData, resultCallback) => {
     origMetricExport(metricsData, (result) => {
       if (result.code === 0) {
-        exportTracker.status = "SUCCESS";
-        exportTracker.lastTime = new Date().toISOString();
-        exportTracker.lastError = undefined;
-        exportTracker.successCount++;
+        metricTracker.status = "SUCCESS";
+        metricTracker.lastSuccessTime = new Date().toISOString();
+        metricTracker.lastError = undefined;
+        metricTracker.successCount++;
       } else {
-        exportTracker.status = "FAILED";
-        exportTracker.lastError = result.error?.message || "OTLP metric export failed";
-        exportTracker.failureCount++;
+        metricTracker.status = "FAILED";
+        metricTracker.lastFailureTime = new Date().toISOString();
+        metricTracker.lastError = sanitizeErrorMessage(result.error?.message || "OTLP metric export failed");
+        metricTracker.failureCount++;
       }
       resultCallback(result);
     });
@@ -339,7 +380,7 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
       try {
         rawRequestCounter.add(value, attributes as Record<string, string | number | boolean>);
       } catch (err: unknown) {
-        log("warn", "OTel counter.add failed", { error: err instanceof Error ? err.message : String(err) });
+        log("warn", "OTel counter.add failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
       }
     },
   };
@@ -350,7 +391,7 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
       try {
         rawErrorCounter.add(value, attributes as Record<string, string | number | boolean>);
       } catch (err: unknown) {
-        log("warn", "OTel errorCounter.add failed", { error: err instanceof Error ? err.message : String(err) });
+        log("warn", "OTel errorCounter.add failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
       }
     },
   };
@@ -361,9 +402,32 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
       try {
         rawDurationHistogram.record(value, attributes as Record<string, string | number | boolean>);
       } catch (err: unknown) {
-        log("warn", "OTel durationHistogram.record failed", { error: err instanceof Error ? err.message : String(err) });
+        log("warn", "OTel durationHistogram.record failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
       }
     },
+  };
+
+  const recordSyntheticMetric = (verificationId: string, count = 1, status = "synthetic") => {
+    registry.recordRequest(count, {
+      method: "POST",
+      route: "/test/synthetic",
+      status_code: 200,
+      verification_id: verificationId,
+      status,
+    });
+    try {
+      rawRequestCounter.add(count, {
+        method: "POST",
+        route: "/test/synthetic",
+        status_code: 200,
+        verification_id: verificationId,
+        status,
+      });
+    } catch (err: unknown) {
+      log("warn", "OTel counter.add for synthetic metric failed", {
+        error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      });
+    }
   };
 
   const startSpan = (name: string, carrier?: Record<string, string>) => {
@@ -408,14 +472,25 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
 
   const getHealthStatus = () => registry.getHealthStatus();
 
-  const getExportStatus = () => ({
-    isCloudExport,
-    lastExportStatus: exportTracker.status,
-    lastExportTime: exportTracker.lastTime,
-    lastExportError: exportTracker.lastError,
-    successCount: exportTracker.successCount,
-    failureCount: exportTracker.failureCount,
-  });
+  const getExportStatus = () => {
+    const computeOverall = (): "SUCCESS" | "FAILED" | "PENDING" | "DISABLED" => {
+      if (!isCloudExport) return "DISABLED";
+      if (metricTracker.status === "FAILED" || traceTracker.status === "FAILED") return "FAILED";
+      if (metricTracker.status === "SUCCESS" && traceTracker.status === "SUCCESS") return "SUCCESS";
+      return "PENDING";
+    };
+
+    return {
+      isCloudExport,
+      metrics: { ...metricTracker },
+      traces: { ...traceTracker },
+      lastExportStatus: computeOverall(),
+      lastExportTime: metricTracker.lastSuccessTime || traceTracker.lastSuccessTime,
+      lastExportError: metricTracker.lastError || traceTracker.lastError,
+      successCount: metricTracker.successCount + traceTracker.successCount,
+      failureCount: metricTracker.failureCount + traceTracker.failureCount,
+    };
+  };
 
   const instance: ServiceTelemetry = {
     tracer,
@@ -429,6 +504,8 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     endSpan,
     isCloudExportEnabled: isCloudExport,
     otlpTargetUrl: traceUrl,
+    registry,
+    recordSyntheticMetric,
     getPrometheusMetrics,
     handleMetricsRequest,
     setHealthStatus,

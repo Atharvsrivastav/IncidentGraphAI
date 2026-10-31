@@ -313,6 +313,9 @@ export class JaegerClient {
     if (trace.isFallback) {
       return { valid: false, reason: "Backend returned fallback trace; no actual span data exists in backend" };
     }
+    if (!trace.traceId || trace.traceId.trim().length === 0) {
+      return { valid: false, reason: "Trace is missing trace ID" };
+    }
     const normTraceId = trace.traceId.toLowerCase().replace(/^0+/, "");
     const normExpectedId = expectedTraceId.toLowerCase().replace(/^0+/, "");
     if (normTraceId !== normExpectedId && trace.traceId.toLowerCase() !== expectedTraceId.toLowerCase()) {
@@ -323,6 +326,17 @@ export class JaegerClient {
     }
     if (!trace.allSpans || trace.allSpans.length === 0) {
       return { valid: false, reason: "Trace contains no span data" };
+    }
+    for (const span of trace.allSpans) {
+      if (span.traceId) {
+        const spanNorm = span.traceId.toLowerCase().replace(/^0+/, "");
+        if (spanNorm !== normExpectedId && span.traceId.toLowerCase() !== expectedTraceId.toLowerCase()) {
+          return {
+            valid: false,
+            reason: `Span ${span.spanId} trace ID mismatch: expected ${expectedTraceId}, got ${span.traceId}`,
+          };
+        }
+      }
     }
     const hasAttr = trace.allSpans.some(
       (s) =>
@@ -426,17 +440,32 @@ export class JaegerClient {
 
   public parseTempoTraceDetail(
     json: Record<string, unknown>,
-    traceId: string,
+    requestedTraceId: string,
     options?: { allowFallback?: boolean }
   ): DistributedTrace | null {
     const allowFallback = options?.allowFallback !== false;
+    if (!json || typeof json !== "object") {
+      return allowFallback ? this.createFallbackTrace(requestedTraceId) : null;
+    }
+
+    const backendRootTraceId = (
+      typeof json.traceID === "string" ? json.traceID :
+      typeof json.traceId === "string" ? json.traceId :
+      undefined
+    );
+
     const batches = (json.batches || json.resourceSpans) as Array<{
+      traceId?: string;
+      traceID?: string;
       resource?: { attributes?: Array<{ key: string; value: { stringValue?: string } }> };
       scopeSpans?: Array<{
         spans?: Array<{
           traceId?: string;
+          traceID?: string;
           spanId?: string;
+          spanID?: string;
           parentSpanId?: string;
+          parentSpanID?: string;
           name?: string;
           startTimeUnixNano?: string;
           endTimeUnixNano?: string;
@@ -447,23 +476,31 @@ export class JaegerClient {
     }>;
 
     if (!Array.isArray(batches) || batches.length === 0) {
-      return allowFallback ? this.createFallbackTrace(traceId) : null;
+      return allowFallback ? this.createFallbackTrace(backendRootTraceId || requestedTraceId) : null;
     }
 
     const allSpans: TraceSpan[] = [];
     const spanMap = new Map<string, TraceSpan>();
     const services = new Set<string>();
     let hasErrors = false;
+    let firstSpanTraceId: string | undefined;
 
     for (const batch of batches) {
       const serviceAttr = batch.resource?.attributes?.find((a) => a.key === "service.name");
       const serviceName = serviceAttr?.value?.stringValue || "unknown-service";
       services.add(serviceName);
 
+      const batchTraceId = batch.traceId || batch.traceID;
+
       for (const scope of batch.scopeSpans || []) {
         for (const rawSpan of scope.spans || []) {
-          const sId = rawSpan.spanId || traceId.slice(0, 16);
-          const pId = rawSpan.parentSpanId || undefined;
+          const rawTraceId = rawSpan.traceId || rawSpan.traceID || batchTraceId || backendRootTraceId;
+          if (!firstSpanTraceId && rawTraceId) {
+            firstSpanTraceId = rawTraceId;
+          }
+          const spanTraceId = rawTraceId || requestedTraceId;
+          const sId = rawSpan.spanId || rawSpan.spanID || requestedTraceId.slice(0, 16);
+          const pId = rawSpan.parentSpanId || rawSpan.parentSpanID || undefined;
           const startMs = rawSpan.startTimeUnixNano ? Number(BigInt(rawSpan.startTimeUnixNano) / BigInt(1e6)) : Date.now();
           const endMs = rawSpan.endTimeUnixNano ? Number(BigInt(rawSpan.endTimeUnixNano) / BigInt(1e6)) : startMs + 10;
           const duration = Math.max(1, Math.round(endMs - startMs));
@@ -478,7 +515,7 @@ export class JaegerClient {
           const span: TraceSpan = {
             spanId: sId,
             parentSpanId: pId,
-            traceId,
+            traceId: spanTraceId,
             operationName: rawSpan.name || "HTTP Operation",
             serviceName,
             startTimeUs: startMs * 1000,
@@ -496,15 +533,16 @@ export class JaegerClient {
     }
 
     if (allSpans.length === 0) {
-      return allowFallback ? this.createFallbackTrace(traceId) : null;
+      return allowFallback ? this.createFallbackTrace(backendRootTraceId || requestedTraceId) : null;
     }
 
     // Build hierarchy and assign depths
     this.linkChildrenAndAssignDepths(allSpans, spanMap);
 
+    const actualTraceId = backendRootTraceId || firstSpanTraceId || requestedTraceId;
     const rootSpan = allSpans.find((s) => s.depth === 0) || allSpans[0];
     return {
-      traceId,
+      traceId: actualTraceId,
       rootServiceName: rootSpan.serviceName,
       operationName: rootSpan.operationName,
       startTime: new Date(allSpans[0].startTimeUs / 1000).toISOString(),

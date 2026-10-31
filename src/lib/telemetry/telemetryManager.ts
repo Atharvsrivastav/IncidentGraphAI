@@ -74,11 +74,14 @@ export class TelemetryManager {
     this.requestedMode = normalized;
     this.cachedObservation = null;
 
+    // Reset verification timestamps and statuses appropriately after mode transitions
+    this.lastVerifiedAt = null;
+    this.lastIngestedAt = null;
+    this.metricsIngested = false;
+    this.tracesIngested = false;
+
     if (normalized === "SIMULATION") {
       this.effectiveMode = "SIMULATION";
-      this.metricsIngested = false;
-      this.tracesIngested = false;
-      this.lastVerifiedAt = null;
     } else {
       // LIVE mode requires confirmed telemetry observations; starts at DEGRADED until verified
       this.effectiveMode = "DEGRADED";
@@ -101,10 +104,10 @@ export class TelemetryManager {
       return this.cachedObservation.data.backendHealth;
     }
 
-    const cloudConfigured = Boolean(
-      (process.env.GRAFANA_CLOUD_OTLP_ENDPOINT && process.env.GRAFANA_CLOUD_OTLP_ENDPOINT.trim().length > 0) ||
-      (process.env.GRAFANA_CLOUD_PROMETHEUS_URL && process.env.GRAFANA_CLOUD_PROMETHEUS_URL.trim().length > 0)
-    );
+    const promIsCloud = Boolean(prometheusClient.isCloudBackend());
+    const tempoIsCloud = Boolean(jaegerClient.isCloudBackend());
+    const bothAreCloud = promIsCloud && tempoIsCloud;
+    const partialCloud = (promIsCloud && !tempoIsCloud) || (!promIsCloud && tempoIsCloud);
 
     if (this.requestedMode === "SIMULATION" && !forceProbe) {
       const status: BackendHealthStatus = {
@@ -114,7 +117,7 @@ export class TelemetryManager {
         jaegerUrl: jaegerClient.getBaseUrl(),
         isMockBackend: false,
         isCloudBackend: false,
-        cloudConfigured,
+        cloudConfigured: bothAreCloud,
         backendType: "SIMULATION",
         provenance: "DISABLED",
         lastChecked: new Date().toISOString(),
@@ -131,11 +134,11 @@ export class TelemetryManager {
     ]);
 
     const isMock = Boolean(promHealth.isMock || jaegerHealth.isMock);
-    const isCloud = Boolean(promHealth.isCloud || jaegerHealth.isCloud || cloudConfigured);
+    const isCloud = bothAreCloud && !isMock;
 
     let backendType: BackendHealthStatus["backendType"] = "UNAVAILABLE";
     if (promHealth.available && jaegerHealth.available) {
-      backendType = isCloud && !isMock ? "GRAFANA_CLOUD" : isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
+      backendType = isCloud ? "GRAFANA_CLOUD" : isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
     } else if (promHealth.available || jaegerHealth.available) {
       // Partial availability
       backendType = isMock ? "MOCK_EMULATION" : "GENUINE_STACK";
@@ -147,16 +150,18 @@ export class TelemetryManager {
     } else if (isMock) {
       provenance = "MOCK_EMULATION";
     } else if (!promHealth.available && !jaegerHealth.available) {
-      provenance = (cloudConfigured || isCloud || this.requestedMode === "LIVE") ? "ERROR" : "DISABLED";
+      provenance = (bothAreCloud || this.requestedMode === "LIVE") ? "ERROR" : "DISABLED";
     } else if (!promHealth.available || !jaegerHealth.available) {
       provenance = "ERROR";
-    } else if (isCloud && !isMock) {
+    } else if (bothAreCloud && !isMock) {
+      // Only truly verified cloud metrics AND traces can result in LIVE provenance
       provenance = (this.effectiveMode === "LIVE" && this.metricsIngested && this.tracesIngested && this.lastVerifiedAt) ? "LIVE" : "LOCAL";
     } else {
+      // Local backends or partial cloud configurations remain LOCAL
       provenance = "LOCAL";
     }
 
-    const details = this.formatHealthDetails(cloudConfigured, isMock, promHealth, jaegerHealth);
+    const details = this.formatHealthDetails(bothAreCloud, partialCloud, isMock, promHealth, jaegerHealth);
 
     const status: BackendHealthStatus = {
       prometheusAvailable: promHealth.available,
@@ -165,7 +170,7 @@ export class TelemetryManager {
       jaegerUrl: jaegerClient.getBaseUrl(),
       isMockBackend: isMock,
       isCloudBackend: isCloud,
-      cloudConfigured,
+      cloudConfigured: bothAreCloud,
       backendType,
       provenance,
       lastChecked: new Date().toISOString(),
@@ -181,16 +186,20 @@ export class TelemetryManager {
   }
 
   private formatHealthDetails(
-    cloudConfigured: boolean,
+    bothAreCloud: boolean,
+    partialCloud: boolean,
     isMock: boolean,
     promHealth: { available: boolean; error?: string },
     jaegerHealth: { available: boolean; error?: string }
   ): string {
-    if (cloudConfigured) {
+    if (bothAreCloud) {
       if (promHealth.available && jaegerHealth.available) {
         return "Connected to Grafana Cloud hosted observability stack (Prometheus & Tempo).";
       }
       return promHealth.error || jaegerHealth.error || "Grafana Cloud configured but unreachable.";
+    }
+    if (partialCloud) {
+      return "Partial cloud telemetry backend configuration: both Prometheus and Tempo must be configured for Grafana Cloud.";
     }
     if (!promHealth.available && !jaegerHealth.available) {
       return "No telemetry backends are connected. Configure Grafana Cloud in .env or run local dev services.";
@@ -297,6 +306,8 @@ export class TelemetryManager {
     if (isTrulyLive) {
       this.lastIngestedAt = new Date().toISOString();
       this.lastVerifiedAt = new Date().toISOString();
+    } else {
+      this.lastVerifiedAt = null;
     }
 
     return this.buildLiveObservedServices(
@@ -410,11 +421,12 @@ export class TelemetryManager {
     hasTelemetryData: boolean,
     promQuerySuccess: boolean = true
   ) {
+    const bothAreCloud = Boolean(prometheusClient.isCloudBackend() && jaegerClient.isCloudBackend());
     const liveProvenance: TelemetryProvenanceState = backendHealth.isMockBackend
       ? "MOCK_EMULATION"
-      : backendHealth.isCloudBackend
+      : bothAreCloud
       ? (effectiveMode === "LIVE" ? "LIVE" : backendHealth.prometheusAvailable && backendHealth.jaegerAvailable ? "LOCAL" : "ERROR")
-      : (effectiveMode === "LIVE" ? "LOCAL" : "ERROR");
+      : (backendHealth.prometheusAvailable && backendHealth.jaegerAvailable ? "LOCAL" : "ERROR");
 
     backendHealth.provenance = liveProvenance;
     backendHealth.metricsIngested = this.metricsIngested;
