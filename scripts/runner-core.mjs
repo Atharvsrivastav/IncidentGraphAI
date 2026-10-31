@@ -408,30 +408,65 @@ export class RunnerLifecycle {
     this.devDbBaseline = null;
     this.state = 'IDLE'; // 'IDLE' | 'STARTING' | 'TESTING' | 'COMPLETED' | 'FAILED' | 'TEARDOWN'
     this.testExitCode = null;
+    this.testExitSignal = null;
+    this.browserTestTerminating = false;
     this.signalReceived = null;
     this.teardownFailed = false;
     this.teardownRunning = false;
     this.teardownCompleted = false;
+    this.cleanupExecutionCount = 0;
+    this.onCleanup = options.onCleanup || null;
   }
 
   recordTeardownFailure() {
     this.teardownFailed = true;
   }
 
+  /**
+   * Records exit status from the browser test child process.
+   * Distinguishes natural failures from teardown-induced termination.
+   * @param {number | null} code
+   * @param {string | null} signal
+   */
+  recordBrowserTestExit(code, signal) {
+    this.testExitSignal = signal;
+
+    // If runner teardown intentionally initiated termination of the browser process tree,
+    // do not classify the signal kill or null exit code as a natural test failure.
+    if (this.browserTestTerminating || this.teardownRunning || this.teardownCompleted) {
+      return;
+    }
+
+    // Preserve an already-established genuine non-zero browser test failure
+    if (this.testExitCode !== null && this.testExitCode !== 0) {
+      return;
+    }
+
+    if (code !== null && code !== undefined) {
+      this.testExitCode = code;
+    } else if (signal) {
+      // Child terminated by unexpected external signal during active run
+      this.testExitCode = 1;
+    } else {
+      this.testExitCode = 0;
+    }
+  }
+
   resolveFinalExitCode() {
-    // 1. If an established non-zero test failure code exists, preserve it
+    // 1. Preserve an already-established genuine non-zero browser test exit code
     if (this.testExitCode !== null && this.testExitCode !== 0) {
       return this.testExitCode;
     }
 
-    // 2. If signal was received during active execution
+    // 2. SIGINT during active execution must return 130 after teardown
     if (this.signalReceived === 'SIGINT') return 130;
+    // SIGTERM during active execution must return 143 after teardown
     if (this.signalReceived === 'SIGTERM') return 143;
 
-    // 3. If teardown failed (leftover DB, dev DB corruption, process kill failure)
+    // 3. A successful browser run with cleanup failure must return non-zero
     if (this.teardownFailed) return 1;
 
-    // 4. If test passed (0) and teardown passed, return 0
+    // 4. Successful test and successful teardown
     if (this.testExitCode === 0) return 0;
 
     // Default failure
@@ -472,8 +507,9 @@ export class RunnerLifecycle {
         }
       }
 
-      // 1. Terminate Browser Test process tree first
+      // 1. Terminate Browser Test process tree first (record termination intent before sending signals)
       if (this.browserTestProcess && this.browserTestProcess.pid) {
+        this.browserTestTerminating = true;
         console.log(`\n[Cleanup] Terminating Browser Test process tree (PID: ${this.browserTestProcess.pid})...`);
         const browserKilled = await killProcessTree(this.browserTestProcess.pid);
         if (browserKilled) {
@@ -504,6 +540,10 @@ export class RunnerLifecycle {
           console.log(`[Cleanup Guard] Skipping deletion of '${this.dbFileName}': database was not owned by runner (dbFileOwned=false).`);
         } else {
           console.log(`[Cleanup] Removing disposable database: ${this.dbFileName}`);
+          this.cleanupExecutionCount++;
+          if (typeof this.onCleanup === 'function') {
+            try { this.onCleanup(); } catch {}
+          }
           const remainingFiles = cleanupDisposableDb(this.dbFilePath, this.dbFileOwned);
           if (remainingFiles.length === 0) {
             console.log(`  ✓ Disposable database ${this.dbFileName} and all journal/WAL/SHM artifacts successfully deleted.`);

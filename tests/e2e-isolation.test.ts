@@ -25,14 +25,45 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
   const dummyRoot = path.resolve(os.tmpdir(), "incidentgraph-real-test-" + Date.now());
   const dummyPrismaDir = path.join(dummyRoot, "prisma");
 
+  const testProcesses = new Set<ChildProcess>();
+  const testPids = new Set<number>();
+
+  function registerTestProcess(proc: ChildProcess) {
+    testProcesses.add(proc);
+    if (proc.pid) testPids.add(proc.pid);
+    proc.on("exit", () => {
+      testProcesses.delete(proc);
+    });
+  }
+
+  function registerTestPid(pid: number) {
+    if (pid && pid > 0) testPids.add(pid);
+  }
+
   beforeEach(() => {
     fs.mkdirSync(dummyPrismaDir, { recursive: true });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     try {
       fs.rmSync(dummyRoot, { recursive: true, force: true });
     } catch {}
+
+    // Deterministically clean up all test-owned processes
+    for (const proc of testProcesses) {
+      if (proc.pid && isProcessAlive(proc.pid)) {
+        await killProcessTree(proc.pid);
+      }
+    }
+    testProcesses.clear();
+
+    for (const pid of testPids) {
+      if (isProcessAlive(pid)) {
+        await killProcessTree(pid);
+      }
+    }
+    testPids.clear();
+
     vi.restoreAllMocks();
   });
 
@@ -260,38 +291,91 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       expect(runner.resolveFinalExitCode()).toBe(1);
     });
 
-    it("12. Repeated signals do not execute teardown twice", async () => {
-      const runner = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
-      let cleanupExecutions = 0;
+    it("11b. Browser test child exit distinguishes natural failures from teardown termination and preserves genuine prior exit codes", () => {
+      // 1. Natural successful exit
+      const runner1 = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
+      runner1.recordBrowserTestExit(0, null);
+      expect(runner1.testExitCode).toBe(0);
+      expect(runner1.resolveFinalExitCode()).toBe(0);
 
-      // Track performTeardown internal cleanup by observing dbFilePath handling
+      // 2. Natural test failure
+      const runner2 = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
+      runner2.recordBrowserTestExit(2, null);
+      expect(runner2.testExitCode).toBe(2);
+      expect(runner2.resolveFinalExitCode()).toBe(2);
+
+      // 3. Teardown-induced termination must NOT set testExitCode or overwrite existing exit code
+      const runner3 = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
+      runner3.browserTestTerminating = true;
+      runner3.recordBrowserTestExit(null, "SIGTERM");
+      expect(runner3.testExitCode).toBeNull(); // Distinguishes teardown termination from natural test failure
+
+      // 4. Teardown with SIGINT returns 130 when no prior failure occurred
+      runner3.signalReceived = "SIGINT";
+      expect(runner3.resolveFinalExitCode()).toBe(130);
+
+      // 5. Teardown with SIGTERM returns 143 when no prior failure occurred
+      const runner4 = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
+      runner4.browserTestTerminating = true;
+      runner4.recordBrowserTestExit(null, "SIGTERM");
+      runner4.signalReceived = "SIGTERM";
+      expect(runner4.resolveFinalExitCode()).toBe(143);
+
+      // 6. Pre-existing genuine failure exit code is preserved even when SIGINT received during teardown
+      const runner5 = new RunnerLifecycle({ cwd: dummyRoot, prismaDir: dummyPrismaDir });
+      runner5.recordBrowserTestExit(3, null); // Genuine prior failure
+      runner5.browserTestTerminating = true;
+      runner5.recordBrowserTestExit(null, "SIGTERM"); // Teardown kill event
+      runner5.signalReceived = "SIGINT"; // Signal arrived
+      expect(runner5.resolveFinalExitCode()).toBe(3); // Real prior test failure preserved!
+    });
+
+    it("12. Concurrent performTeardown calls execute actual cleanup exactly once, remove all sidecars, and return 130 to all callers", async () => {
       const dbInfo = createExclusiveDatabase(dummyPrismaDir);
+      const walPath = `${dbInfo.dbFilePath}-wal`;
+      const shmPath = `${dbInfo.dbFilePath}-shm`;
+      fs.writeFileSync(walPath, "wal content");
+      fs.writeFileSync(shmPath, "shm content");
+
+      let observableCleanupInvocations = 0;
+      const runner = new RunnerLifecycle({
+        cwd: dummyRoot,
+        prismaDir: dummyPrismaDir,
+        onCleanup: () => {
+          observableCleanupInvocations++;
+        },
+      });
       runner.dbFileName = dbInfo.dbFileName;
       runner.dbFilePath = dbInfo.dbFilePath;
       runner.dbFileOwned = true;
 
-      // Wrap teardown with counter
-      const originalTeardown = runner.performTeardown.bind(runner);
-      runner.performTeardown = async (...args) => {
-        cleanupExecutions++;
-        return originalTeardown(...args);
-      };
-
-      // Concurrent signal calls
+      // Invoke performTeardown concurrently through three signal/exit paths
       const [c1, c2, c3] = await Promise.all([
         runner.performTeardown({ signal: "SIGINT" }),
         runner.performTeardown({ signal: "SIGINT" }),
         runner.performTeardown({ signal: "SIGTERM" }),
       ]);
 
+      // Assert the actual cleanup operation executed exactly once
+      expect(runner.cleanupExecutionCount).toBe(1);
+      expect(observableCleanupInvocations).toBe(1);
+
+      // Assert database and sidecars are absent afterward
+      expect(fs.existsSync(dbInfo.dbFilePath)).toBe(false);
+      expect(fs.existsSync(walPath)).toBe(false);
+      expect(fs.existsSync(shmPath)).toBe(false);
+
+      // Assert all callers receive the correct final exit code (first signal was SIGINT -> 130)
       expect(c1).toBe(130);
       expect(c2).toBe(130);
       expect(c3).toBe(130);
-      expect(cleanupExecutions).toBe(3);
+
+      // Verify teardown state flags
+      expect(runner.teardownCompleted).toBe(true);
+      expect(runner.dbFileOwned).toBe(false);
     });
 
-    it("13. Real nested child-process termination terminates both parent and nested worker", async () => {
-      // Spawn a real detached Node parent process which starts a nested worker process
+    it("13. Real nested child-process termination terminates detached parent, non-detached worker, and grandchild", async () => {
       const isWin = process.platform === "win32";
       const parent = spawn(
         process.execPath,
@@ -300,46 +384,90 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
           "-e",
           `
             import { spawn } from 'child_process';
-            const isWin = process.platform === 'win32';
-            const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
-              stdio: 'ignore',
-              detached: !isWin,
+            // Nested worker is non-detached so it inherits parent's process group
+            const worker = spawn(process.execPath, [
+              '--input-type=module',
+              '-e',
+              \`
+                import { spawn } from 'child_process';
+                // Grandchild worker is also non-detached
+                const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+                  stdio: 'ignore',
+                  detached: false,
+                });
+                console.log('WORKER_PIDS:' + process.pid + ':' + grandchild.pid);
+                setInterval(() => {}, 1000);
+              \`
+            ], {
+              stdio: ['ignore', 'pipe', 'ignore'],
+              detached: false,
             });
-            console.log('PIDS:' + process.pid + ':' + worker.pid);
+
+            worker.stdout.on('data', (d) => {
+              const m = d.toString().match(/WORKER_PIDS:(\\d+):(\\d+)/);
+              if (m) {
+                console.log('ALL_PIDS:' + process.pid + ':' + m[1] + ':' + m[2]);
+              }
+            });
+
             setInterval(() => {}, 1000);
           `
         ],
         {
           cwd: process.cwd(),
           stdio: ["ignore", "pipe", "ignore"],
-          detached: !isWin,
+          detached: !isWin, // Detached parent process (process group leader on POSIX)
         }
       );
 
-      const [parentPid, workerPid] = await new Promise<[number, number]>((resolve) => {
-        parent.stdout.on("data", (d) => {
-          const match = d.toString().match(/PIDS:(\d+):(\d+)/);
-          if (match) {
-            resolve([parseInt(match[1], 10), parseInt(match[2], 10)]);
-          }
+      registerTestProcess(parent);
+
+      let parentPid = 0;
+      let workerPid = 0;
+      let grandchildPid = 0;
+
+      try {
+        [parentPid, workerPid, grandchildPid] = await new Promise<[number, number, number]>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("Timeout waiting for process tree to start")), 10000);
+          parent.stdout.on("data", (d) => {
+            const match = d.toString().match(/ALL_PIDS:(\d+):(\d+):(\d+)/);
+            if (match) {
+              clearTimeout(timer);
+              resolve([parseInt(match[1], 10), parseInt(match[2], 10), parseInt(match[3], 10)]);
+            }
+          });
+          parent.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
         });
-      });
 
-      // Confirm both parent and nested child worker are actively alive in the OS
-      expect(isProcessAlive(parentPid)).toBe(true);
-      expect(isProcessAlive(workerPid)).toBe(true);
-      expect(isProcessGroupAlive(parentPid)).toBe(true);
+        registerTestPid(parentPid);
+        registerTestPid(workerPid);
+        registerTestPid(grandchildPid);
 
-      // Run actual production killProcessTree against parent process group
-      const stopped = await killProcessTree(parentPid);
-      expect(stopped).toBe(true);
+        // Confirm parent, worker and grandchild PIDs are all running
+        expect(isProcessAlive(parentPid)).toBe(true);
+        expect(isProcessAlive(workerPid)).toBe(true);
+        expect(isProcessAlive(grandchildPid)).toBe(true);
+        expect(isProcessGroupAlive(parentPid)).toBe(true);
 
-      // Verify both parent and nested child are terminated
-      expect(isProcessAlive(parentPid)).toBe(false);
-      expect(isProcessAlive(workerPid)).toBe(false);
+        // Terminate the process tree via parentPid
+        const stopped = await killProcessTree(parentPid);
+        expect(stopped).toBe(true);
 
-      // Verify the group has no surviving processes
-      expect(isProcessGroupAlive(parentPid)).toBe(false);
+        // Verify parent, worker and grandchild PIDs are all terminated
+        expect(isProcessAlive(parentPid)).toBe(false);
+        expect(isProcessAlive(workerPid)).toBe(false);
+        expect(isProcessAlive(grandchildPid)).toBe(false);
+
+        // Verify process group no longer exists
+        expect(isProcessGroupAlive(parentPid)).toBe(false);
+      } finally {
+        if (parentPid && isProcessAlive(parentPid)) await killProcessTree(parentPid);
+        if (workerPid && isProcessAlive(workerPid)) await killProcessTree(workerPid);
+        if (grandchildPid && isProcessAlive(grandchildPid)) await killProcessTree(grandchildPid);
+      }
     });
 
     it("14. Real server process and port release terminates process group and releases port", async () => {
@@ -366,35 +494,52 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         }
       );
 
-      const port = await new Promise<number>((resolve) => {
-        child.stdout.on("data", (d) => {
-          const match = d.toString().match(/LISTENING:(\d+)/);
-          if (match) {
-            resolve(parseInt(match[1], 10));
-          }
+      registerTestProcess(child);
+
+      let port = 0;
+      let childPid = 0;
+
+      try {
+        port = await new Promise<number>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("Timeout waiting for server port")), 10000);
+          child.stdout.on("data", (d) => {
+            const match = d.toString().match(/LISTENING:(\d+)/);
+            if (match) {
+              clearTimeout(timer);
+              resolve(parseInt(match[1], 10));
+            }
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
         });
-      });
 
-      const childPid = child.pid!;
-      // Confirm server is listening and port is occupied
-      expect(isProcessAlive(childPid)).toBe(true);
-      expect(await isPortAvailable(port)).toBe(false);
+        childPid = child.pid!;
+        registerTestPid(childPid);
 
-      // Invoke real production killProcessTree(child.pid, port)
-      const stopped = await killProcessTree(childPid, port);
-      expect(stopped).toBe(true);
+        // Confirm server is listening and port is occupied
+        expect(isProcessAlive(childPid)).toBe(true);
+        expect(await isPortAvailable(port)).toBe(false);
 
-      // Verify the process group is terminated
-      expect(isProcessAlive(childPid)).toBe(false);
-      expect(isProcessGroupAlive(childPid)).toBe(false);
+        // Invoke real production killProcessTree(child.pid, port)
+        const stopped = await killProcessTree(childPid, port);
+        expect(stopped).toBe(true);
 
-      // Verify the port becomes available
-      expect(await isPortAvailable(port)).toBe(true);
+        // Verify the process group is terminated
+        expect(isProcessAlive(childPid)).toBe(false);
+        expect(isProcessGroupAlive(childPid)).toBe(false);
 
-      // Assert cleanup fails if PID is missing or invalid
-      expect(await killProcessTree(null as unknown as number, port)).toBe(false);
-      expect(await killProcessTree(undefined as unknown as number, port)).toBe(false);
-      expect(await killProcessTree(-1, port)).toBe(false);
+        // Verify the port becomes available
+        expect(await isPortAvailable(port)).toBe(true);
+
+        // Assert cleanup fails if PID is missing or invalid
+        expect(await killProcessTree(null as unknown as number, port)).toBe(false);
+        expect(await killProcessTree(undefined as unknown as number, port)).toBe(false);
+        expect(await killProcessTree(-1, port)).toBe(false);
+      } finally {
+        if (childPid && isProcessAlive(childPid)) await killProcessTree(childPid, port || undefined);
+      }
     });
 
     it("15. Full-runner SIGINT integration test terminates browser process tree, releases port, cleans up DB, and exits 130", async () => {
@@ -419,106 +564,117 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         }
       );
 
+      registerTestProcess(runnerChild);
+
       let runnerDbPath: string | null = null;
       let runnerPort: number | null = null;
       let browserPid: number | null = null;
       let workerPid: number | null = null;
       let stderrOutput = "";
 
-      await new Promise<void>((resolve, reject) => {
-        let isReady = false;
-        const timeout = setTimeout(() => {
-          reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
-        }, 15000);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let isReady = false;
+          const timeout = setTimeout(() => {
+            reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
+          }, 15000);
 
-        runnerChild.on("message", (msg: unknown) => {
-          const m = msg as {
-            type?: string;
-            dbFilePath?: string;
-            targetPort?: number;
-            browserPid?: number;
-            workerPid?: number;
-          } | null;
-          if (m && m.type === "RUNNER_READY") {
-            if (m.dbFilePath) runnerDbPath = m.dbFilePath;
-            if (m.targetPort) runnerPort = m.targetPort;
-          }
-          if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
-            if (m.browserPid) browserPid = m.browserPid;
-            if (m.workerPid) workerPid = m.workerPid;
-            isReady = true;
-            clearTimeout(timeout);
-            resolve();
-          }
+          runnerChild.on("message", (msg: unknown) => {
+            const m = msg as {
+              type?: string;
+              dbFilePath?: string;
+              targetPort?: number;
+              browserPid?: number;
+              workerPid?: number;
+            } | null;
+            if (m && m.type === "RUNNER_READY") {
+              if (m.dbFilePath) runnerDbPath = m.dbFilePath;
+              if (m.targetPort) runnerPort = m.targetPort;
+            }
+            if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
+              if (m.browserPid) browserPid = m.browserPid;
+              if (m.workerPid) workerPid = m.workerPid;
+              isReady = true;
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+
+          runnerChild.stdout?.on("data", (data) => {
+            const str = data.toString();
+            const dbMatch = str.match(/Target path:\s*(.+)/);
+            if (dbMatch) runnerDbPath = dbMatch[1].trim();
+            const portMatch = str.match(/Starting server on port (\d+)/);
+            if (portMatch) runnerPort = parseInt(portMatch[1], 10);
+            const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
+            if (browserMatch && !isReady) {
+              browserPid = parseInt(browserMatch[1], 10);
+              workerPid = parseInt(browserMatch[2], 10);
+              isReady = true;
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+
+          runnerChild.stderr?.on("data", (d) => {
+            stderrOutput += d.toString();
+          });
+
+          runnerChild.on("exit", (code) => {
+            if (!isReady) {
+              clearTimeout(timeout);
+              reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
+            }
+          });
         });
 
-        runnerChild.stdout?.on("data", (data) => {
-          const str = data.toString();
-          const dbMatch = str.match(/Target path:\s*(.+)/);
-          if (dbMatch) runnerDbPath = dbMatch[1].trim();
-          const portMatch = str.match(/Starting server on port (\d+)/);
-          if (portMatch) runnerPort = parseInt(portMatch[1], 10);
-          const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
-          if (browserMatch && !isReady) {
-            browserPid = parseInt(browserMatch[1], 10);
-            workerPid = parseInt(browserMatch[2], 10);
-            isReady = true;
-            clearTimeout(timeout);
-            resolve();
-          }
+        if (browserPid) registerTestPid(browserPid);
+        if (workerPid) registerTestPid(workerPid);
+
+        expect(browserPid).toBeGreaterThan(0);
+        expect(workerPid).toBeGreaterThan(0);
+        expect(isProcessAlive(browserPid!)).toBe(true);
+        expect(isProcessAlive(workerPid!)).toBe(true);
+        expect(runnerDbPath).not.toBeNull();
+        expect(fs.existsSync(runnerDbPath!)).toBe(true);
+
+        // Trigger real SIGINT interruption: on Windows use IPC/stdin, on POSIX send SIGINT signal
+        if (isWin) {
+          runnerChild.send("SIGINT");
+        } else {
+          runnerChild.kill("SIGINT");
+        }
+
+        const exitCode = await new Promise((resolve) => {
+          runnerChild.on("exit", (code) => resolve(code));
         });
 
-        runnerChild.stderr?.on("data", (d) => {
-          stderrOutput += d.toString();
-        });
+        // Verify exit code 130
+        expect(exitCode).toBe(130);
 
-        runnerChild.on("exit", (code) => {
-          if (!isReady) {
-            clearTimeout(timeout);
-            reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
-          }
-        });
-      });
+        // Verify browser Node and worker descendants stopped
+        expect(isProcessAlive(browserPid!)).toBe(false);
+        expect(isProcessAlive(workerPid!)).toBe(false);
 
-      expect(browserPid).toBeGreaterThan(0);
-      expect(workerPid).toBeGreaterThan(0);
-      expect(isProcessAlive(browserPid!)).toBe(true);
-      expect(isProcessAlive(workerPid!)).toBe(true);
-      expect(runnerDbPath).not.toBeNull();
-      expect(fs.existsSync(runnerDbPath!)).toBe(true);
+        // Verify server process and port stopped
+        if (runnerPort) {
+          expect(await isPortAvailable(runnerPort)).toBe(true);
+        }
 
-      // Trigger real SIGINT interruption: on Windows use IPC/stdin, on POSIX use SIGINT signal
-      if (isWin) {
-        runnerChild.send("SIGINT");
-      } else {
-        runnerChild.kill("SIGINT");
+        // Verify owned DB and all sidecars are removed
+        expect(fs.existsSync(runnerDbPath!)).toBe(false);
+        expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
+        expect(fs.existsSync(`${runnerDbPath}-shm`)).toBe(false);
+
+        // Verify developer DB and its sidecars remain unchanged
+        const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+        expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
+        expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
+      } finally {
+        if (browserPid && isProcessAlive(browserPid)) await killProcessTree(browserPid);
+        if (workerPid && isProcessAlive(workerPid)) await killProcessTree(workerPid);
+        if (runnerChild.pid && isProcessAlive(runnerChild.pid)) await killProcessTree(runnerChild.pid, runnerPort || undefined);
       }
-
-      const exitCode = await new Promise((resolve) => {
-        runnerChild.on("exit", (code) => resolve(code));
-      });
-
-      // Verify exit code 130
-      expect(exitCode).toBe(130);
-
-      // Verify browser Node and worker descendants stopped
-      expect(isProcessAlive(browserPid!)).toBe(false);
-      expect(isProcessAlive(workerPid!)).toBe(false);
-
-      // Verify server process and port stopped
-      if (runnerPort) {
-        expect(await isPortAvailable(runnerPort)).toBe(true);
-      }
-
-      // Verify owned DB and all sidecars are removed
-      expect(fs.existsSync(runnerDbPath!)).toBe(false);
-      expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
-      expect(fs.existsSync(`${runnerDbPath}-shm`)).toBe(false);
-
-      // Verify developer DB and its sidecars remain unchanged
-      const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
-      expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
-      expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
     }, 20000);
 
     it("16. Full-runner SIGTERM integration test terminates browser process tree, releases port, cleans up DB, and exits 143", async () => {
@@ -543,110 +699,121 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         }
       );
 
+      registerTestProcess(runnerChild);
+
       let runnerDbPath: string | null = null;
       let runnerPort: number | null = null;
       let browserPid: number | null = null;
       let workerPid: number | null = null;
       let stderrOutput = "";
 
-      await new Promise<void>((resolve, reject) => {
-        let isReady = false;
-        const timeout = setTimeout(() => {
-          reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
-        }, 15000);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let isReady = false;
+          const timeout = setTimeout(() => {
+            reject(new Error(`Timeout waiting for runner ready. Stderr: ${stderrOutput}`));
+          }, 15000);
 
-        runnerChild.on("message", (msg: unknown) => {
-          const m = msg as {
-            type?: string;
-            dbFilePath?: string;
-            targetPort?: number;
-            browserPid?: number;
-            workerPid?: number;
-          } | null;
-          if (m && m.type === "RUNNER_READY") {
-            if (m.dbFilePath) runnerDbPath = m.dbFilePath;
-            if (m.targetPort) runnerPort = m.targetPort;
-          }
-          if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
-            if (m.browserPid) browserPid = m.browserPid;
-            if (m.workerPid) workerPid = m.workerPid;
-            isReady = true;
-            clearTimeout(timeout);
-            resolve();
-          }
+          runnerChild.on("message", (msg: unknown) => {
+            const m = msg as {
+              type?: string;
+              dbFilePath?: string;
+              targetPort?: number;
+              browserPid?: number;
+              workerPid?: number;
+            } | null;
+            if (m && m.type === "RUNNER_READY") {
+              if (m.dbFilePath) runnerDbPath = m.dbFilePath;
+              if (m.targetPort) runnerPort = m.targetPort;
+            }
+            if (m && m.type === "INTERRUPTIBLE_BROWSER_READY") {
+              if (m.browserPid) browserPid = m.browserPid;
+              if (m.workerPid) workerPid = m.workerPid;
+              isReady = true;
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+
+          runnerChild.stdout?.on("data", (data) => {
+            const str = data.toString();
+            const dbMatch = str.match(/Target path:\s*(.+)/);
+            if (dbMatch) runnerDbPath = dbMatch[1].trim();
+            const portMatch = str.match(/Starting server on port (\d+)/);
+            if (portMatch) runnerPort = parseInt(portMatch[1], 10);
+            const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
+            if (browserMatch && !isReady) {
+              browserPid = parseInt(browserMatch[1], 10);
+              workerPid = parseInt(browserMatch[2], 10);
+              isReady = true;
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+
+          runnerChild.stderr?.on("data", (d) => {
+            stderrOutput += d.toString();
+          });
+
+          runnerChild.on("exit", (code) => {
+            if (!isReady) {
+              clearTimeout(timeout);
+              reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
+            }
+          });
         });
 
-        runnerChild.stdout?.on("data", (data) => {
-          const str = data.toString();
-          const dbMatch = str.match(/Target path:\s*(.+)/);
-          if (dbMatch) runnerDbPath = dbMatch[1].trim();
-          const portMatch = str.match(/Starting server on port (\d+)/);
-          if (portMatch) runnerPort = parseInt(portMatch[1], 10);
-          const browserMatch = str.match(/INTERRUPTIBLE_BROWSER_READY:(\d+):(\d+)/);
-          if (browserMatch && !isReady) {
-            browserPid = parseInt(browserMatch[1], 10);
-            workerPid = parseInt(browserMatch[2], 10);
-            isReady = true;
-            clearTimeout(timeout);
-            resolve();
-          }
+        if (browserPid) registerTestPid(browserPid);
+        if (workerPid) registerTestPid(workerPid);
+
+        expect(browserPid).toBeGreaterThan(0);
+        expect(workerPid).toBeGreaterThan(0);
+        expect(isProcessAlive(browserPid!)).toBe(true);
+        expect(isProcessAlive(workerPid!)).toBe(true);
+        expect(runnerDbPath).not.toBeNull();
+        expect(fs.existsSync(runnerDbPath!)).toBe(true);
+
+        // Trigger SIGTERM
+        if (isWin) {
+          runnerChild.send("SIGTERM");
+        } else {
+          runnerChild.kill("SIGTERM");
+        }
+
+        const exitCode = await new Promise((resolve) => {
+          runnerChild.on("exit", (code) => resolve(code));
         });
 
-        runnerChild.stderr?.on("data", (d) => {
-          stderrOutput += d.toString();
-        });
+        // Verify exit code 143
+        expect(exitCode).toBe(143);
 
-        runnerChild.on("exit", (code) => {
-          if (!isReady) {
-            clearTimeout(timeout);
-            reject(new Error(`Runner exited prematurely with code ${code}. Stderr: ${stderrOutput}`));
-          }
-        });
-      });
+        // Verify browser Node and worker descendants stopped
+        expect(isProcessAlive(browserPid!)).toBe(false);
+        expect(isProcessAlive(workerPid!)).toBe(false);
 
-      expect(browserPid).toBeGreaterThan(0);
-      expect(workerPid).toBeGreaterThan(0);
-      expect(isProcessAlive(browserPid!)).toBe(true);
-      expect(isProcessAlive(workerPid!)).toBe(true);
-      expect(runnerDbPath).not.toBeNull();
-      expect(fs.existsSync(runnerDbPath!)).toBe(true);
+        // Verify server process and port stopped
+        if (runnerPort) {
+          expect(await isPortAvailable(runnerPort)).toBe(true);
+        }
 
-      // Trigger SIGTERM
-      if (isWin) {
-        runnerChild.send("SIGTERM");
-      } else {
-        runnerChild.kill("SIGTERM");
+        // Verify owned DB and all sidecars are removed
+        expect(fs.existsSync(runnerDbPath!)).toBe(false);
+        expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
+
+        // Verify developer DB and its sidecars remain unchanged
+        const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
+        expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
+        expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
+      } finally {
+        if (browserPid && isProcessAlive(browserPid)) await killProcessTree(browserPid);
+        if (workerPid && isProcessAlive(workerPid)) await killProcessTree(workerPid);
+        if (runnerChild.pid && isProcessAlive(runnerChild.pid)) await killProcessTree(runnerChild.pid, runnerPort || undefined);
       }
-
-      const exitCode = await new Promise((resolve) => {
-        runnerChild.on("exit", (code) => resolve(code));
-      });
-
-      // Verify exit code 143
-      expect(exitCode).toBe(143);
-
-      // Verify browser Node and worker descendants stopped
-      expect(isProcessAlive(browserPid!)).toBe(false);
-      expect(isProcessAlive(workerPid!)).toBe(false);
-
-      // Verify server process and port stopped
-      if (runnerPort) {
-        expect(await isPortAvailable(runnerPort)).toBe(true);
-      }
-
-      // Verify owned DB and all sidecars are removed
-      expect(fs.existsSync(runnerDbPath!)).toBe(false);
-      expect(fs.existsSync(`${runnerDbPath}-wal`)).toBe(false);
-
-      // Verify developer DB and its sidecars remain unchanged
-      const currentDevBaseline = recordDevDbBaseline(path.resolve(process.cwd(), "prisma"), "dev.db");
-      expect(currentDevBaseline["dev.db"].hash).toBe(devDbBaseline["dev.db"].hash);
-      expect(currentDevBaseline["dev.db"].size).toBe(devDbBaseline["dev.db"].size);
     }, 20000);
   });
 
   describe("4. Browser Safety Validation Guard & Isolation Rejection", () => {
-    it("16. Unsafe non-isolated browser-test execution is rejected by the actual production guard", async () => {
+    it("17. Unsafe non-isolated browser-test execution is rejected by the actual production guard", async () => {
       // Start a real HTTP server that returns non-isolated health response
       const server = http.createServer((req, res) => {
         if (req.url === "/api/health") {
@@ -684,7 +851,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       await new Promise((resolve) => server.close(resolve));
     });
 
-    it("17. Existing symlink and path traversal protections continue passing in production code", () => {
+    it("18. Existing symlink and path traversal protections continue passing in production code", () => {
       // Path traversal
       expect(validateDatabaseIsolation("file:../../dev.db", "1", dummyRoot).isIsolated).toBe(false);
       expect(validateDatabaseIsolation("file:./sub/../../dev.db", "1", dummyRoot).isIsolated).toBe(false);

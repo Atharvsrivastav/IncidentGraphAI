@@ -252,17 +252,22 @@ async function main() {
     });
   }
 
-  const testCode = await new Promise((resolve) => {
-    runner.browserTestProcess.on('exit', (code) => resolve(code ?? 1));
+  await new Promise((resolve) => {
+    runner.browserTestProcess.on('exit', (code, signal) => {
+      runner.recordBrowserTestExit(code, signal);
+      resolve();
+    });
     runner.browserTestProcess.on('error', (err) => {
       console.error('Failed to spawn browser test child process:', err);
-      resolve(1);
+      if (!runner.browserTestTerminating && !runner.teardownRunning && !runner.teardownCompleted) {
+        runner.testExitCode = 1;
+      }
+      resolve();
     });
   });
 
-  runner.testExitCode = testCode;
   runner.browserTestProcess = null;
-  runner.state = testCode === 0 ? 'COMPLETED' : 'FAILED';
+  runner.state = runner.testExitCode === 0 ? 'COMPLETED' : 'FAILED';
 }
 
 main()
