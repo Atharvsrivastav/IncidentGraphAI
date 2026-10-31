@@ -428,17 +428,19 @@ npm run test:observability:live
   - **Strict JSON Parsing:** Rejects malformed JSON payloads with HTTP 400 Bad Request instead of silently ignoring parse failures.
   - **Identifier & Count Bounds:** Validates `verification_id` format (`^[a-zA-Z0-9_-]{8,64}$`) and requires `count` to be a finite positive integer between 1 and 1000.
   - **Bounded Status Allowlist:** Caller cannot supply arbitrary status labels; status is strictly restricted to `['synthetic', 'test_verified', 'smoke_test']`.
-- **Bounded Cardinality & Deterministic TTL Expiry:**
+- **Bounded Cardinality & Deterministic TTL Expiry (Phase 2.6 Hardened):**
   - **Prometheus Smoke-Test Registry:** The dedicated custom Prometheus registry caps active verification IDs to a maximum of 100 (`MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS = 100`).
-  - **Deterministic Expiry:** Active IDs have a 5-minute TTL (`DEFAULT_SYNTHETIC_ID_TTL_MS = 300,000ms`). `pruneExpiredSyntheticIds()` automatically purges expired entries, releasing registry capacity.
+  - **Deterministic Expiry via Scrape Path Pruning:** Active IDs have a 5-minute TTL (`DEFAULT_SYNTHETIC_ID_TTL_MS = 300,000ms`). In Phase 2.6, `PrometheusRegistry.toPrometheusFormat()` invokes `pruneExpiredSyntheticIds()` prior to exposition generation, guaranteeing expired IDs are stripped from Prometheus scrape responses even if no new registration or manual cleanup has occurred.
+  - **Deterministic Time Injection:** `PrometheusRegistry.setTimeProvider(fn: () => number)` enables millisecond-precision deterministic time advancement in unit tests without depending on real-time sleep.
   - **Manual Cleanup Release:** Authenticated `DELETE /test/record-metric` or `POST /test/cleanup-metric` (as well as `clearSyntheticVerificationId(id)` / `clearSyntheticVerificationIds()`) explicitly removes metrics from the custom Prometheus registry and releases capacity.
-  - **Safe Re-registration:** Expired or cleaned-up IDs can be registered again. Repeated requests using an active ID succeed without consuming additional slots. The 101st unique active ID is rejected with HTTP 429 (`{ error, ceiling: 100 }`).
+  - **Safe Re-registration:** Expired or cleaned-up IDs can be registered again. Repeated requests using an active ID succeed without consuming additional slots and refresh the TTL timestamp. The 101st unique active ID is rejected with HTTP 429 (`{ error, ceiling: 100 }`).
   - **OpenTelemetry Metric Stream Protection:** The long-lived OpenTelemetry Counter metric strictly records across bounded, stable dimensions (`service`, `method`, `route`, `status`), never attaching arbitrary unique `verification_id` values. This protects the OpenTelemetry SDK aggregator from unbounded lifetime memory growth while preserving the Prometheus smoke-test registry's exact `verification_id` read-back.
-- **Real Child-Process Isolation for Disposable Order Service:**
+- **Child-Process Lifecycle & Parent Environment Preservation (Phase 2.6 Hardened):**
   - `startDisposableOrderService()` executes the disposable order service in a real child process using `child_process.spawn`.
-  - Passes ephemeral credentials (`TEST_METRIC_ENDPOINT_TOKEN`, `ENABLE_TEST_METRIC_ENDPOINT="true"`) strictly to the child process environment without mutating parent `process.env`.
-  - Automatically allocates an isolated dynamic port (communicating the bound port back to the parent securely via standard output `[DISPOSABLE_ORDER_SERVICE_PORT:<port>]`), falling back to a free port if port 4001 is already bound.
-  - Cleans up child process (`SIGTERM` followed by `SIGKILL` if needed) and purges dynamic discovery target files in `finally` blocks, even if errors occur.
+  - **Cryptographically Secure Disposable Tokens:** Generates 32 bytes of cryptographically secure randomness via `crypto.randomBytes(32).toString("hex")`, keeping verification IDs strictly decoupled from authentication tokens.
+  - **Parent Environment Preservation:** Ephemeral credentials (`TEST_METRIC_ENDPOINT_TOKEN`, `ENABLE_TEST_METRIC_ENDPOINT="true"`) are passed exclusively through `childEnv`. Parent `process.env` is never modified or deleted, preserving existing configuration. Tokens are never logged or written to target files.
+  - **True Process Termination & Escalation:** Replaces reliance on `child.killed` with true process exit tracking (`exitCode`, `signalCode`, `'exit'`/`'close'` events). `stop()` is idempotent, sends `SIGTERM`, awaits exit within a 1500ms grace period, escalates to `SIGKILL` if the child ignores termination, and awaits final termination before resolving.
+  - **Dynamic Target Discovery via Host Gateway:** Registers dynamic target `host.docker.internal:${boundPort}` in `./docker/file_sd/` (avoiding container-loopback `127.0.0.1`), with `extra_hosts: ["host.docker.internal:host-gateway"]` in `docker-compose.yml` to support Docker host routing. Dynamic target files are deterministically cleaned up on stop. Target health is confirmed via `/api/v1/targets` and exact verification ID via PromQL prior to remote-write verification.
 
 ### F. Strict Tempo Search-to-Detail Verification (Phase 2.5 Hardened)
 

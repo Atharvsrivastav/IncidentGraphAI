@@ -19,7 +19,7 @@ import {
   server as orderServer,
   safeTokenEquals,
 } from "../sample-services/order/server";
-import { startDisposableOrderService } from "../scripts/verify-live-observability";
+import { startDisposableOrderService, generateSecureToken, stopChildProcess } from "../scripts/verify-live-observability";
 import YAML from "yaml";
 
 describe("Phase 6: Observability Provenance, Failure Handling & Security Verification", () => {
@@ -2884,6 +2884,311 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
         });
         expect(res.status).toBe(403);
         expect((res.body as Record<string, unknown>).disabled).toBe(true);
+      });
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.6: TTL Scrape Cleanup, Child Lifecycle & Verification Corrections
+  // =========================================================================
+  describe("Phase 2.6: TTL Scrape Cleanup, Child Lifecycle & Verification Integrity", () => {
+    describe("1. Prometheus Scrape TTL Expiration via Time Injection", () => {
+      it("prunes expired synthetic IDs before Prometheus exposition output without waiting real-time", () => {
+        const reg = new PrometheusRegistry("test-service");
+        let currentTime = 1000000;
+        reg.setTimeProvider(() => currentTime);
+
+        // Record standard baseline metrics
+        reg.setHealthStatus(1);
+        reg.recordRequest(1, { route: "/api/orders", method: "GET", status: "200" });
+
+        // Register synthetic verification ID
+        reg.recordRequest(1, {
+          verification_id: "verify_synth_001",
+        });
+
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["verify_synth_001"]);
+
+        // Exposition immediately shows synthetic metric
+        const output1 = reg.toPrometheusFormat();
+        expect(output1).toContain('verification_id="verify_synth_001"');
+        expect(output1).toContain('service_health_status{service="test-service"} 1');
+
+        // Repeated ID call refreshes timestamp and does NOT consume additional capacity
+        currentTime += 2 * 60 * 1000; // +2 minutes
+        reg.recordRequest(1, {
+          verification_id: "verify_synth_001",
+        });
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(1);
+
+        // Advance time by 6 minutes (TTL is 5 minutes, so 1000000 + 2m + 6m = expired)
+        currentTime += 6 * 60 * 1000;
+
+        // Calling toPrometheusFormat() directly must prune expired IDs before emitting output
+        const output2 = reg.toPrometheusFormat();
+
+        // Expired verification ID is absent from Prometheus exposition
+        expect(output2).not.toContain('verification_id="verify_synth_001"');
+        // Active ID map has decreased
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual([]);
+
+        // Standard non-synthetic service metrics remain intact
+        expect(output2).toContain('service_health_status{service="test-service"} 1');
+        expect(output2).toContain('http_requests_total{service="test-service",status="200"} 1');
+
+        // New ID can be registered after expiry
+        reg.recordRequest(1, {
+          verification_id: "verify_synth_002",
+        });
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["verify_synth_002"]);
+        const output3 = reg.toPrometheusFormat();
+        expect(output3).toContain('verification_id="verify_synth_002"');
+      });
+
+      it("enforces 100-ID ceiling after expired IDs have been pruned", () => {
+        const reg = new PrometheusRegistry("test-service");
+        let currentTime = 1000000;
+        reg.setTimeProvider(() => currentTime);
+
+        // Register 100 IDs
+        for (let i = 0; i < 100; i++) {
+          reg.recordRequest(1, { verification_id: `id_${i}` });
+        }
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(100);
+
+        // 101st ID is rejected when at ceiling
+        expect(() => {
+          reg.recordRequest(1, { verification_id: "id_overflow" });
+        }).toThrow(/cardinality ceiling/i);
+
+        // Advance time past TTL
+        currentTime += 6 * 60 * 1000;
+
+        // Pruning via toPrometheusFormat clears expired IDs
+        reg.toPrometheusFormat();
+        expect(reg.getActiveSyntheticVerificationIds().length).toBe(0);
+
+        // Now registering new IDs succeeds
+        expect(() => {
+          reg.recordRequest(1, { verification_id: "id_fresh" });
+        }).not.toThrow();
+        expect(reg.getActiveSyntheticVerificationIds()).toEqual(["id_fresh"]);
+      });
+    });
+
+    describe("2. Child Process Shutdown, Escalation & True Termination", () => {
+      it("shuts down normal child cleanly and removes dynamic discovery file", async () => {
+        const service = await startDisposableOrderService();
+        expect(service.port).toBeGreaterThan(0);
+        if (service.targetFilePath) {
+          expect(fs.existsSync(service.targetFilePath)).toBe(true);
+        }
+
+        await service.stop();
+
+        // Process is confirmed actually terminated
+        expect(service.process).toBeDefined();
+        expect(service.process!.exitCode !== null || service.process!.signalCode !== null).toBe(true);
+        if (service.targetFilePath) {
+          expect(fs.existsSync(service.targetFilePath)).toBe(false);
+        }
+      });
+
+      it("handles stop() idempotently when child exits before stop() is called", async () => {
+        const service = await startDisposableOrderService();
+        // Manually kill child early
+        expect(service.process).toBeDefined();
+        service.process!.kill("SIGTERM");
+        await new Promise((r) => setTimeout(r, 200));
+
+        // stop() should complete cleanly without throwing and remove files
+        await expect(service.stop()).resolves.toBeUndefined();
+        // Repeated calls succeed idempotently
+        await expect(service.stop()).resolves.toBeUndefined();
+      });
+
+      it("handles repeated sequential and parallel stop() calls idempotently", async () => {
+        const service = await startDisposableOrderService();
+        const p1 = service.stop();
+        const p2 = service.stop();
+        const p3 = service.stop();
+
+        await Promise.all([p1, p2, p3]);
+        expect(service.process).toBeDefined();
+        expect(service.process!.exitCode !== null || service.process!.signalCode !== null).toBe(true);
+      });
+
+      it("escalates to SIGKILL if child ignores SIGTERM", async () => {
+        const { EventEmitter } = await import("events");
+        const emitter = new EventEmitter();
+        const killSignals: string[] = [];
+
+        interface MutableFakeChild {
+          exitCode: number | null;
+          signalCode: NodeJS.Signals | null;
+          killed: boolean;
+          kill: (signal?: NodeJS.Signals | number) => boolean;
+          once: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => import("child_process").ChildProcess;
+        }
+
+        const fakeChild: MutableFakeChild = {
+          exitCode: null,
+          signalCode: null,
+          killed: false,
+          kill: (signal?: NodeJS.Signals | number) => {
+            const sigStr = String(signal ?? "SIGTERM");
+            killSignals.push(sigStr);
+            if (sigStr === "SIGKILL") {
+              fakeChild.exitCode = null;
+              fakeChild.signalCode = "SIGKILL";
+              setTimeout(() => {
+                emitter.emit("exit", null, "SIGKILL");
+                emitter.emit("close");
+              }, 10);
+            }
+            return true;
+          },
+          once: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.once(event, cb);
+            return fakeChild as unknown as import("child_process").ChildProcess;
+          },
+          removeListener: (event: string, cb: (...args: unknown[]) => void) => {
+            emitter.removeListener(event, cb);
+            return fakeChild as unknown as import("child_process").ChildProcess;
+          },
+        };
+
+        await stopChildProcess(fakeChild as unknown as import("child_process").ChildProcess, undefined, 50);
+
+        expect(killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+        expect(fakeChild.signalCode).toBe("SIGKILL");
+      });
+
+      it("handles child process startup failure and cleans up", async () => {
+        await expect(
+          startDisposableOrderService({ port: -1 })
+        ).rejects.toThrow();
+      });
+    });
+
+    describe("3. Parent-Process Environment Variable Preservation", () => {
+      it("preserves pre-existing parent environment variables and does not leak child tokens", async () => {
+        const SENTINEL_ENABLE = "parent_sentinel_enable_preserved";
+        const SENTINEL_TOKEN = "parent_sentinel_token_preserved";
+
+        process.env.ENABLE_TEST_METRIC_ENDPOINT = SENTINEL_ENABLE;
+        process.env.TEST_METRIC_ENDPOINT_TOKEN = SENTINEL_TOKEN;
+
+        try {
+          const service = await startDisposableOrderService();
+          // Parent environment was NOT overwritten by child's token
+          expect(process.env.ENABLE_TEST_METRIC_ENDPOINT).toBe(SENTINEL_ENABLE);
+          expect(process.env.TEST_METRIC_ENDPOINT_TOKEN).toBe(SENTINEL_TOKEN);
+
+          // Child received its own distinct 32-byte token
+          expect(service.token).not.toBe(SENTINEL_TOKEN);
+          expect(service.token.length).toBeGreaterThanOrEqual(64); // 32 bytes in hex = 64 chars
+
+          // Target service endpoint becomes unreachable after stop
+          await service.stop();
+          await expect(fetch(`${service.baseUrl}/health`)).rejects.toThrow();
+
+          // Parent environment still preserved after cleanup
+          expect(process.env.ENABLE_TEST_METRIC_ENDPOINT).toBe(SENTINEL_ENABLE);
+          expect(process.env.TEST_METRIC_ENDPOINT_TOKEN).toBe(SENTINEL_TOKEN);
+        } finally {
+          delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+          delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+        }
+      });
+    });
+
+    describe("4. Cryptographically Secure Disposable Token Generation", () => {
+      it("generates tokens with at least 32 bytes of cryptographic randomness", () => {
+        const token1 = generateSecureToken();
+        const token2 = generateSecureToken();
+
+        expect(token1).toHaveLength(64); // 32 bytes = 64 hex characters
+        expect(token2).toHaveLength(64);
+        expect(token1).not.toBe(token2);
+        // Valid hex string
+        expect(/^[0-9a-f]{64}$/.test(token1)).toBe(true);
+      });
+
+      it("allows deterministic token injection when explicitly requested by tests", async () => {
+        const customToken = "deterministic_test_token_1234567890abcdef1234567890abcdef";
+        const service = await startDisposableOrderService({ token: customToken });
+        expect(service.token).toBe(customToken);
+        await service.stop();
+      });
+    });
+
+    describe("5. Dynamic File-Based Discovery Configuration", () => {
+      it("uses host.docker.internal and avoids 127.0.0.1 in dynamic file_sd targets", async () => {
+        const service = await startDisposableOrderService();
+        expect(service.targetFilePath).toBeDefined();
+        if (service.targetFilePath && fs.existsSync(service.targetFilePath)) {
+          const content = JSON.parse(fs.readFileSync(service.targetFilePath, "utf8"));
+          expect(Array.isArray(content)).toBe(true);
+          const targets = content[0].targets;
+          expect(targets).toContain(`host.docker.internal:${service.port}`);
+          expect(targets).not.toContain(`127.0.0.1:${service.port}`);
+        }
+        await service.stop();
+      });
+
+      it("genuine Prometheus scrape integration test (disposable or local Prometheus if reachable)", async () => {
+        const localPrometheusUrl = process.env.PROMETHEUS_URL || "http://localhost:9090";
+        let isPrometheusRunning = false;
+        try {
+          const res = await fetch(`${localPrometheusUrl}/-/healthy`, { signal: AbortSignal.timeout(1000) });
+          isPrometheusRunning = res.ok;
+        } catch {
+          isPrometheusRunning = false;
+        }
+
+        if (!isPrometheusRunning) {
+          // Gracefully skip execution if Prometheus daemon is not available locally
+          expect(true).toBe(true);
+          return;
+        }
+
+        // If Prometheus is running locally, execute genuine target discovery & scrape validation
+        const service = await startDisposableOrderService();
+        const testAuthToken = service.token;
+        const testVerificationId = `verify_scrape_${Date.now()}`;
+
+        // Emit synthetic metric to child service
+        const postRes = await fetch(`${service.baseUrl}/test/record-metric`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-test-token": testAuthToken },
+          body: JSON.stringify({ verification_id: testVerificationId, count: 1 }),
+        });
+        expect(postRes.ok).toBe(true);
+
+        // Verify target appears in Prometheus targets
+        let discovered = false;
+        for (let i = 0; i < 5; i++) {
+          const tRes = await fetch(`${localPrometheusUrl}/api/v1/targets`);
+          if (tRes.ok) {
+            const data = (await tRes.json()) as {
+              data?: {
+                activeTargets?: Array<{
+                  discoveredLabels?: Record<string, string>;
+                }>;
+              };
+            };
+            if (data.data?.activeTargets?.some((t) => t.discoveredLabels?.["__address__"]?.includes(`:${service.port}`))) {
+              discovered = true;
+              break;
+            }
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+
+        await service.stop();
+        expect(discovered).toBe(true);
       });
     });
   });

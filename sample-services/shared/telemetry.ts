@@ -77,6 +77,18 @@ export class PrometheusRegistry {
   public static readonly DEFAULT_SYNTHETIC_ID_TTL_MS = 5 * 60 * 1000; // 5 minutes
   private syntheticIdTtlMs: number = PrometheusRegistry.DEFAULT_SYNTHETIC_ID_TTL_MS;
   private activeSyntheticIds = new Map<string, number>();
+  private timeProvider: () => number = () => Date.now();
+
+  public setTimeProvider(fn: () => number): void {
+    if (typeof fn !== "function") {
+      throw new Error("Time provider must be a function returning milliseconds");
+    }
+    this.timeProvider = fn;
+  }
+
+  public getTimeProvider(): () => number {
+    return this.timeProvider;
+  }
 
   public setSyntheticIdTtlMs(ttlMs: number): void {
     if (typeof ttlMs !== "number" || isNaN(ttlMs) || ttlMs <= 0) {
@@ -89,11 +101,12 @@ export class PrometheusRegistry {
     return this.syntheticIdTtlMs;
   }
 
-  public pruneExpiredSyntheticIds(nowMs: number = Date.now(), customTtlMs?: number): number {
+  public pruneExpiredSyntheticIds(nowMs?: number, customTtlMs?: number): number {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
     const ttl = customTtlMs ?? this.syntheticIdTtlMs;
     let prunedCount = 0;
     for (const [id, registeredAt] of Array.from(this.activeSyntheticIds.entries())) {
-      if (nowMs - registeredAt >= ttl) {
+      if (now - registeredAt >= ttl) {
         this.clearSyntheticVerificationId(id);
         prunedCount++;
       }
@@ -101,8 +114,9 @@ export class PrometheusRegistry {
     return prunedCount;
   }
 
-  public getActiveSyntheticVerificationIds(nowMs: number = Date.now()): string[] {
-    this.pruneExpiredSyntheticIds(nowMs);
+  public getActiveSyntheticVerificationIds(nowMs?: number): string[] {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
+    this.pruneExpiredSyntheticIds(now);
     return Array.from(this.activeSyntheticIds.keys());
   }
 
@@ -138,7 +152,7 @@ export class PrometheusRegistry {
 
     if (attributes?.verification_id) {
       const vId = String(attributes.verification_id).trim();
-      const now = typeof attributes._recordTimeMs === "number" ? attributes._recordTimeMs : Date.now();
+      const now = typeof attributes._recordTimeMs === "number" ? attributes._recordTimeMs : this.timeProvider();
       this.pruneExpiredSyntheticIds(now);
       if (!this.activeSyntheticIds.has(vId) && this.activeSyntheticIds.size >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
         throw new Error(
@@ -178,7 +192,9 @@ export class PrometheusRegistry {
     }
   }
 
-  public toPrometheusFormat(): string {
+  public toPrometheusFormat(nowMs?: number): string {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
+    this.pruneExpiredSyntheticIds(now);
     const lines: string[] = [];
 
     // http_requests_total
@@ -260,6 +276,8 @@ export interface ServiceTelemetry {
   pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => number;
   setSyntheticIdTtlMs: (ttlMs: number) => void;
   getSyntheticIdTtlMs: () => number;
+  setTimeProvider: (fn: () => number) => void;
+  getTimeProvider: () => () => number;
   getPrometheusMetrics: () => string;
   handleMetricsRequest: (res: import("http").ServerResponse) => void;
   setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
@@ -609,6 +627,8 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => registry.pruneExpiredSyntheticIds(nowMs, customTtlMs),
     setSyntheticIdTtlMs: (ttlMs: number) => registry.setSyntheticIdTtlMs(ttlMs),
     getSyntheticIdTtlMs: () => registry.getSyntheticIdTtlMs(),
+    setTimeProvider: (fn: () => number) => registry.setTimeProvider(fn),
+    getTimeProvider: () => registry.getTimeProvider(),
     getPrometheusMetrics,
     handleMetricsRequest,
     setHealthStatus,

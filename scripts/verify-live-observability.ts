@@ -23,6 +23,7 @@
 import fs from "fs";
 import path from "path";
 import http from "http";
+import crypto from "crypto";
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
@@ -143,12 +144,85 @@ export interface DisposableServiceInstance {
   stop: () => Promise<void>;
 }
 
+export function generateSecureToken(): string {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+export async function stopChildProcess(
+  child: ChildProcess,
+  targetFilePath?: string,
+  gracePeriodMs: number = 1500
+): Promise<void> {
+  // 1. Remove discovery file immediately upon stop request
+  if (targetFilePath && fs.existsSync(targetFilePath)) {
+    try {
+      fs.unlinkSync(targetFilePath);
+    } catch {
+      // Ignore
+    }
+  }
+
+  const isProcessAlive = (): boolean => {
+    if (child.exitCode !== null || child.signalCode !== null) return false;
+    return true;
+  };
+
+  // If child already exited, complete cleanup without sending unnecessary signals
+  if (!isProcessAlive()) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let sigkillTimer: NodeJS.Timeout | null = null;
+    let hardLimitTimer: NodeJS.Timeout | null = null;
+
+    const onExitOrClose = () => {
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (hardLimitTimer) clearTimeout(hardLimitTimer);
+      child.removeListener("exit", onExitOrClose);
+      child.removeListener("close", onExitOrClose);
+      resolve();
+    };
+
+    child.once("exit", onExitOrClose);
+    child.once("close", onExitOrClose);
+
+    // Send SIGTERM when the process is still running
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      if (!isProcessAlive()) {
+        onExitOrClose();
+        return;
+      }
+    }
+
+    // Bounded grace period: escalate to SIGKILL after gracePeriodMs if process has not exited
+    sigkillTimer = setTimeout(() => {
+      if (isProcessAlive()) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Ignore
+        }
+      }
+    }, gracePeriodMs);
+    sigkillTimer.unref();
+
+    // Safety fallback timer
+    hardLimitTimer = setTimeout(() => {
+      onExitOrClose();
+    }, gracePeriodMs + 2000);
+    hardLimitTimer.unref();
+  });
+}
+
 export async function startDisposableOrderService(options?: {
   port?: number;
   token?: string;
   registerPrometheusTarget?: boolean;
 }): Promise<DisposableServiceInstance> {
-  const token = options?.token || `verify_token_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+  const token = options?.token || generateSecureToken();
   const preferredPort = options?.port ?? 0;
 
   // Real Process Isolation: parent process.env is NEVER modified.
@@ -202,37 +276,20 @@ export async function startDisposableOrderService(options?: {
 
   let targetFilePath: string | undefined;
 
-  const cleanupChild = (): void => {
-    if (targetFilePath && fs.existsSync(targetFilePath)) {
-      try {
-        fs.unlinkSync(targetFilePath);
-      } catch {
-        // Ignore
-      }
+  let stopPromise: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (!stopPromise) {
+      stopPromise = stopChildProcess(child, targetFilePath);
     }
-    if (!child.killed) {
-      try {
-        child.kill("SIGTERM");
-        setTimeout(() => {
-          if (!child.killed) {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // Ignore
-            }
-          }
-        }, 1000).unref();
-      } catch {
-        // Ignore
-      }
-    }
+    return stopPromise;
   };
 
   let boundPort: number;
   try {
     boundPort = await new Promise<number>((resolve, reject) => {
+      let resolvedOrRejected = false;
       const timeout = setTimeout(() => {
-        cleanupChild();
+        cleanupListeners();
         reject(new Error("Timeout waiting for disposable order-service child process to start"));
       }, 10000);
 
@@ -243,30 +300,40 @@ export async function startDisposableOrderService(options?: {
         stdoutBuffer += chunk.toString("utf8");
         const match = stdoutBuffer.match(/\[DISPOSABLE_ORDER_SERVICE_PORT:(\d+)\]/);
         if (match) {
-          clearTimeout(timeout);
-          child.stdout?.removeListener("data", onData);
+          cleanupListeners();
           resolve(Number(match[1]));
         }
       };
+
+      const onError = (err: Error) => {
+        cleanupListeners();
+        reject(new Error(`Failed to spawn disposable order-service child process: ${err.message}`));
+      };
+
+      const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        cleanupListeners();
+        const detail = stderrBuffer.trim() ? ` Stderr: ${stderrBuffer.trim()}` : "";
+        reject(new Error(`Disposable order-service child process exited prematurely with code ${code}, signal ${signal}.${detail}`));
+      };
+
+      function cleanupListeners() {
+        if (resolvedOrRejected) return;
+        resolvedOrRejected = true;
+        clearTimeout(timeout);
+        child.stdout?.removeListener("data", onData);
+        child.removeListener("error", onError);
+        child.removeListener("exit", onEarlyExit);
+      }
 
       child.stdout?.on("data", onData);
       child.stderr?.on("data", (chunk: Buffer) => {
         stderrBuffer += chunk.toString("utf8");
       });
-
-      child.once("error", (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn disposable order-service child process: ${err.message}`));
-      });
-
-      child.once("exit", (code, signal) => {
-        clearTimeout(timeout);
-        const detail = stderrBuffer.trim() ? ` Stderr: ${stderrBuffer.trim()}` : "";
-        reject(new Error(`Disposable order-service child process exited prematurely with code ${code}, signal ${signal}.${detail}`));
-      });
+      child.once("error", onError);
+      child.once("exit", onEarlyExit);
     });
   } catch (err) {
-    cleanupChild();
+    await stop();
     throw err;
   }
 
@@ -284,7 +351,6 @@ export async function startDisposableOrderService(options?: {
         {
           targets: [
             `host.docker.internal:${boundPort}`,
-            `127.0.0.1:${boundPort}`,
           ],
           labels: {
             job: "order-service-dynamic",
@@ -298,16 +364,6 @@ export async function startDisposableOrderService(options?: {
       // Non-fatal if directory is readonly
     }
   }
-
-  const stop = async () => {
-    cleanupChild();
-    if (!child.killed) {
-      await new Promise<void>((resolve) => {
-        child.once("exit", () => resolve());
-        setTimeout(resolve, 500);
-      });
-    }
-  };
 
   return {
     process: child,
@@ -531,15 +587,15 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   // 3. Metrics Verification: Path B (Sample-Service -> Prometheus Scrape -> Remote-Write)
   // ---------------------------------------------------------------------------
   console.log("\n--- 3. Metrics Verification (Path B: Sample-Service -> Prometheus Scrape -> Remote-Write) ---");
-  const uniqueRwId = `verify_rw_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+  const uniqueRwId = `verify_rw_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
   report.prometheusRemoteWriteResult.verificationId = uniqueRwId;
 
   let disposableService: DisposableServiceInstance | null = null;
 
   try {
-    const testAuthToken = `verify_test_token_${uniqueRwId}`;
     console.log("  Starting isolated disposable order-service instance with dynamic port allocation...");
-    disposableService = await startDisposableOrderService({ token: testAuthToken });
+    disposableService = await startDisposableOrderService();
+    const testAuthToken = disposableService.token;
     const orderServiceBase = disposableService.baseUrl;
     const orderServicePort = disposableService.port;
     console.log(`  ✓ Disposable order-service bound to isolated port ${disposableService.port}.`);
@@ -698,15 +754,13 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
         // Ignore
       }
     }
-    delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
-    delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
   }
 
   // ---------------------------------------------------------------------------
   // 4. Traces Verification: Strict Tempo Trace Verification
   // ---------------------------------------------------------------------------
   console.log("\n--- 4. Distributed Trace Ingestion Verification (Strict Tempo) ---");
-  const uniqueTraceVerificationId = `verify_trace_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+  const uniqueTraceVerificationId = `verify_trace_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
   report.tracesResult.verificationId = uniqueTraceVerificationId;
 
   const traceResource = resourceFromAttributes({
