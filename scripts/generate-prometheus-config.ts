@@ -64,22 +64,28 @@ export function validateRemoteWriteConfig(env: Record<string, string | undefined
     return { valid: false, reason: `Invalid URL: "${url}" is malformed` };
   }
 
-  // Dedicated write token
-  const writeToken = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN || env.GRAFANA_CLOUD_PROMETHEUS_TOKEN;
+  // Dedicated write token: only GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN authorizes remote-write
+  const writeToken = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN;
   if (!writeToken || writeToken.trim().length === 0) {
+    if (env.GRAFANA_CLOUD_PROMETHEUS_TOKEN && env.GRAFANA_CLOUD_PROMETHEUS_TOKEN.trim().length > 0) {
+      return {
+        valid: false,
+        reason: "URL present with read-only Prometheus token (Read-only query token GRAFANA_CLOUD_PROMETHEUS_TOKEN cannot be used for Prometheus remote-write; dedicated write token GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN required)",
+      };
+    }
     if (env.GRAFANA_CLOUD_INGESTION_TOKEN && env.GRAFANA_CLOUD_INGESTION_TOKEN.trim().length > 0) {
       return {
         valid: false,
-        reason: "URL present with only OTLP ingestion token (OTLP ingestion credentials do not count as Prometheus remote-write credentials)",
+        reason: "URL present with only OTLP ingestion token (OTLP ingestion credentials do not count as Prometheus remote-write credentials; dedicated write token GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN required)",
       };
     }
-    return { valid: false, reason: "URL present but token absent (Dedicated write token required)" };
+    return { valid: false, reason: "URL present but token absent (Dedicated write token GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN required)" };
   }
 
-  // Username
-  const user = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || env.GRAFANA_CLOUD_PROMETHEUS_USER || env.GRAFANA_CLOUD_INSTANCE_ID;
+  // Username: dedicated remote-write user or instance ID (never fall back to read-only query user)
+  const user = env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || env.GRAFANA_CLOUD_INSTANCE_ID;
   if (!user || user.trim().length === 0) {
-    return { valid: false, reason: "Missing username (Remote-write username or instance ID required)" };
+    return { valid: false, reason: "Missing username (Remote-write username GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER or instance ID required)" };
   }
 
   return {
@@ -118,11 +124,11 @@ export function generatePrometheusConfig(options: PrometheusConfigOptions = {}):
 
   const remoteWriteUser = options.remoteWriteUser !== undefined
     ? options.remoteWriteUser
-    : (process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || process.env.GRAFANA_CLOUD_PROMETHEUS_USER || process.env.GRAFANA_CLOUD_INSTANCE_ID);
+    : (process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER || process.env.GRAFANA_CLOUD_INSTANCE_ID);
 
   const remoteWriteToken = options.remoteWriteToken !== undefined
     ? options.remoteWriteToken
-    : (process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN || process.env.GRAFANA_CLOUD_PROMETHEUS_TOKEN);
+    : process.env.GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN;
 
   const lines: string[] = [
     "global:",

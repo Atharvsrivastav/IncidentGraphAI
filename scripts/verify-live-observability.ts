@@ -351,6 +351,10 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   let startedLocalOrderServer: import("http").Server | null = null;
 
   try {
+    const testAuthToken = `verify_test_token_${uniqueRwId}`;
+    process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+    process.env.TEST_METRIC_ENDPOINT_TOKEN = testAuthToken;
+
     const isServiceRunning = await isHttpEndpointReachable(`${orderServiceBase}/health`, 1500);
     if (!isServiceRunning) {
       console.log(`  Starting disposable order-service instance on port ${orderServicePort}...`);
@@ -362,15 +366,18 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
       startedLocalOrderServer = server;
     }
 
-    // Record synthetic metric via actual running sample-service HTTP endpoint
+    // Record synthetic metric via actual running sample-service HTTP endpoint with test authentication
     console.log(`  Emitting synthetic metric to ${orderServiceBase}/test/record-metric with verification_id: ${uniqueRwId}`);
     const postRes = await fetch(`${orderServiceBase}/test/record-metric`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-test-token": testAuthToken,
+      },
       body: JSON.stringify({
         verification_id: uniqueRwId,
         count: 1,
-        status: "synthetic",
+        status: "test_verified",
       }),
     });
 
@@ -446,9 +453,9 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
 
         // Now evaluate remote-write
         if (!hasRemoteWrite) {
-          report.prometheusRemoteWriteResult.status = "NOT_VERIFIED_AWAITING_CONFIG";
-          report.prometheusRemoteWriteResult.details = `Local Prometheus scrape confirmed, but remote-write is not configured: ${rwValidation.reason}. State: Remote-write not configured.`;
-          console.log(`  ℹ [Remote-write not configured] ${rwValidation.reason}.`);
+          report.prometheusRemoteWriteResult.status = "NOT_VERIFIED";
+          report.prometheusRemoteWriteResult.details = `NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: Local Prometheus scrape confirmed, but remote-write is not configured: ${rwValidation.reason}. State: Remote-write not configured.`;
+          console.log(`  ℹ [Remote-write not configured] NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE: ${rwValidation.reason}.`);
         } else {
           console.log("  Querying Grafana Cloud Prometheus to confirm remote-write delivery...");
           const rwQueryStart = Date.now();
@@ -509,6 +516,8 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
         // Ignore
       }
     }
+    delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+    delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
   }
 
   // ---------------------------------------------------------------------------
@@ -628,10 +637,25 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   // ---------------------------------------------------------------------------
   // 5. Verification Summary & Final Status Decision
   // ---------------------------------------------------------------------------
-  // EXPORT_CONFIRMED_QUERY_PENDING or NOT_VERIFIED can NEVER result in overall success!
   const directMetricsPassed = report.directOtlpMetricsResult.status === "PASSED";
   const tracesPassed = report.tracesResult.status === "PASSED";
-  report.overallPassed = directMetricsPassed && tracesPassed;
+  const remoteWritePassed = report.prometheusRemoteWriteResult.status === "PASSED";
+  const remoteWriteConfigured = report.prometheusRemoteWriteResult.remoteWriteConfigured;
+
+  let finalVerdictBadge = "";
+  if (directMetricsPassed && tracesPassed && remoteWritePassed) {
+    report.overallPassed = true;
+    finalVerdictBadge = "🎉 ALL CONFIGURED PIPELINES EXTERNALLY VERIFIED (Paths A, B, and C)";
+  } else if (directMetricsPassed && tracesPassed && !remoteWriteConfigured) {
+    report.overallPassed = false;
+    finalVerdictBadge = "✓ CORE DIRECT OTLP & TEMPO PATHS VERIFIED (Paths A & C) — PROMETHEUS REMOTE-WRITE NOT CONFIGURED";
+  } else if (directMetricsPassed && tracesPassed && remoteWriteConfigured && !remoteWritePassed) {
+    report.overallPassed = false;
+    finalVerdictBadge = "⚠ CORE DIRECT OTLP & TEMPO PATHS VERIFIED (Paths A & C), BUT PROMETHEUS REMOTE-WRITE (PATH B) UNVERIFIED — INTEGRATION INCOMPLETE";
+  } else {
+    report.overallPassed = false;
+    finalVerdictBadge = "✗ LIVE VERIFICATION FAILED OR INCOMPLETE";
+  }
 
   console.log("\n===============================================================================");
   console.log("   LIVE OBSERVABILITY VERIFICATION REPORT");
@@ -648,6 +672,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
 
   console.log("   [PATH B: PROMETHEUS SCRAPE & REMOTE-WRITE INGESTION]");
   console.log(`     Status           : ${report.prometheusRemoteWriteResult.status}`);
+  console.log(`     Metric Name      : ${report.prometheusRemoteWriteResult.metricName}`);
   console.log(`     Verification ID  : ${report.prometheusRemoteWriteResult.verificationId}`);
   console.log(`     Scrape Confirmed : ${report.prometheusRemoteWriteResult.scrapeConfirmed ? "YES" : "NO"}`);
   console.log(`     Remote-Write Cfg : ${report.prometheusRemoteWriteResult.remoteWriteConfigured ? "YES" : "NO"}`);
@@ -672,10 +697,7 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
     // Ignore shutdown error
   }
 
-  const outcomeBadge = report.overallPassed
-    ? "🎉 ALL REQUIRED LIVE TELEMETRY PIPELINES VERIFIED LIVE"
-    : "✗ LIVE VERIFICATION FAILED OR INCOMPLETE";
-  console.log(`   Final Verdict: ${outcomeBadge}`);
+  console.log(`   Final Verdict: ${finalVerdictBadge}`);
   console.log("===============================================================================\n");
 
   return report;

@@ -407,21 +407,31 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     },
   };
 
-  const recordSyntheticMetric = (verificationId: string, count = 1, status = "synthetic") => {
+  const recordSyntheticMetric = (verificationId: string, count = 1, status = "test_verified") => {
+    const VERIFICATION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+    if (!verificationId || !VERIFICATION_ID_REGEX.test(verificationId.trim())) {
+      throw new Error(`Invalid verificationId: must be 8-64 alphanumeric, dash, or underscore characters, got "${verificationId}"`);
+    }
+    if (typeof count !== "number" || !Number.isFinite(count) || count <= 0 || !Number.isInteger(count) || count > 1000) {
+      throw new Error(`Invalid synthetic metric count: ${count}. Must be a finite positive integer between 1 and 1000.`);
+    }
+    const ALLOWED_STATUSES = new Set(["synthetic", "test_verified", "smoke_test"]);
+    const safeStatus = ALLOWED_STATUSES.has(status) ? status : "test_verified";
+
     registry.recordRequest(count, {
       method: "POST",
       route: "/test/synthetic",
       status_code: 200,
-      verification_id: verificationId,
-      status,
+      verification_id: verificationId.trim(),
+      status: safeStatus,
     });
     try {
       rawRequestCounter.add(count, {
         method: "POST",
         route: "/test/synthetic",
         status_code: 200,
-        verification_id: verificationId,
-        status,
+        verification_id: verificationId.trim(),
+        status: safeStatus,
       });
     } catch (err: unknown) {
       log("warn", "OTel counter.add for synthetic metric failed", {

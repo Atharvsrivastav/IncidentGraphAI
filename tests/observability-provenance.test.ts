@@ -3,14 +3,15 @@ import { PrometheusClient } from "@/lib/telemetry/prometheusClient";
 import { JaegerClient } from "@/lib/telemetry/jaegerClient";
 import { TelemetryManager } from "@/lib/telemetry/telemetryManager";
 import { mergeServiceMetrics, ServiceMapItem } from "@/lib/telemetry/mergeServiceMetrics";
-import { ObservedServiceMetric } from "@/lib/telemetry/types";
+import { ObservedServiceMetric, DistributedTrace } from "@/lib/telemetry/types";
 import { PrometheusRegistry, sanitizeErrorMessage } from "../sample-services/shared/telemetry";
+import http from "http";
 import {
   validateRemoteWriteConfig,
   generatePrometheusConfig,
   validateGeneratedYaml,
 } from "../scripts/generate-prometheus-config";
-import { setOrderFault, resetOrderFault, telemetry as orderTelemetry } from "../sample-services/order/server";
+import { setOrderFault, resetOrderFault, telemetry as orderTelemetry, server as orderServer } from "../sample-services/order/server";
 
 describe("Phase 6: Observability Provenance, Failure Handling & Security Verification", () => {
   const originalFetch = global.fetch;
@@ -779,7 +780,6 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       expect(validYaml).toContain("url: \"https://prometheus-prod-10.grafana.net/api/prom/push\"");
       expect(validYaml).toContain("username: \"1871065\"");
 
-      // Check YAML validator
       const validation = validateGeneratedYaml(validYaml);
       expect(validation.valid).toBe(true);
 
@@ -787,6 +787,24 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       const badValidation = validateGeneratedYaml(tabBadYaml);
       expect(badValidation.valid).toBe(false);
       expect(badValidation.error).toContain("tab indentation error");
+    });
+
+    it("rejects read-only Prometheus query token as remote-write credentials", () => {
+      const res = validateRemoteWriteConfig({
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL: "https://prometheus-prod-10.grafana.net/api/prom/push",
+        GRAFANA_CLOUD_PROMETHEUS_TOKEN: "glc_read_only_token_12345",
+        GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER: "1871065",
+      });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("read-only Prometheus token");
+    });
+
+    it("no credentials produces local standalone mode without remote_write block", () => {
+      const standaloneYaml = generatePrometheusConfig({});
+      expect(standaloneYaml).not.toContain("remote_write:");
+      expect(standaloneYaml).toContain("scrape_configs:");
+      const validation = validateGeneratedYaml(standaloneYaml);
+      expect(validation.valid).toBe(true);
     });
   });
 
@@ -1158,6 +1176,471 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       expect(exportStatus.traces).toHaveProperty("status");
       expect(exportStatus.traces).toHaveProperty("successCount");
       expect(exportStatus.traces).toHaveProperty("failureCount");
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.3: Strict Tempo Trace Identifier Validation
+  // =========================================================================
+  describe("Phase 2.3: Strict Tempo Trace Identifier Validation", () => {
+    const client = new JaegerClient("https://tempo-prod.grafana.net", 2000);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const spanId = "00f067aa0ba902b7";
+    const verificationId = "verify_test_trace_12345";
+
+    const createValidTrace = (): DistributedTrace => ({
+      traceId,
+      rootServiceName: "order-service",
+      operationName: "POST /orders",
+      startTime: new Date().toISOString(),
+      durationMs: 45,
+      totalSpans: 1,
+      hasErrors: false,
+      servicesInvolved: ["order-service"],
+      isFallback: false,
+      rootSpan: {
+        spanId,
+        traceId,
+        serviceName: "order-service",
+        operationName: "POST /orders",
+        startTimeUs: Date.now() * 1000,
+        durationMs: 45,
+        statusCode: "OK",
+        attributes: { "verification.id": verificationId },
+        depth: 0,
+        children: [],
+      },
+      allSpans: [
+        {
+          spanId,
+          traceId,
+          serviceName: "order-service",
+          operationName: "POST /orders",
+          startTimeUs: Date.now() * 1000,
+          durationMs: 45,
+          statusCode: "OK",
+          attributes: { "verification.id": verificationId },
+          depth: 0,
+          children: [],
+        },
+      ],
+    });
+
+    it("validates genuine Tempo response with matching root and span IDs", () => {
+      const trace = createValidTrace();
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(true);
+    });
+
+    it("rejects trace missing root trace ID", () => {
+      const trace = createValidTrace();
+      trace.traceId = "";
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Missing root ID");
+    });
+
+    it("rejects trace missing span trace ID", () => {
+      const trace = createValidTrace();
+      trace.allSpans[0].traceId = "";
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Missing span trace ID");
+    });
+
+    it("rejects trace missing span ID", () => {
+      const trace = createValidTrace();
+      trace.allSpans[0].spanId = "";
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Missing span ID");
+    });
+
+    it("rejects trace with wrong root ID", () => {
+      const trace = createValidTrace();
+      trace.traceId = "11112222333344445555666677778888";
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Wrong root ID");
+    });
+
+    it("rejects trace with wrong individual span ID", () => {
+      const trace = createValidTrace();
+      trace.allSpans[0].traceId = "99998888777766665555444433332222";
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Wrong individual span ID");
+    });
+
+    it("rejects trace with conflicting or duplicate span IDs", () => {
+      const trace = createValidTrace();
+      trace.allSpans.push({
+        spanId, // Duplicate spanId
+        traceId,
+        serviceName: "order-service",
+        operationName: "POST /sub",
+        startTimeUs: Date.now() * 1000,
+        durationMs: 10,
+        statusCode: "OK",
+        attributes: {},
+        depth: 1,
+        children: [],
+      });
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("Conflicting span IDs");
+    });
+
+    it("rejects trace with empty spans", () => {
+      const trace = createValidTrace();
+      trace.allSpans = [];
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("no span data");
+    });
+
+    it("rejects trace missing verification attribute", () => {
+      const trace = createValidTrace();
+      trace.allSpans[0].attributes = { unrelated: "foo" };
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("not found in span hierarchy");
+    });
+
+    it("rejects synthesized fallback trace", () => {
+      const trace = createValidTrace();
+      trace.isFallback = true;
+      const res = client.verifyLiveTrace(trace, traceId, verificationId);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain("fallback trace");
+    });
+
+    it("parseTempoTraceDetail in strict mode rejects missing backend span IDs and never manufactures IDs", () => {
+      const rawPayload = {
+        traceID: traceId,
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    // Missing spanId / spanID!
+                    traceId,
+                    name: "HTTP GET",
+                    attributes: [{ key: "verification.id", value: { stringValue: verificationId } }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      // Strict mode: allowFallback = false -> must return null
+      const strictResult = client.parseTempoTraceDetail(rawPayload, traceId, { allowFallback: false });
+      expect(strictResult).toBeNull();
+
+      // Fallback mode: allowFallback = true -> creates fallback span ID for dashboard continuity
+      const fallbackResult = client.parseTempoTraceDetail(rawPayload, traceId, { allowFallback: true });
+      expect(fallbackResult).not.toBeNull();
+      expect(fallbackResult?.allSpans[0].spanId).toBe(traceId.slice(0, 16));
+    });
+
+    it("parseTempoTraceDetail in strict mode rejects conflicting root and batch trace IDs", () => {
+      const conflictingPayload = {
+        traceID: traceId,
+        batches: [
+          {
+            traceID: "different_trace_id_1234567890",
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    spanId,
+                    traceId,
+                    name: "HTTP GET",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const result = client.parseTempoTraceDetail(conflictingPayload, traceId, { allowFallback: false });
+      expect(result).toBeNull();
+    });
+
+    it("parseTempoTraceDetail in strict mode rejects conflicting span trace IDs", () => {
+      const conflictingSpanPayload = {
+        traceID: traceId,
+        batches: [
+          {
+            traceID: traceId,
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    spanId,
+                    traceId: "conflicting_span_trace_id_999",
+                    name: "HTTP GET",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const result = client.parseTempoTraceDetail(conflictingSpanPayload, traceId, { allowFallback: false });
+      expect(result).toBeNull();
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.3: Secure Synthetic Test Metric Endpoint
+  // =========================================================================
+  describe("Phase 2.3: Secure Synthetic Test Metric Endpoint", () => {
+    let testPort: number;
+    let boundServer: http.Server;
+
+    function sendTestRequest(options: {
+      method?: string;
+      path?: string;
+      headers?: Record<string, string>;
+      body?: string;
+    }): Promise<{ status: number; body: Record<string, unknown> | string }> {
+      return new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: testPort,
+            path: options.path || "/test/record-metric",
+            method: options.method || "POST",
+            headers: options.headers || {},
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk) => {
+              data += chunk;
+            });
+            res.on("end", () => {
+              let parsed: Record<string, unknown> | string = data;
+              try {
+                parsed = JSON.parse(data);
+              } catch {
+                // Return string if not JSON
+              }
+              resolve({ status: res.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        req.on("error", reject);
+        if (options.body) req.write(options.body);
+        req.end();
+      });
+    }
+
+    beforeEach(async () => {
+      delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+      delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+      delete process.env.DEPLOYMENT_ENVIRONMENT;
+      (process.env as Record<string, string | undefined>).NODE_ENV = "test";
+
+      boundServer = orderServer;
+      if (!boundServer.listening) {
+        await new Promise<void>((resolve) => {
+          boundServer.listen(0, () => {
+            const addr = boundServer.address();
+            testPort = typeof addr === "object" && addr ? addr.port : 4001;
+            resolve();
+          });
+        });
+      }
+    });
+
+    it("rejects requests with 403 when test endpoint is default-disabled", async () => {
+      delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+      const res = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "any" },
+        body: JSON.stringify({ verification_id: "verify_12345678", count: 1 }),
+      });
+      expect(res.status).toBe(403);
+      expect((res.body as Record<string, unknown>).disabled).toBe(true);
+    });
+
+    it("rejects requests with 403 in production mode even if ENABLE_TEST_METRIC_ENDPOINT is true", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+      const res = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "any" },
+        body: JSON.stringify({ verification_id: "verify_12345678", count: 1 }),
+      });
+      expect(res.status).toBe(403);
+      expect((res.body as Record<string, unknown>).error).toContain("strictly disabled in production mode");
+    });
+
+    it("rejects unauthenticated requests or invalid auth token with 401", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      // Missing token
+      const res1 = await sendTestRequest({
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verification_id: "verify_12345678", count: 1 }),
+      });
+      expect(res1.status).toBe(401);
+      expect((res1.body as Record<string, unknown>).error).toContain("Unauthorized");
+
+      // Invalid token
+      const res2 = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "wrong_token" },
+        body: JSON.stringify({ verification_id: "verify_12345678", count: 1 }),
+      });
+      expect(res2.status).toBe(401);
+      expect((res2.body as Record<string, unknown>).error).toContain("Unauthorized");
+    });
+
+    it("accepts valid authenticated test request and records metric with 200", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      const res = await sendTestRequest({
+        headers: {
+          "Content-Type": "application/json",
+          "x-test-token": "secret_local_token_999",
+        },
+        body: JSON.stringify({
+          verification_id: "verify_valid_token_123",
+          count: 5,
+          status: "test_verified",
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = res.body as Record<string, unknown>;
+      expect(body.success).toBe(true);
+      expect(body.verification_id).toBe("verify_valid_token_123");
+      expect(body.count).toBe(5);
+      expect(body.status).toBe("test_verified");
+
+      // Verify exposed on /metrics
+      const metricsText = orderTelemetry.getPrometheusMetrics();
+      expect(metricsText).toContain('verification_id="verify_valid_token_123"');
+    });
+
+    it("rejects oversized payloads (> 1024 bytes) with 413", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      const hugePayload = JSON.stringify({
+        verification_id: "verify_valid_id_123",
+        count: 1,
+        padding: "X".repeat(2000),
+      });
+
+      const res = await sendTestRequest({
+        headers: {
+          "Content-Type": "application/json",
+          "x-test-token": "secret_local_token_999",
+          "content-length": String(hugePayload.length),
+        },
+        body: hugePayload,
+      });
+
+      expect(res.status).toBe(413);
+      expect((res.body as Record<string, unknown>).error).toContain("Payload too large");
+    });
+
+    it("rejects invalid JSON payloads with 400", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      const res = await sendTestRequest({
+        headers: {
+          "Content-Type": "application/json",
+          "x-test-token": "secret_local_token_999",
+        },
+        body: "{ not valid json ...",
+      });
+
+      expect(res.status).toBe(400);
+      expect((res.body as Record<string, unknown>).error).toContain("Invalid JSON");
+    });
+
+    it("rejects invalid verification_id formats (too short, special chars) with 400", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      // Too short (< 8 chars)
+      const res1 = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_local_token_999" },
+        body: JSON.stringify({ verification_id: "short", count: 1 }),
+      });
+      expect(res1.status).toBe(400);
+
+      // Special characters
+      const res2 = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_local_token_999" },
+        body: JSON.stringify({ verification_id: "bad!@#id_with_symbols", count: 1 }),
+      });
+      expect(res2.status).toBe(400);
+    });
+
+    it("rejects negative, zero, infinite, NaN, and excessive counts with 400", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      const testCounts = [-5, 0, 5000, 1.5];
+      for (const badCount of testCounts) {
+        const res = await sendTestRequest({
+          headers: { "Content-Type": "application/json", "x-test-token": "secret_local_token_999" },
+          body: JSON.stringify({ verification_id: "verify_count_test_1", count: badCount }),
+        });
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it("rejects un-whitelisted status values to bound metric cardinality", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      const res = await sendTestRequest({
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_local_token_999" },
+        body: JSON.stringify({
+          verification_id: "verify_cardinality_1",
+          count: 1,
+          status: "arbitrary_attacker_label_explosion",
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((res.body as Record<string, unknown>).error).toContain("Invalid status");
+    });
+
+    it("handles repeated synthetic metric requests cleanly without crashing", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_local_token_999";
+
+      for (let i = 1; i <= 3; i++) {
+        const res = await sendTestRequest({
+          headers: { "Content-Type": "application/json", "x-test-token": "secret_local_token_999" },
+          body: JSON.stringify({
+            verification_id: "verify_repeated_test",
+            count: 2,
+            status: "test_verified",
+          }),
+        });
+        expect(res.status).toBe(200);
+      }
+    });
+
+    it("recordSyntheticMetric in telemetry throws on invalid verification ID or count", () => {
+      expect(() => orderTelemetry.recordSyntheticMetric("short", 1)).toThrow("Invalid verificationId");
+      expect(() => orderTelemetry.recordSyntheticMetric("verify_valid_123", -1)).toThrow("Invalid synthetic metric count");
+      expect(() => orderTelemetry.recordSyntheticMetric("verify_valid_123", 99999)).toThrow("Invalid synthetic metric count");
     });
   });
 });

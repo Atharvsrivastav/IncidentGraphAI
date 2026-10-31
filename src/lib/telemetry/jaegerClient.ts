@@ -314,28 +314,38 @@ export class JaegerClient {
       return { valid: false, reason: "Backend returned fallback trace; no actual span data exists in backend" };
     }
     if (!trace.traceId || trace.traceId.trim().length === 0) {
-      return { valid: false, reason: "Trace is missing trace ID" };
+      return { valid: false, reason: "Missing root ID: Trace is missing root trace ID" };
     }
     const normTraceId = trace.traceId.toLowerCase().replace(/^0+/, "");
     const normExpectedId = expectedTraceId.toLowerCase().replace(/^0+/, "");
     if (normTraceId !== normExpectedId && trace.traceId.toLowerCase() !== expectedTraceId.toLowerCase()) {
       return {
         valid: false,
-        reason: `Trace ID mismatch: expected ${expectedTraceId}, got ${trace.traceId}`,
+        reason: `Trace ID mismatch (Wrong root ID): expected ${expectedTraceId}, got ${trace.traceId}`,
       };
     }
     if (!trace.allSpans || trace.allSpans.length === 0) {
       return { valid: false, reason: "Trace contains no span data" };
     }
+    const seenSpanIds = new Set<string>();
     for (const span of trace.allSpans) {
-      if (span.traceId) {
-        const spanNorm = span.traceId.toLowerCase().replace(/^0+/, "");
-        if (spanNorm !== normExpectedId && span.traceId.toLowerCase() !== expectedTraceId.toLowerCase()) {
-          return {
-            valid: false,
-            reason: `Span ${span.spanId} trace ID mismatch: expected ${expectedTraceId}, got ${span.traceId}`,
-          };
-        }
+      if (!span.spanId || span.spanId.trim().length === 0) {
+        return { valid: false, reason: "Missing span ID: Span is missing span ID" };
+      }
+      if (seenSpanIds.has(span.spanId)) {
+        return { valid: false, reason: `Conflicting span IDs: duplicate span ID ${span.spanId}` };
+      }
+      seenSpanIds.add(span.spanId);
+
+      if (!span.traceId || span.traceId.trim().length === 0) {
+        return { valid: false, reason: `Missing span trace ID: Span ${span.spanId} is missing trace ID` };
+      }
+      const spanNorm = span.traceId.toLowerCase().replace(/^0+/, "");
+      if (spanNorm !== normExpectedId && span.traceId.toLowerCase() !== expectedTraceId.toLowerCase()) {
+        return {
+          valid: false,
+          reason: `Wrong individual span ID: Span ${span.spanId} trace ID mismatch: expected ${expectedTraceId}, got ${span.traceId}`,
+        };
       }
     }
     const hasAttr = trace.allSpans.some(
@@ -491,15 +501,34 @@ export class JaegerClient {
       services.add(serviceName);
 
       const batchTraceId = batch.traceId || batch.traceID;
+      if (!allowFallback && backendRootTraceId && batchTraceId && backendRootTraceId.toLowerCase() !== batchTraceId.toLowerCase()) {
+        return null;
+      }
 
       for (const scope of batch.scopeSpans || []) {
         for (const rawSpan of scope.spans || []) {
           const rawTraceId = rawSpan.traceId || rawSpan.traceID || batchTraceId || backendRootTraceId;
+          if (!allowFallback && !rawTraceId) {
+            return null;
+          }
+          if (!allowFallback && rawSpan.traceId && backendRootTraceId && rawSpan.traceId.toLowerCase() !== backendRootTraceId.toLowerCase()) {
+            return null;
+          }
+          if (!allowFallback && rawSpan.traceId && batchTraceId && rawSpan.traceId.toLowerCase() !== batchTraceId.toLowerCase()) {
+            return null;
+          }
           if (!firstSpanTraceId && rawTraceId) {
             firstSpanTraceId = rawTraceId;
           }
-          const spanTraceId = rawTraceId || requestedTraceId;
-          const sId = rawSpan.spanId || rawSpan.spanID || requestedTraceId.slice(0, 16);
+          const spanTraceId = rawTraceId || (allowFallback ? requestedTraceId : "");
+          const rawSpanId = rawSpan.spanId || rawSpan.spanID;
+          if (!allowFallback && (!rawSpanId || rawSpanId.trim().length === 0)) {
+            return null;
+          }
+          const sId = rawSpanId || (allowFallback ? requestedTraceId.slice(0, 16) : "");
+          if (!allowFallback && spanMap.has(sId)) {
+            return null;
+          }
           const pId = rawSpan.parentSpanId || rawSpan.parentSpanID || undefined;
           const startMs = rawSpan.startTimeUnixNano ? Number(BigInt(rawSpan.startTimeUnixNano) / BigInt(1e6)) : Date.now();
           const endMs = rawSpan.endTimeUnixNano ? Number(BigInt(rawSpan.endTimeUnixNano) / BigInt(1e6)) : startMs + 10;
@@ -539,7 +568,13 @@ export class JaegerClient {
     // Build hierarchy and assign depths
     this.linkChildrenAndAssignDepths(allSpans, spanMap);
 
-    const actualTraceId = backendRootTraceId || firstSpanTraceId || requestedTraceId;
+    if (!allowFallback && !backendRootTraceId && !firstSpanTraceId) {
+      return null;
+    }
+    const actualTraceId = backendRootTraceId || firstSpanTraceId || (allowFallback ? requestedTraceId : "");
+    if (!allowFallback && (!actualTraceId || actualTraceId.trim().length === 0)) {
+      return null;
+    }
     const rootSpan = allSpans.find((s) => s.depth === 0) || allSpans[0];
     return {
       traceId: actualTraceId,

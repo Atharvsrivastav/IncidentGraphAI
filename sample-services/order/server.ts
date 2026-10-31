@@ -120,30 +120,127 @@ export const server = http.createServer(async (req, res) => {
       }
 
       if (req.method === "POST" && url.pathname === "/test/record-metric") {
+        const isEnabled = process.env.ENABLE_TEST_METRIC_ENDPOINT === "true";
+        const isProduction = process.env.NODE_ENV === "production" || process.env.DEPLOYMENT_ENVIRONMENT === "production";
+        if (!isEnabled || isProduction) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: isProduction
+              ? "Synthetic test metric endpoint is strictly disabled in production mode"
+              : "Synthetic test metric endpoint is disabled by default. Set ENABLE_TEST_METRIC_ENDPOINT=true to enable.",
+            disabled: true,
+          }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Endpoint disabled");
+          return;
+        }
+
+        // Test authentication check
+        const expectedToken = process.env.TEST_METRIC_ENDPOINT_TOKEN || "test-metric-secret-token";
+        const authHeader = req.headers["authorization"];
+        const providedToken = req.headers["x-test-token"] || (authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : undefined);
+        if (!providedToken || providedToken !== expectedToken) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized: Missing or invalid test authentication token" }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Unauthorized test request");
+          return;
+        }
+
+        // Payload size protection: max 1024 bytes
+        const contentLength = Number(req.headers["content-length"]);
+        if (Number.isFinite(contentLength) && contentLength > 1024) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+          return;
+        }
+
         let body = "";
+        let bodyLength = 0;
         for await (const chunk of req) {
+          bodyLength += chunk.length;
+          if (bodyLength > 1024) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
+            telemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+            return;
+          }
           body += chunk;
         }
-        let parsed: { verification_id?: string; count?: number; status?: string } = {};
-        try {
-          if (body) parsed = JSON.parse(body);
-        } catch {
-          // ignore
-        }
-        const verificationId = parsed.verification_id || "verify_manual_" + Date.now();
-        const count = typeof parsed.count === "number" ? parsed.count : 1;
-        const status = parsed.status || "synthetic";
 
-        telemetry.recordSyntheticMetric(verificationId, count, status);
-        telemetry.log("info", "Recorded synthetic test metric via HTTP endpoint", { verificationId, count, status });
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON payload" }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON");
+          return;
+        }
+
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Payload must be a JSON object" }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON object");
+          return;
+        }
+
+        // Verification ID validation: 8-64 alphanumeric, dash, or underscore
+        const verificationId = parsed.verification_id;
+        const VERIFICATION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+        if (typeof verificationId !== "string" || !VERIFICATION_ID_REGEX.test(verificationId.trim())) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Invalid verification_id: must be 8-64 alphanumeric, underscore, or dash characters",
+          }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid verification ID");
+          return;
+        }
+
+        // Count validation: finite positive bounded integer (1-1000)
+        const count = parsed.count;
+        if (
+          typeof count !== "number" ||
+          !Number.isFinite(count) ||
+          Number.isNaN(count) ||
+          count <= 0 ||
+          !Number.isInteger(count) ||
+          count > 1000
+        ) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Invalid count: must be a finite positive integer between 1 and 1000",
+          }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid count");
+          return;
+        }
+
+        // Status validation: bounded allowlist to prevent unbounded metric cardinality
+        const ALLOWED_STATUSES = new Set(["synthetic", "test_verified", "smoke_test"]);
+        const rawStatus = parsed.status;
+        if (rawStatus !== undefined && !ALLOWED_STATUSES.has(String(rawStatus))) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Invalid status: must be one of ['synthetic', 'test_verified', 'smoke_test']",
+          }));
+          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid status");
+          return;
+        }
+        const validatedStatus = (rawStatus as string) || "test_verified";
+
+        telemetry.recordSyntheticMetric(verificationId.trim(), count, validatedStatus);
+        telemetry.log("info", "Recorded synthetic test metric via authenticated HTTP endpoint", {
+          verificationId: verificationId.trim(),
+          count,
+          status: validatedStatus,
+        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
           service: SERVICE_NAME,
-          verification_id: verificationId,
+          verification_id: verificationId.trim(),
           count,
-          status,
+          status: validatedStatus,
         }));
         telemetry.endSpan(span, SpanStatusCode.OK);
         return;

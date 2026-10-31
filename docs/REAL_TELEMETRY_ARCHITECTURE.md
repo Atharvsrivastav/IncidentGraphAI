@@ -395,25 +395,40 @@ npm run test:observability:live
    - Missing credentials report `NOT_VERIFIED_AWAITING_CONFIG`.
    - If remote-write credentials are missing or Prometheus is offline, the report strictly indicates `NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE` without claiming an unverified pass.
 
-### D. Prometheus Remote-Write Configuration & Credential Separation
+### D. Prometheus Remote-Write Configuration & Strict Credential Enforcement (Phase 2.3 Hardened)
 
-- **Dedicated Remote-Write Credentials:**
+- **Dedicated Remote-Write Credentials Only:**
   - `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL`: Dedicated remote-write push URL (e.g. `https://prometheus-prod-XX-prod-ap-south-1.grafana.net/api/prom/push`).
-  - `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER`: Remote-write username / instance ID.
-  - `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN`: Dedicated write token (requires `metrics:write` scope).
-  - **Strict Credential Separation:** OTLP ingestion credentials (`GRAFANA_CLOUD_INGESTION_TOKEN`) do NOT automatically count as Prometheus remote-write credentials. Read credentials (`GRAFANA_CLOUD_PROMETHEUS_TOKEN` with `metrics:read`) remain separate from write credentials.
+  - `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER`: Remote-write username / instance ID (requires `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER` or `GRAFANA_CLOUD_INSTANCE_ID`; never falls back to read-only query user `GRAFANA_CLOUD_PROMETHEUS_USER`).
+  - `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN`: Dedicated write token with `metrics:write` scope.
+  - **Zero Read-Token / OTLP Fallback:** The configuration strictly rejects `GRAFANA_CLOUD_PROMETHEUS_TOKEN` (metrics read token) and `GRAFANA_CLOUD_INGESTION_TOKEN` (OTLP token) from authorizing remote-write.
 - **Docker Compose Integration:**
-  - Supported via `docker-compose.yml` environment block:
-    ```yaml
-    environment:
-      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL
-      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER
-      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN
-    ```
+  - In `docker-compose.yml`, Prometheus entrypoint injects remote-write only when `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL` and `GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN` are explicitly set.
+  - Read credentials and query tokens are completely excluded from the Prometheus container environment.
   - When omitted, Prometheus operates safely in local standalone scrape mode without cloud credentials.
   - Dynamic configuration generation tool: `npx tsx scripts/generate-prometheus-config.ts`.
 
-### E. Service Health Gauge Semantics & Fault Cycles
+### E. Secure Synthetic Test Metric Endpoint
+
+- **Gated Access (`POST /test/record-metric` on `order-service`):**
+  - **Default Disabled:** Disabled by default unless `ENABLE_TEST_METRIC_ENDPOINT="true"`.
+  - **Production Guard:** Strictly forbidden and returns HTTP 403 if `NODE_ENV === "production"` or `DEPLOYMENT_ENVIRONMENT === "production"`.
+  - **Authentication Required:** Requires `x-test-token` or `Authorization: Bearer <token>` matching `TEST_METRIC_ENDPOINT_TOKEN`.
+  - **Payload Ceilings:** Rejects payloads exceeding 1024 bytes (HTTP 413) and malformed JSON (HTTP 400).
+  - **Identifier & Count Bounds:** Validates `verification_id` format (`^[a-zA-Z0-9_-]{8,64}$`) and requires `count` to be a finite positive integer between 1 and 1000.
+  - **Cardinality Protection:** Caller cannot supply arbitrary label/status values; status is strictly restricted to an allowlist (`['synthetic', 'test_verified', 'smoke_test']`).
+- **Disposable Verification Lifecycle:** The verification runner enables this endpoint only for its disposable test service and cleans up environment variables and processes upon completion.
+
+### F. Strict Tempo Identifier Validation
+
+- **Backend Trace ID & Span ID Preservation:**
+  - When `allowFallback: false` (strict live verification), `parseTempoTraceDetail()` never substitutes caller-requested trace IDs for missing backend IDs.
+  - Never manufactures synthetic span IDs from requested trace IDs.
+  - Rejects missing span IDs, missing span trace IDs, and conflicting root, batch, or span identifiers.
+  - Rejects duplicate span IDs within a trace.
+- **Independent Live Verification:** `verifyLiveTrace()` requires genuine backend spans, exact matching root trace ID and individual span trace IDs, at least one real span, and the exact `verification.id` attribute.
+
+### G. Service Health Gauge Semantics & Fault Cycles
 
 In `sample-services/shared/telemetry.ts`:
 - **Correct Gauge Values:**
@@ -424,10 +439,19 @@ In `sample-services/shared/telemetry.ts`:
 - **Exposition Format:** Exposes `service_health_status` with `# HELP service_health_status Health status of the service (1=healthy, 0.5=degraded, 0=down)`.
 - **Fault Injection Cycles:** Verified across normal operation (1), fault-injected degraded state (0.5), severe outage (0), and service restoration (1).
 
-### F. Signal-Separated Export Tracking
+### H. Signal-Separated Export Tracking
 
 - Metric and trace export outcomes are tracked independently via `SignalExportStatus`:
   - `metrics: SignalExportStatus` (tracks metric exporter outcomes, counts, errors, and timestamps)
   - `traces: SignalExportStatus` (tracks trace exporter outcomes, counts, errors, and timestamps)
 - Exporters never overwrite each other's status or error details.
 - Error messages are sanitized via `sanitizeErrorMessage()` to redact `Bearer` tokens, `Basic` tokens, `glc_` keys, and passwords before logging or storing.
+
+### I. Current External Verification Status & Remaining Blockers
+
+IncidentGraph AI distinguishes between deterministic local/CI test suites and genuine external cloud verification:
+1. **Local Test Suites (100% Passing):** All 254 unit and integration tests across 11 suites pass locally and in GitHub Actions CI with zero external secrets.
+2. **Path A (Direct OTLP Metrics):** Reported as passed when external PromQL read-back confirms the synthetic metric in Grafana Cloud Mimir.
+3. **Path B (Prometheus Remote-Write):** Currently reported as **`NOT VERIFIED — CREDENTIALS/BACKEND UNAVAILABLE`** because Docker Prometheus is not running and remote-write credentials are unset in local environment. This is an external environment blocker until dedicated remote-write credentials and a running Prometheus instance are provisioned.
+4. **Path C (Tempo Distributed Traces):** Currently reported as **`NOT VERIFIED`** pending Tempo block storage propagation and trace indexing. Fallback traces are strictly rejected in live verification.
+5. **Simulation Provenance:** In Simulation Mode, the application truthfully reports `provenance: "DISABLED"` with details `"Simulation mode active. Live network telemetry probes are disabled."`. `MOCK_EMULATION` is only assigned when mock observability servers (`x-observability-provider: mock-observability-server`) are active during local testing.
