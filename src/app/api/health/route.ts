@@ -53,15 +53,12 @@ export async function GET() {
   const dbProvider = dbUrl.startsWith("postgres://") || dbUrl.startsWith("postgresql://")
     ? "postgresql"
     : "sqlite";
-  const isIsolated = Boolean(
+  const isExplicitIsolatedMode =
     process.env.E2E_ISOLATED === "1" ||
-    process.env.E2E_ISOLATED === "true" ||
-    dbUrl.toLowerCase().includes("e2e") ||
-    dbUrl.toLowerCase().includes("isolated") ||
-    dbUrl.toLowerCase().includes("test") ||
-    dbUrl.toLowerCase().includes("tmp") ||
-    dbUrl.toLowerCase().includes("temp")
-  );
+    process.env.E2E_ISOLATED === "true";
+  const isStrictDisposableDb =
+    /e2e-(?:isolated|ci)-[a-zA-Z0-9_\-]+\.db(?:[?#]|$)/i.test(dbUrl);
+  const isIsolated = Boolean(isExplicitIsolatedMode && isStrictDisposableDb);
 
   return NextResponse.json(
     {

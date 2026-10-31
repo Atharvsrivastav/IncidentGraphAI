@@ -5,6 +5,15 @@ import crypto from 'crypto';
 import net from 'net';
 
 /**
+ * Computes SHA-256 hash of a file if it exists.
+ */
+function computeFileHash(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const content = fs.readFileSync(filePath);
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/**
  * Checks whether a given TCP port is open / available.
  */
 function isPortAvailable(port) {
@@ -31,24 +40,102 @@ async function findAvailablePort(preferredPort = 3000) {
 }
 
 /**
- * Cross-platform process tree termination.
+ * Checks if a process with given PID is still alive.
  */
-function killProcessTree(pid) {
-  if (!pid) return;
+function isProcessAlive(pid) {
   try {
-    if (process.platform === 'win32') {
-      execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
-    } else {
-      execSync(`pkill -P ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
-      process.kill(pid, 'SIGKILL');
-    }
-  } catch {
-    // Process already terminated
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM'; // If EPERM, process exists; if ESRCH, process is dead
   }
 }
 
 /**
- * Clean up disposable database files with retry for Windows file locks.
+ * Cross-platform process tree termination and verification.
+ */
+async function killProcessTree(pid, port) {
+  if (!pid) return true;
+  const isWindows = process.platform === 'win32';
+
+  try {
+    if (isWindows) {
+      try {
+        execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
+      } catch {
+        // May already be stopped
+      }
+    } else {
+      // On POSIX, terminate the dedicated process group (-pid), fallback to direct kill
+      try {
+        process.kill(-pid, 'SIGTERM');
+      } catch {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {
+          // Process group already dead
+        }
+      }
+      try {
+        execSync(`pkill -TERM -P ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
+      } catch {
+        // Ignored
+      }
+    }
+  } catch {
+    // Signal errors ignored
+  }
+
+  // Verify process has actually stopped
+  let stopped = false;
+  for (let i = 0; i < 20; i++) {
+    let alive = false;
+    try {
+      alive = isProcessAlive(pid);
+    } catch {
+      alive = false;
+    }
+
+    if (!alive) {
+      stopped = true;
+      break;
+    }
+
+    // Escalate to SIGKILL if still alive after initial wait
+    if (i >= 5) {
+      if (isWindows) {
+        try { execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' }); } catch {}
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
+        try { execSync(`pkill -KILL -P ${pid} 2>/dev/null || true`, { stdio: 'ignore' }); } catch {}
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  // Also verify port is released
+  let portReleased = false;
+  if (port) {
+    for (let i = 0; i < 15; i++) {
+      if (await isPortAvailable(port)) {
+        portReleased = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  } else {
+    portReleased = true;
+  }
+
+  return stopped && portReleased;
+}
+
+/**
+ * Clean up disposable database files with retry for file locks.
+ * Returns an array of any files that could NOT be deleted.
  */
 function cleanupDisposableDb(dbPath) {
   const patterns = [
@@ -60,18 +147,20 @@ function cleanupDisposableDb(dbPath) {
 
   for (const file of patterns) {
     if (fs.existsSync(file)) {
-      for (let attempt = 0; attempt < 10; attempt++) {
+      for (let attempt = 0; attempt < 15; attempt++) {
         try {
           fs.unlinkSync(file);
           break;
         } catch {
-          // Brief backoff to allow OS to release file handle
           const end = Date.now() + 150;
           while (Date.now() < end) { /* busy wait */ }
         }
       }
     }
   }
+
+  // Return any surviving artifacts
+  return patterns.filter((f) => fs.existsSync(f));
 }
 
 async function main() {
@@ -83,41 +172,55 @@ async function main() {
   const prismaDir = path.resolve(cwd, 'prisma');
   const devDbPath = path.resolve(prismaDir, 'dev.db');
 
-  // Record dev.db pre-test stats if present
+  // 1. Record developer DB baseline stats and SHA-256 hash if present
   let devDbBefore = null;
   if (fs.existsSync(devDbPath)) {
     const stat = fs.statSync(devDbPath);
-    devDbBefore = { size: stat.size, mtime: stat.mtimeMs };
-    console.log(`[Developer DB Guard] Detected dev.db (${stat.size} bytes, modified ${stat.mtime.toISOString()})`);
+    const hash = computeFileHash(devDbPath);
+    devDbBefore = { size: stat.size, mtime: stat.mtimeMs, hash };
+    console.log(`[Developer DB Guard] Recorded baseline: size=${stat.size} bytes, modified=${stat.mtime.toISOString()}`);
+    console.log(`  SHA-256: ${hash}`);
   }
 
-  // 1. Check if an external server is already provided and isolated
+  // 2. If BASE_URL is externally supplied, strictly verify or reject
   if (process.env.BASE_URL) {
+    let healthData = null;
     try {
       const res = await fetch(`${process.env.BASE_URL}/api/health`);
       if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'healthy' && data.database?.isIsolated) {
-          console.log(`[Runner] Detected running isolated server at ${process.env.BASE_URL}`);
-          console.log(`  Database Provider: ${data.database.provider}, Services: ${data.database.servicesCount}`);
-          console.log('[Runner] Executing browser E2E test suite against existing isolated server...');
-
-          const testProc = spawn('node', ['tests/browser-e2e.mjs'], {
-            stdio: 'inherit',
-            shell: true,
-            env: { ...process.env, E2E_ISOLATED: '1' },
-          });
-
-          const code = await new Promise((resolve) => testProc.on('exit', resolve));
-          process.exit(code ?? 1);
-        }
+        healthData = await res.json();
       }
-    } catch {
-      // External server not running or not reachable; proceed to spawn dedicated isolated environment
+    } catch (err) {
+      console.error(`❌ [External Server Rejection] Cannot connect to supplied BASE_URL at ${process.env.BASE_URL}/api/health: ${err.message}`);
+      process.exit(1);
     }
+
+    if (!healthData || healthData.status !== 'healthy' || !healthData.database?.isIsolated) {
+      console.error(
+        `❌ [External Server Rejection] Target BASE_URL (${process.env.BASE_URL}) is not a verified isolated server.\n` +
+        `  Reported status: ${healthData?.status || 'unreachable'}\n` +
+        `  isIsolated:      ${Boolean(healthData?.database?.isIsolated)}\n` +
+        `  Services count:  ${healthData?.database?.servicesCount ?? 'unknown'}\n` +
+        `Destructive automated browser testing against unverified or non-isolated servers is prohibited.`
+      );
+      process.exit(1);
+    }
+
+    console.log(`[Runner] Detected verified isolated server at ${process.env.BASE_URL}`);
+    console.log(`  Database Provider: ${healthData.database.provider}, Services: ${healthData.database.servicesCount}, isIsolated: true`);
+    console.log('[Runner] Executing browser E2E test suite against existing isolated server...');
+
+    const testProc = spawn('node', ['tests/browser-e2e.mjs'], {
+      stdio: 'inherit',
+      shell: true,
+      env: { ...process.env, E2E_ISOLATED: '1' },
+    });
+
+    const code = await new Promise((resolve) => testProc.on('exit', resolve));
+    process.exit(code ?? 1);
   }
 
-  // 2. Generate unique disposable SQLite database
+  // 3. Generate unique disposable SQLite database adhering to strict naming convention: e2e-isolated-*
   const uniqueId = `e2e-isolated-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dbFileName = `${uniqueId}.db`;
   const dbFilePath = path.join(prismaDir, dbFileName);
@@ -128,10 +231,23 @@ async function main() {
   console.log(`  Prisma URL:  ${databaseUrl}`);
 
   let serverProcess = null;
+  let targetPort = null;
   let testExitCode = 1;
 
+  // Setup signal handlers for interrupted execution
+  const handleSignal = async (signal) => {
+    console.log(`\n[Runner] Received ${signal}. Forcing graceful cleanup...`);
+    if (serverProcess?.pid) {
+      await killProcessTree(serverProcess.pid, targetPort);
+    }
+    cleanupDisposableDb(dbFilePath);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.on('SIGINT', () => handleSignal('SIGINT'));
+  process.on('SIGTERM', () => handleSignal('SIGTERM'));
+
   try {
-    // 3. Push schema to isolated database
+    // 4. Push schema to isolated database
     console.log('[Isolated DB] Applying Prisma schema (db push)...');
     execSync('npx prisma db push --skip-generate', {
       cwd,
@@ -143,7 +259,7 @@ async function main() {
     });
     console.log('  ✓ Prisma schema successfully applied to disposable database');
 
-    // 4. Seed isolated database with 7 services and dependencies
+    // 5. Seed isolated database with 7 services and dependencies
     console.log('[Isolated DB] Seeding base topology and dependencies...');
     execSync('npx tsx src/lib/db/seed.ts', {
       cwd,
@@ -155,15 +271,17 @@ async function main() {
     });
     console.log('  ✓ Disposable database seeded (7 services, 8 dependencies, IDLE simulation state)');
 
-    // 5. Select port and start production Next.js server
+    // 6. Select port and start production Next.js server
     const preferredPort = parseInt(process.env.PORT || '3000', 10);
-    const targetPort = await findAvailablePort(preferredPort);
+    targetPort = await findAvailablePort(preferredPort);
     const targetBaseUrl = `http://localhost:${targetPort}`;
 
+    const isWindows = process.platform === 'win32';
     console.log(`[Next.js Server] Starting production server on port ${targetPort}...`);
     serverProcess = spawn('npx', ['next', 'start', '-p', String(targetPort)], {
       cwd,
       shell: true,
+      detached: !isWindows, // Creates dedicated process group on POSIX
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
@@ -175,6 +293,10 @@ async function main() {
       },
     });
 
+    serverProcess.on('error', (err) => {
+      console.error('❌ [Next.js Server Process Error]:', err);
+    });
+
     serverProcess.stdout?.on('data', (d) => {
       const msg = d.toString();
       if (process.env.DEBUG_SERVER) console.log(`[server stdout] ${msg.trim()}`);
@@ -184,7 +306,7 @@ async function main() {
       if (process.env.DEBUG_SERVER) console.error(`[server stderr] ${msg.trim()}`);
     });
 
-    // 6. Wait for health check confirmation
+    // 7. Wait for health check confirmation with strict isolation verification
     console.log(`[Health Polling] Waiting for server at ${targetBaseUrl}/api/health...`);
     let isHealthy = false;
     let lastError = null;
@@ -194,7 +316,7 @@ async function main() {
         const res = await fetch(`${targetBaseUrl}/api/health`);
         if (res.ok) {
           const data = await res.json();
-          if (data.status === 'healthy' && data.database?.servicesCount === 7) {
+          if (data.status === 'healthy' && data.database?.servicesCount === 7 && data.database?.isIsolated) {
             console.log(`  ✓ Server is ready and healthy on attempt ${attempt} (${data.database.servicesCount} services, isolated=${data.database.isIsolated})`);
             isHealthy = true;
             break;
@@ -207,10 +329,10 @@ async function main() {
     }
 
     if (!isHealthy) {
-      throw new Error(`Production server failed to become healthy within 30s: ${lastError || 'Unknown timeout'}`);
+      throw new Error(`Production server failed to become healthy and isolated within 30s: ${lastError || 'Unknown timeout'}`);
     }
 
-    // 7. Execute Browser E2E Test Suite
+    // 8. Execute Browser E2E Test Suite
     console.log(`\n[Browser E2E] Launching browser test runner against ${targetBaseUrl}...`);
     const testProc = spawn('node', ['tests/browser-e2e.mjs'], {
       cwd,
@@ -233,30 +355,64 @@ async function main() {
     });
 
   } finally {
-    // 8. Stop the server and kill all child processes
+    // 9. Stop the server and verify process termination and port release
     if (serverProcess && serverProcess.pid) {
-      console.log(`\n[Cleanup] Shutting down Next.js server (PID: ${serverProcess.pid})...`);
-      killProcessTree(serverProcess.pid);
-      await new Promise((r) => setTimeout(r, 600));
-    }
-
-    // 9. Clean up temporary database files
-    console.log(`[Cleanup] Removing disposable database: ${dbFileName}`);
-    cleanupDisposableDb(dbFilePath);
-
-    if (!fs.existsSync(dbFilePath)) {
-      console.log(`  ✓ Disposable database ${dbFileName} successfully deleted.`);
-    } else {
-      console.warn(`  ⚠️ Warning: disposable database file still exists at ${dbFilePath}`);
-    }
-
-    // 10. Verify developer database remained untouched
-    if (devDbBefore && fs.existsSync(devDbPath)) {
-      const statAfter = fs.statSync(devDbPath);
-      if (statAfter.size === devDbBefore.size && statAfter.mtimeMs === devDbBefore.mtime) {
-        console.log('  ✓ Developer database (prisma/dev.db) verified 100% UNTOUCHED (size & timestamp identical)');
+      console.log(`\n[Cleanup] Shutting down Next.js server (PID: ${serverProcess.pid}, Port: ${targetPort})...`);
+      const killedCleanly = await killProcessTree(serverProcess.pid, targetPort);
+      if (killedCleanly) {
+        console.log(`  ✓ Next.js server process tree (PID: ${serverProcess.pid}) and port ${targetPort} verified cleanly stopped.`);
       } else {
-        console.warn('  ⚠️ Developer database stat changed during test execution!');
+        console.error(`❌ [Server Cleanup Failure] Next.js server or child processes may still be running (PID: ${serverProcess.pid})!`);
+        if (testExitCode === 0) testExitCode = 1;
+      }
+    }
+
+    // 10. Clean up temporary database files and make any remaining file fatal
+    console.log(`[Cleanup] Removing disposable database: ${dbFileName}`);
+    const remainingFiles = cleanupDisposableDb(dbFilePath);
+
+    if (remainingFiles.length === 0) {
+      console.log(`  ✓ Disposable database ${dbFileName} and all journal/WAL/SHM artifacts successfully deleted.`);
+    } else {
+      console.error(
+        `❌ [Fatal Cleanup Failure] Disposable database artifacts remain after cleanup retries:\n` +
+        `  ${remainingFiles.join('\n  ')}\n` +
+        `Failing test runner due to database cleanup invariant violation.`
+      );
+      if (testExitCode === 0) {
+        testExitCode = 1;
+      }
+    }
+
+    // 11. Verify developer database remained 100% untouched (hash, size, mtime)
+    if (devDbBefore) {
+      if (!fs.existsSync(devDbPath)) {
+        console.error('❌ [Developer DB Integrity Violation] dev.db was deleted during test execution!');
+        if (testExitCode === 0) testExitCode = 1;
+      } else {
+        const statAfter = fs.statSync(devDbPath);
+        const hashAfter = computeFileHash(devDbPath);
+        let violation = false;
+
+        if (hashAfter !== devDbBefore.hash) {
+          console.error(`❌ [Developer DB Integrity Violation] dev.db SHA-256 hash changed!\n  Before: ${devDbBefore.hash}\n  After:  ${hashAfter}`);
+          violation = true;
+        }
+        if (statAfter.size !== devDbBefore.size) {
+          console.error(`❌ [Developer DB Integrity Violation] dev.db file size changed!\n  Before: ${devDbBefore.size} bytes\n  After:  ${statAfter.size} bytes`);
+          violation = true;
+        }
+        if (statAfter.mtimeMs !== devDbBefore.mtime) {
+          console.error(`❌ [Developer DB Integrity Violation] dev.db modification timestamp changed!\n  Before: ${devDbBefore.mtime}\n  After:  ${statAfter.mtimeMs}`);
+          violation = true;
+        }
+
+        if (violation) {
+          console.error('❌ Developer database was modified during testing. Failing runner.');
+          if (testExitCode === 0) testExitCode = 1;
+        } else {
+          console.log(`  ✓ Developer database (prisma/dev.db) verified 100% UNTOUCHED (hash: ${hashAfter})`);
+        }
       }
     }
 
