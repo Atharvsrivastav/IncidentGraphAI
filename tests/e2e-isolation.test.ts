@@ -570,6 +570,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       let runnerPort: number | null = null;
       let browserPid: number | null = null;
       let workerPid: number | null = null;
+      let stdoutOutput = "";
       let stderrOutput = "";
 
       try {
@@ -602,6 +603,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
 
           runnerChild.stdout?.on("data", (data) => {
             const str = data.toString();
+            stdoutOutput += str;
             const dbMatch = str.match(/Target path:\s*(.+)/);
             if (dbMatch) runnerDbPath = dbMatch[1].trim();
             const portMatch = str.match(/Starting server on port (\d+)/);
@@ -617,7 +619,8 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
           });
 
           runnerChild.stderr?.on("data", (d) => {
-            stderrOutput += d.toString();
+            const str = d.toString();
+            stderrOutput += str;
           });
 
           runnerChild.on("exit", (code) => {
@@ -638,6 +641,10 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         expect(runnerDbPath).not.toBeNull();
         expect(fs.existsSync(runnerDbPath!)).toBe(true);
 
+        const exitPromise = new Promise<number | null>((resolve) => {
+          runnerChild.on("exit", (code) => resolve(code));
+        });
+
         // Trigger real SIGINT interruption: on Windows use IPC/stdin, on POSIX send SIGINT signal
         if (isWin) {
           runnerChild.send("SIGINT");
@@ -645,9 +652,10 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
           runnerChild.kill("SIGINT");
         }
 
-        const exitCode = await new Promise((resolve) => {
-          runnerChild.on("exit", (code) => resolve(code));
-        });
+        const exitCode = await exitPromise;
+        if (exitCode !== 130) {
+          console.error(`[TEST 15 FAILED] exitCode=${exitCode}\nSTDOUT:\n${stdoutOutput}\nSTDERR:\n${stderrOutput}`);
+        }
 
         // Verify exit code 130
         expect(exitCode).toBe(130);
@@ -705,6 +713,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
       let runnerPort: number | null = null;
       let browserPid: number | null = null;
       let workerPid: number | null = null;
+      let stdoutOutput = "";
       let stderrOutput = "";
 
       try {
@@ -737,6 +746,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
 
           runnerChild.stdout?.on("data", (data) => {
             const str = data.toString();
+            stdoutOutput += str;
             const dbMatch = str.match(/Target path:\s*(.+)/);
             if (dbMatch) runnerDbPath = dbMatch[1].trim();
             const portMatch = str.match(/Starting server on port (\d+)/);
@@ -752,7 +762,8 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
           });
 
           runnerChild.stderr?.on("data", (d) => {
-            stderrOutput += d.toString();
+            const str = d.toString();
+            stderrOutput += str;
           });
 
           runnerChild.on("exit", (code) => {
@@ -773,6 +784,10 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         expect(runnerDbPath).not.toBeNull();
         expect(fs.existsSync(runnerDbPath!)).toBe(true);
 
+        const exitPromise = new Promise<number | null>((resolve) => {
+          runnerChild.on("exit", (code) => resolve(code));
+        });
+
         // Trigger SIGTERM
         if (isWin) {
           runnerChild.send("SIGTERM");
@@ -780,9 +795,10 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
           runnerChild.kill("SIGTERM");
         }
 
-        const exitCode = await new Promise((resolve) => {
-          runnerChild.on("exit", (code) => resolve(code));
-        });
+        const exitCode = await exitPromise;
+        if (exitCode !== 143) {
+          console.error(`[TEST 16 FAILED] exitCode=${exitCode}\nSTDOUT:\n${stdoutOutput}\nSTDERR:\n${stderrOutput}`);
+        }
 
         // Verify exit code 143
         expect(exitCode).toBe(143);

@@ -433,7 +433,7 @@ export class RunnerLifecycle {
 
     // If runner teardown intentionally initiated termination of the browser process tree,
     // do not classify the signal kill or null exit code as a natural test failure.
-    if (this.browserTestTerminating || this.teardownRunning || this.teardownCompleted) {
+    if (this.signalReceived || this.browserTestTerminating || this.teardownRunning || this.teardownCompleted) {
       return;
     }
 
@@ -478,6 +478,20 @@ export class RunnerLifecycle {
    * @returns {Promise<number>}
    */
   async performTeardown({ signal = null, error = null, testCode = null } = {}) {
+    if (signal && !this.signalReceived) {
+      this.signalReceived = signal;
+      console.log(`\n[Runner] Handling signal ${signal}...`);
+    }
+
+    if (testCode !== null && testCode !== undefined && this.testExitCode === null) {
+      this.testExitCode = testCode;
+    }
+
+    if (error) {
+      console.error('\n❌ Error encountered during runner execution:', error);
+      this.recordTeardownFailure();
+    }
+
     if (this.teardownCompleted) {
       return this.resolveFinalExitCode();
     }
@@ -491,21 +505,6 @@ export class RunnerLifecycle {
     this.state = 'TEARDOWN';
 
     try {
-      if (signal && !this.signalReceived) {
-        this.signalReceived = signal;
-        console.log(`\n[Runner] Handling signal ${signal}...`);
-      }
-
-      if (testCode !== null && testCode !== undefined && this.testExitCode === null) {
-        this.testExitCode = testCode;
-      }
-
-      if (error) {
-        console.error('\n❌ Error encountered during runner execution:', error);
-        if (this.testExitCode === null || this.testExitCode === 0) {
-          this.testExitCode = 1;
-        }
-      }
 
       // 1. Terminate Browser Test process tree first (record termination intent before sending signals)
       if (this.browserTestProcess && this.browserTestProcess.pid) {

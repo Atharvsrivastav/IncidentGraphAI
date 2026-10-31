@@ -259,7 +259,7 @@ async function main() {
     });
     runner.browserTestProcess.on('error', (err) => {
       console.error('Failed to spawn browser test child process:', err);
-      if (!runner.browserTestTerminating && !runner.teardownRunning && !runner.teardownCompleted) {
+      if (!runner.signalReceived && !runner.browserTestTerminating && !runner.teardownRunning && !runner.teardownCompleted) {
         runner.testExitCode = 1;
       }
       resolve();
