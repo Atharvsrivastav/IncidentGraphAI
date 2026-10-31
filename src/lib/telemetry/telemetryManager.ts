@@ -99,6 +99,10 @@ export class TelemetryManager {
     return this.lastIngestedAt;
   }
 
+  public getLastVerifiedAt(): string | null {
+    return this.lastVerifiedAt;
+  }
+
   public async getBackendHealth(forceProbe: boolean = false): Promise<BackendHealthStatus> {
     if (!forceProbe && this.cachedObservation && Date.now() - this.cachedObservation.timestamp < 3000) {
       return this.cachedObservation.data.backendHealth;

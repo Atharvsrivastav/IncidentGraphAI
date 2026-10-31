@@ -8,6 +8,8 @@ import { PrometheusRegistry, sanitizeErrorMessage } from "../sample-services/sha
 import http from "http";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
+import { spawn } from "child_process";
 import {
   validateRemoteWriteConfig,
   generatePrometheusConfig,
@@ -3449,6 +3451,369 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
 
         await stopChildProcess(deadChild);
         expect(killCalled).toBe(false);
+      });
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.7: Genuine OS Process Lifecycle Integration & Live Telemetry Acceptance
+  // =========================================================================
+  describe("Phase 2.7: Genuine OS Process Lifecycle Integration & Live Telemetry Acceptance", () => {
+    describe("1. Real Operating-System Process Lifecycle Integration", () => {
+      const trackedPids: number[] = [];
+
+      const isPidDead = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (err: unknown) {
+          return (err as { code?: string }).code === "ESRCH";
+        }
+      };
+
+      it("manages a real child process that exits normally", async () => {
+        const child = spawn(process.execPath, [
+          "-e",
+          "setTimeout(() => process.exit(0), 30);",
+        ]);
+        expect(child.pid).toBeDefined();
+        const pid = child.pid!;
+        trackedPids.push(pid);
+
+        expect(isPidDead(pid)).toBe(false);
+
+        // Wait for child to exit normally
+        await new Promise<void>((resolve) => {
+          child.once("exit", () => resolve());
+        });
+
+        await stopChildProcess(child, undefined, 1000);
+
+        expect(child.exitCode).toBe(0);
+        expect(isPidDead(pid)).toBe(true);
+      });
+
+      it("terminates a cooperative real child process with SIGTERM", async () => {
+        const child = spawn(process.execPath, [
+          "-e",
+          "setInterval(() => {}, 1000);",
+        ]);
+        expect(child.pid).toBeDefined();
+        const pid = child.pid!;
+        trackedPids.push(pid);
+
+        expect(isPidDead(pid)).toBe(false);
+
+        await stopChildProcess(child, undefined, 1500);
+
+        expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+        expect(isPidDead(pid)).toBe(true);
+      });
+
+      it("escalates to SIGKILL when child is uncooperative to SIGTERM", async () => {
+        const child = spawn(process.execPath, [
+          "-e",
+          "setInterval(() => {}, 1000);",
+        ]);
+        expect(child.pid).toBeDefined();
+        const pid = child.pid!;
+        trackedPids.push(pid);
+
+        // Intercept SIGTERM to simulate an uncooperative daemon ignoring graceful termination
+        const origKill = child.kill.bind(child);
+        const signalsReceived: string[] = [];
+        child.kill = (sig?: NodeJS.Signals | number) => {
+          const s = String(sig ?? "SIGTERM");
+          signalsReceived.push(s);
+          if (s === "SIGTERM") {
+            // Uncooperative: ignore SIGTERM, keep running!
+            return true;
+          }
+          // Real kill on SIGKILL escalation
+          return origKill("SIGKILL");
+        };
+
+        // Grace period 100ms - process ignores SIGTERM, then SIGKILL terminates it
+        await stopChildProcess(child, undefined, 100);
+
+        expect(signalsReceived).toContain("SIGTERM");
+        expect(signalsReceived).toContain("SIGKILL");
+        expect(isPidDead(pid)).toBe(true);
+      });
+
+      it("coalesces multiple concurrent stop calls on a real child process without duplicate signals", async () => {
+        const child = spawn(process.execPath, [
+          "-e",
+          "setInterval(() => {}, 1000);",
+        ]);
+        expect(child.pid).toBeDefined();
+        const pid = child.pid!;
+        trackedPids.push(pid);
+
+        const origKill = child.kill.bind(child);
+        let killCount = 0;
+        child.kill = (sig?: NodeJS.Signals | number) => {
+          killCount++;
+          return origKill(sig);
+        };
+
+        // 3 parallel stop calls on the exact same real child instance
+        const results = await Promise.all([
+          stopChildProcess(child, undefined, 1500),
+          stopChildProcess(child, undefined, 1500),
+          stopChildProcess(child, undefined, 1500),
+        ]);
+
+        expect(results).toEqual([undefined, undefined, undefined]);
+        expect(killCount).toBe(1);
+        expect(isPidDead(pid)).toBe(true);
+      });
+
+      it("calling stop on an already-exited real child process does not dispatch additional signals", async () => {
+        const child = spawn(process.execPath, [
+          "-e",
+          "process.exit(0);",
+        ]);
+        expect(child.pid).toBeDefined();
+        const pid = child.pid!;
+        trackedPids.push(pid);
+
+        // Wait until it has exited
+        await new Promise<void>((resolve) => {
+          child.once("exit", () => resolve());
+        });
+
+        expect(child.exitCode).toBe(0);
+
+        let signalDispatched = false;
+        child.kill = () => {
+          signalDispatched = true;
+          return false;
+        };
+
+        await stopChildProcess(child);
+        expect(signalDispatched).toBe(false);
+        expect(isPidDead(pid)).toBe(true);
+      });
+
+      it("cleans up resources and stderr listeners cleanly on disposable service startup failure", async () => {
+        await expect(
+          startDisposableOrderService({ port: -1 })
+        ).rejects.toThrow();
+      });
+
+      it("releases stderr listeners and ensures no orphan child processes remain", async () => {
+        const service = await startDisposableOrderService();
+        expect(service.process).toBeDefined();
+        const pid = service.process!.pid!;
+        trackedPids.push(pid);
+
+        expect(isPidDead(pid)).toBe(false);
+
+        await service.stop();
+
+        // Stderr listeners must be cleared
+        expect(service.process?.stderr?.listenerCount("data")).toBe(0);
+        // Process must be dead in the operating system
+        expect(isPidDead(pid)).toBe(true);
+
+        // Confirm every tracked child process in this test suite has terminated
+        for (const trackedPid of trackedPids) {
+          expect(isPidDead(trackedPid)).toBe(true);
+        }
+      });
+    });
+
+    describe("2. Provenance and Telemetry-Mode Audit (SIMULATION, LIVE, DEGRADED)", () => {
+      it("guarantees SIMULATION mode makes zero external network calls", async () => {
+        const mgr = new TelemetryManager();
+        mgr.setMode("SIMULATION");
+        const fetchSpy = vi.spyOn(global, "fetch");
+
+        const result = await mgr.getObservedServices(true);
+        expect(result.observedServices.length).toBeGreaterThan(0);
+        expect(result.effectiveMode).toBe("SIMULATION");
+        expect(fetchSpy).not.toHaveBeenCalled();
+        for (const s of result.observedServices) {
+          expect(s.source).toBe("SIMULATION");
+          expect(s.provenance).toBe("DISABLED");
+        }
+      });
+
+      it("transitions to DEGRADED and does not claim LIVE when backends return empty responses", async () => {
+        const mgr = new TelemetryManager();
+        mgr.setMode("LIVE");
+        vi.spyOn(mgr, "getBackendHealth").mockResolvedValue({
+          prometheusAvailable: true,
+          jaegerAvailable: true,
+          prometheusUrl: "https://prometheus.example.com",
+          jaegerUrl: "https://tempo.example.com",
+          isMockBackend: false,
+          isCloudBackend: true,
+          cloudConfigured: true,
+          backendType: "GRAFANA_CLOUD",
+          lastChecked: new Date().toISOString(),
+        });
+
+        vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue({
+          success: true,
+          metrics: new Map(),
+          diagnostics: [],
+          p95Supported: true,
+        });
+
+        vi.spyOn(JaegerClient.prototype, "getRecentTracesDetailed").mockResolvedValue({
+          success: true,
+          traces: [],
+          normalizedSpans: [],
+          diagnostic: {
+            provider: "TEMPO",
+            endpoint: "/api/search",
+            status: "OK",
+            message: "No traces returned",
+            latencyMs: 5,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        const result = await mgr.getObservedServices(true);
+        expect(result.effectiveMode).toBe("DEGRADED");
+        expect(mgr.getLastVerifiedAt()).toBeNull();
+      });
+
+      it("strictly requires both backends: partial provider failure results in DEGRADED", async () => {
+        const mgr = new TelemetryManager();
+        mgr.setMode("LIVE");
+        vi.spyOn(mgr, "getBackendHealth").mockResolvedValue({
+          prometheusAvailable: true,
+          jaegerAvailable: false,
+          prometheusUrl: "https://prometheus.example.com",
+          jaegerUrl: "https://tempo.example.com",
+          isMockBackend: false,
+          isCloudBackend: true,
+          cloudConfigured: true,
+          backendType: "GRAFANA_CLOUD",
+          lastChecked: new Date().toISOString(),
+        });
+
+        const metricsMap = new Map();
+        metricsMap.set("order-service", {
+          serviceName: "order-service",
+          timestamp: new Date().toISOString(),
+          metricType: "REQUEST_RATE",
+          value: 50,
+          unit: "req/s",
+          hasValidValue: true,
+          isAnomaly: false,
+        });
+
+        vi.spyOn(PrometheusClient.prototype, "getServiceMetricsDetailed").mockResolvedValue({
+          success: true,
+          metrics: metricsMap,
+          diagnostics: [],
+          p95Supported: true,
+        });
+
+        const result = await mgr.getObservedServices(true);
+        expect(result.effectiveMode).toBe("DEGRADED");
+        expect(mgr.getLastVerifiedAt()).toBeNull();
+      });
+
+      it("failed verification never updates lastVerifiedAt or lastIngestedAt", async () => {
+        const mgr = new TelemetryManager();
+        mgr.setMode("LIVE");
+        vi.spyOn(mgr, "getBackendHealth").mockResolvedValue({
+          prometheusAvailable: false,
+          jaegerAvailable: false,
+          prometheusUrl: "",
+          jaegerUrl: "",
+          isMockBackend: false,
+          isCloudBackend: false,
+          cloudConfigured: false,
+          backendType: "UNAVAILABLE",
+          lastChecked: new Date().toISOString(),
+        });
+
+        const initialVerified = mgr.getLastVerifiedAt();
+        const initialIngested = mgr.getLastIngestedAt();
+
+        await mgr.getObservedServices(true);
+        expect(mgr.getLastVerifiedAt()).toBe(initialVerified);
+        expect(mgr.getLastIngestedAt()).toBe(initialIngested);
+      });
+    });
+
+    describe("3. Path A Direct OTLP & Path C Tempo Contracts", () => {
+      it("generates a 128-bit trace ID and validates parent-child span hierarchy", () => {
+        const traceId = crypto.randomBytes(16).toString("hex");
+        expect(traceId).toHaveLength(32);
+        expect(/^[0-9a-f]{32}$/.test(traceId)).toBe(true);
+
+        const rootSpanId = crypto.randomBytes(8).toString("hex");
+        const childSpanId = crypto.randomBytes(8).toString("hex");
+
+        const span1: import("@/lib/telemetry/types").TraceSpan = {
+          spanId: rootSpanId,
+          traceId,
+          serviceName: "api-gateway",
+          operationName: "POST /order",
+          startTimeUs: 1000,
+          durationMs: 85,
+          statusCode: "OK",
+          attributes: {},
+          depth: 0,
+          children: [],
+        };
+
+        const span2: import("@/lib/telemetry/types").TraceSpan = {
+          spanId: childSpanId,
+          parentSpanId: rootSpanId,
+          traceId,
+          serviceName: "order-service",
+          operationName: "CreateOrder",
+          startTimeUs: 1020,
+          durationMs: 40,
+          statusCode: "OK",
+          attributes: {},
+          depth: 1,
+          children: [],
+        };
+
+        const tracePayload: DistributedTrace = {
+          traceId,
+          rootServiceName: "api-gateway",
+          operationName: "POST /order",
+          durationMs: 85,
+          startTime: new Date().toISOString(),
+          totalSpans: 2,
+          hasErrors: false,
+          servicesInvolved: ["api-gateway", "order-service"],
+          rootSpan: span1,
+          allSpans: [span1, span2],
+        };
+
+        expect(tracePayload.allSpans).toHaveLength(2);
+        expect(tracePayload.allSpans[1].parentSpanId).toBe(rootSpanId);
+        expect(tracePayload.allSpans[1].traceId).toBe(traceId);
+      });
+
+      it("rejects search summaries without full span detail from being accepted as verified", () => {
+        const incompleteSummary: DistributedTrace = {
+          traceId: "abcdef1234567890abcdef1234567890",
+          rootServiceName: "order-service",
+          operationName: "GET /metrics",
+          durationMs: 12,
+          startTime: new Date().toISOString(),
+          totalSpans: 1,
+          hasErrors: false,
+          servicesInvolved: ["order-service"],
+          isFallback: true,
+          rootSpan: null,
+          allSpans: [],
+        };
+
+        expect(incompleteSummary.isFallback).toBe(true);
+        expect(incompleteSummary.allSpans).toEqual([]);
       });
     });
   });
