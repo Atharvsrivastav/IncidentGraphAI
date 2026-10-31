@@ -517,13 +517,14 @@ export class RunnerLifecycle {
 
       // 1. Terminate Browser Test process tree first (record termination intent before sending signals)
       if (this.browserTestProcess && this.browserTestProcess.pid) {
+        const browserPid = this.browserTestProcess.pid;
         this.browserTestTerminating = true;
-        console.log(`\n[Cleanup] Terminating Browser Test process tree (PID: ${this.browserTestProcess.pid})...`);
-        const browserKilled = await killProcessTree(this.browserTestProcess.pid);
+        console.log(`\n[Cleanup] Terminating Browser Test process tree (PID: ${browserPid})...`);
+        const browserKilled = await killProcessTree(browserPid);
         if (browserKilled) {
-          console.log(`  ✓ Browser Test process tree (PID: ${this.browserTestProcess.pid}) cleanly stopped.`);
+          console.log(`  ✓ Browser Test process tree (PID: ${browserPid}) cleanly stopped.`);
         } else {
-          console.error(`❌ [Browser Cleanup Failure] Browser Test process tree (PID: ${this.browserTestProcess.pid}) could not be fully stopped!`);
+          console.error(`❌ [Browser Cleanup Failure] Browser Test process tree (PID: ${browserPid}) could not be fully stopped!`);
           this.recordTeardownFailure();
         }
         this.browserTestProcess = null;
@@ -531,12 +532,13 @@ export class RunnerLifecycle {
 
       // 2. Terminate Server process tree and release port
       if (this.serverProcess && this.serverProcess.pid) {
-        console.log(`[Cleanup] Shutting down Next.js server (PID: ${this.serverProcess.pid}, Port: ${this.targetPort})...`);
-        const serverKilled = await killProcessTree(this.serverProcess.pid, this.targetPort);
+        const serverPid = this.serverProcess.pid;
+        console.log(`[Cleanup] Shutting down Next.js server (PID: ${serverPid}, Port: ${this.targetPort})...`);
+        const serverKilled = await killProcessTree(serverPid, this.targetPort);
         if (serverKilled) {
-          console.log(`  ✓ Next.js server process tree (PID: ${this.serverProcess.pid}) and port ${this.targetPort} verified cleanly stopped.`);
+          console.log(`  ✓ Next.js server process tree (PID: ${serverPid}) and port ${this.targetPort} verified cleanly stopped.`);
         } else {
-          console.error(`❌ [Server Cleanup Failure] Next.js server process or port still active (PID: ${this.serverProcess.pid})!`);
+          console.error(`❌ [Server Cleanup Failure] Next.js server process or port still active (PID: ${serverPid})!`);
           this.recordTeardownFailure();
         }
         this.serverProcess = null;
