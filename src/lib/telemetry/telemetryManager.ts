@@ -147,7 +147,7 @@ export class TelemetryManager {
     } else if (isMock) {
       provenance = "MOCK_EMULATION";
     } else if (!promHealth.available && !jaegerHealth.available) {
-      provenance = cloudConfigured ? "ERROR" : "DISABLED";
+      provenance = (cloudConfigured || isCloud || this.requestedMode === "LIVE") ? "ERROR" : "DISABLED";
     } else if (!promHealth.available || !jaegerHealth.available) {
       provenance = "ERROR";
     } else if (isCloud && !isMock) {
