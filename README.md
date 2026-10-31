@@ -7,7 +7,7 @@
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Instrumented-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Grafana Cloud](https://img.shields.io/badge/Grafana%20Cloud-Mimir%20%26%20Tempo-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Neon Database](https://img.shields.io/badge/Neon-PostgreSQL%20Serverless-00E599?logo=postgresql&logoColor=white)](https://neon.tech/)
-[![Tests](https://img.shields.io/badge/Vitest-280%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Vitest-300%20Passed-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Benchmark](https://img.shields.io/badge/Benchmark-117%2F117%20Passed-blueviolet)](docs/ROOT_CAUSE_BENCHMARK.md)
 [![Recruiter Demo](https://img.shields.io/badge/Recruiter%20Demo-3%20Min%20Walkthrough-success)](docs/RECRUITER_DEMO.md)
 

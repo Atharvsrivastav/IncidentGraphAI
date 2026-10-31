@@ -1,7 +1,16 @@
 import http from "http";
+import crypto from "crypto";
 import { initServiceTelemetry } from "../shared/telemetry";
 import { SamplePostgresClient } from "../shared/database";
 import { SpanStatusCode, context } from "@opentelemetry/api";
+
+function safeTokenEquals(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 const PORT = Number(process.env.SAMPLE_ORDER_PORT) || 4001;
 const INVENTORY_URL = process.env.SAMPLE_INVENTORY_URL || `http://localhost:${process.env.SAMPLE_INVENTORY_PORT || 4003}`;
@@ -30,15 +39,16 @@ export function resetOrderFault() {
   telemetry.setHealthStatus(1);
 }
 
-export const server = http.createServer(async (req, res) => {
-  const start = performance.now();
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
-  const carrier: Record<string, string> = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === "string") carrier[key] = value;
-  }
+export function createOrderServer(activeTelemetry = telemetry): http.Server {
+  return http.createServer(async (req, res) => {
+    const start = performance.now();
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const carrier: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === "string") carrier[key] = value;
+    }
 
-  const { span, ctx } = telemetry.startSpan(`HTTP ${req.method} ${url.pathname}`, carrier);
+    const { span, ctx } = activeTelemetry.startSpan(`HTTP ${req.method} ${url.pathname}`, carrier);
 
   await context.with(ctx, async () => {
     try {
@@ -134,14 +144,25 @@ export const server = http.createServer(async (req, res) => {
           return;
         }
 
-        // Test authentication check
-        const expectedToken = process.env.TEST_METRIC_ENDPOINT_TOKEN || "test-metric-secret-token";
+        // Test authentication check - fail closed if token is absent or empty
+        const configuredToken = process.env.TEST_METRIC_ENDPOINT_TOKEN?.trim();
+        if (!configuredToken) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Authentication not configured: TEST_METRIC_ENDPOINT_TOKEN environment variable must be set to a non-empty secret token",
+            misconfigured: true,
+          }));
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Authentication not configured");
+          return;
+        }
+
         const authHeader = req.headers["authorization"];
-        const providedToken = req.headers["x-test-token"] || (authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : undefined);
-        if (!providedToken || providedToken !== expectedToken) {
+        const rawProvided = req.headers["x-test-token"] || (typeof authHeader === "string" && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : undefined);
+        const providedToken = typeof rawProvided === "string" ? rawProvided.trim() : "";
+        if (!providedToken || !safeTokenEquals(providedToken, configuredToken)) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Unauthorized: Missing or invalid test authentication token" }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Unauthorized test request");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Unauthorized test request");
           return;
         }
 
@@ -150,7 +171,7 @@ export const server = http.createServer(async (req, res) => {
         if (Number.isFinite(contentLength) && contentLength > 1024) {
           res.writeHead(413, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
           return;
         }
 
@@ -161,7 +182,7 @@ export const server = http.createServer(async (req, res) => {
           if (bodyLength > 1024) {
             res.writeHead(413, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Payload too large: Maximum 1024 bytes allowed" }));
-            telemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Payload too large");
             return;
           }
           body += chunk;
@@ -173,14 +194,14 @@ export const server = http.createServer(async (req, res) => {
         } catch {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Invalid JSON payload" }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON");
           return;
         }
 
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Payload must be a JSON object" }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON object");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid JSON object");
           return;
         }
 
@@ -192,7 +213,7 @@ export const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({
             error: "Invalid verification_id: must be 8-64 alphanumeric, underscore, or dash characters",
           }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid verification ID");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid verification ID");
           return;
         }
 
@@ -210,7 +231,7 @@ export const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({
             error: "Invalid count: must be a finite positive integer between 1 and 1000",
           }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid count");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid count");
           return;
         }
 
@@ -222,13 +243,28 @@ export const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({
             error: "Invalid status: must be one of ['synthetic', 'test_verified', 'smoke_test']",
           }));
-          telemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid status");
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Invalid status");
           return;
         }
         const validatedStatus = (rawStatus as string) || "test_verified";
 
-        telemetry.recordSyntheticMetric(verificationId.trim(), count, validatedStatus);
-        telemetry.log("info", "Recorded synthetic test metric via authenticated HTTP endpoint", {
+        try {
+          activeTelemetry.recordSyntheticMetric(verificationId.trim(), count, validatedStatus);
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (errMsg.includes("cardinality ceiling")) {
+            res.writeHead(429, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: errMsg,
+              ceiling: 100,
+            }));
+            activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Cardinality ceiling reached");
+            return;
+          }
+          throw err;
+        }
+
+        activeTelemetry.log("info", "Recorded synthetic test metric via authenticated HTTP endpoint", {
           verificationId: verificationId.trim(),
           count,
           status: validatedStatus,
@@ -242,40 +278,109 @@ export const server = http.createServer(async (req, res) => {
           count,
           status: validatedStatus,
         }));
-        telemetry.endSpan(span, SpanStatusCode.OK);
+        activeTelemetry.endSpan(span, SpanStatusCode.OK);
+        return;
+      }
+
+      if ((req.method === "DELETE" && url.pathname === "/test/record-metric") ||
+          ((req.method === "POST" || req.method === "DELETE") && url.pathname === "/test/cleanup-metric")) {
+        const isEnabled = process.env.ENABLE_TEST_METRIC_ENDPOINT === "true";
+        const isProduction = process.env.NODE_ENV === "production" || process.env.DEPLOYMENT_ENVIRONMENT === "production";
+        if (!isEnabled || isProduction) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: isProduction
+              ? "Synthetic test metric endpoint is strictly disabled in production mode"
+              : "Synthetic test metric endpoint is disabled by default. Set ENABLE_TEST_METRIC_ENDPOINT=true to enable.",
+            disabled: true,
+          }));
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Endpoint disabled");
+          return;
+        }
+
+        const configuredToken = process.env.TEST_METRIC_ENDPOINT_TOKEN?.trim();
+        if (!configuredToken) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Authentication not configured: TEST_METRIC_ENDPOINT_TOKEN environment variable must be set to a non-empty secret token",
+            misconfigured: true,
+          }));
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Authentication not configured");
+          return;
+        }
+
+        const authHeader = req.headers["authorization"];
+        const rawProvided = req.headers["x-test-token"] || (typeof authHeader === "string" && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : undefined);
+        const providedToken = typeof rawProvided === "string" ? rawProvided.trim() : "";
+        if (!providedToken || !safeTokenEquals(providedToken, configuredToken)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized: Missing or invalid test authentication token" }));
+          activeTelemetry.endSpan(span, SpanStatusCode.ERROR, "Unauthorized test request");
+          return;
+        }
+
+        let body = "";
+        for await (const chunk of req) {
+          body += chunk;
+        }
+        let parsedBody: Record<string, unknown> = {};
+        if (body.trim().length > 0) {
+          try {
+            parsedBody = JSON.parse(body);
+          } catch {
+            // Ignore parse error on optional body
+          }
+        }
+
+        const targetId = url.searchParams.get("verification_id") ||
+          (typeof parsedBody.verification_id === "string" ? parsedBody.verification_id.trim() : undefined);
+
+        if (targetId) {
+          const removed = activeTelemetry.clearSyntheticVerificationId(targetId);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, removed, verification_id: targetId }));
+        } else {
+          activeTelemetry.clearSyntheticVerificationIds();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, clearedAll: true }));
+        }
+        activeTelemetry.endSpan(span, SpanStatusCode.OK);
         return;
       }
 
       if (url.pathname === "/metrics") {
-        telemetry.handleMetricsRequest(res);
-        telemetry.endSpan(span, SpanStatusCode.OK);
+        activeTelemetry.handleMetricsRequest(res);
+        activeTelemetry.endSpan(span, SpanStatusCode.OK);
         return;
       }
 
       if (url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "HEALTHY", service: SERVICE_NAME }));
-        telemetry.endSpan(span, SpanStatusCode.OK);
+        activeTelemetry.endSpan(span, SpanStatusCode.OK);
         return;
       }
 
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Route not found" }));
-      telemetry.endSpan(span, SpanStatusCode.OK);
+      activeTelemetry.endSpan(span, SpanStatusCode.OK);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      telemetry.errorCounter.add(1, { service: SERVICE_NAME, status: "500" });
-      telemetry.log("error", `Order creation failed: ${msg}`, { error: msg });
-      telemetry.endSpan(span, SpanStatusCode.ERROR, msg);
+      activeTelemetry.errorCounter.add(1, { service: SERVICE_NAME, status: "500" });
+      activeTelemetry.log("error", `Order creation failed: ${msg}`, { error: msg });
+      activeTelemetry.endSpan(span, SpanStatusCode.ERROR, msg);
 
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: msg }));
     } finally {
       const durationSec = (performance.now() - start) / 1000;
-      telemetry.durationHistogram.record(durationSec, { service: SERVICE_NAME });
+      activeTelemetry.durationHistogram.record(durationSec, { service: SERVICE_NAME });
     }
+    });
   });
-});
+}
+
+export const server = createOrderServer();
 
 if (require.main === module) {
   server.listen(PORT, () => {

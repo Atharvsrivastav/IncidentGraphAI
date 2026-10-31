@@ -11,7 +11,14 @@ import {
   generatePrometheusConfig,
   validateGeneratedYaml,
 } from "../scripts/generate-prometheus-config";
-import { setOrderFault, resetOrderFault, telemetry as orderTelemetry, server as orderServer } from "../sample-services/order/server";
+import {
+  setOrderFault,
+  resetOrderFault,
+  telemetry as orderTelemetry,
+  server as orderServer,
+} from "../sample-services/order/server";
+import { startDisposableOrderService } from "../scripts/verify-live-observability";
+import YAML from "yaml";
 
 describe("Phase 6: Observability Provenance, Failure Handling & Security Verification", () => {
   const originalFetch = global.fetch;
@@ -1641,6 +1648,710 @@ describe("Phase 6: Observability Provenance, Failure Handling & Security Verific
       expect(() => orderTelemetry.recordSyntheticMetric("short", 1)).toThrow("Invalid verificationId");
       expect(() => orderTelemetry.recordSyntheticMetric("verify_valid_123", -1)).toThrow("Invalid synthetic metric count");
       expect(() => orderTelemetry.recordSyntheticMetric("verify_valid_123", 99999)).toThrow("Invalid synthetic metric count");
+    });
+  });
+
+  // =========================================================================
+  // Phase 2.4 Regression Test Suites
+  // =========================================================================
+
+  // 1. Strict Tempo Backend Identity Validation
+  describe("Phase 2.4: Strict Tempo Backend Identity Validation", () => {
+    it("fails strict verification when top-level backend root trace ID is missing with otherwise valid spans", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadMissingRoot = {
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "00f067aa0ba902b7",
+                    name: "HTTP GET /orders",
+                    startTimeUnixNano: "1000000000",
+                    endTimeUnixNano: "1050000000",
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadMissingRoot,
+        text: async () => JSON.stringify(payloadMissingRoot),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+
+      const fallbackRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: true });
+      expect(fallbackRes).not.toBeNull();
+      expect(fallbackRes?.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+    });
+
+    it("fails strict verification when individual span trace ID is missing while batch and root IDs exist", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadMissingSpanTraceId = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    spanId: "00f067aa0ba902b7",
+                    name: "HTTP GET /orders",
+                    startTimeUnixNano: "1000000000",
+                    endTimeUnixNano: "1050000000",
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadMissingSpanTraceId,
+        text: async () => JSON.stringify(payloadMissingSpanTraceId),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("fails strict verification when individual span trace ID is missing while only root ID exists", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadMissingSpanTraceIdNoBatch = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    spanId: "00f067aa0ba902b7",
+                    name: "HTTP GET /orders",
+                    startTimeUnixNano: "1000000000",
+                    endTimeUnixNano: "1050000000",
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadMissingSpanTraceIdNoBatch,
+        text: async () => JSON.stringify(payloadMissingSpanTraceIdNoBatch),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("fails strict verification on conflicting traceId and traceID spellings", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const conflictingSpellings = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        traceID: "different_trace_id_value_12345",
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "00f067aa0ba902b7",
+                    name: "HTTP GET /orders",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => conflictingSpellings,
+        text: async () => JSON.stringify(conflictingSpellings),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("fails strict verification on missing span ID", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadMissingSpanId = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    name: "HTTP GET /orders",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadMissingSpanId,
+        text: async () => JSON.stringify(payloadMissingSpanId),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("fails strict verification on duplicate span IDs", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadDuplicateSpanId = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "duplicate_span_01",
+                    name: "HTTP GET /orders",
+                  },
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "duplicate_span_01",
+                    name: "SELECT orders",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadDuplicateSpanId,
+        text: async () => JSON.stringify(payloadDuplicateSpanId),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("fails strict verification when root ID does not match span trace ID or requested ID", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const payloadMismatchedTraceId = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "wrong_span_trace_id_9999",
+                    spanId: "span_01",
+                    name: "HTTP GET /orders",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payloadMismatchedTraceId,
+        text: async () => JSON.stringify(payloadMismatchedTraceId),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).toBeNull();
+    });
+
+    it("accepts valid backend payload with all genuine identifiers in strict mode", async () => {
+      const client = new JaegerClient("https://tempo-test.invalid", 1000);
+      const validPayload = {
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        batches: [
+          {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "order-service" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "span_01",
+                    name: "HTTP GET /orders",
+                    startTimeUnixNano: "1700000000000000000",
+                    endTimeUnixNano: "1700000000100000000",
+                    status: { code: 1 },
+                  },
+                  {
+                    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                    spanId: "span_02",
+                    name: "SELECT orders",
+                    startTimeUnixNano: "1700000000020000000",
+                    endTimeUnixNano: "1700000000080000000",
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => validPayload,
+        text: async () => JSON.stringify(validPayload),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).not.toBeNull();
+      expect(strictRes?.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+      expect(strictRes?.allSpans.length).toBe(2);
+      expect(strictRes?.allSpans[0].spanId).toBe("span_01");
+      expect(strictRes?.allSpans[1].spanId).toBe("span_02");
+    });
+
+    it("strictly verifies Jaeger-style trace payloads", async () => {
+      const client = new JaegerClient("https://jaeger-test.invalid", 1000);
+      const validJaeger = {
+        data: [
+          {
+            traceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans: [
+              {
+                traceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+                spanID: "j_span_1",
+                operationName: "order.create",
+                startTime: 1700000000000,
+                duration: 50000,
+                processID: "p1",
+                tags: [],
+              },
+            ],
+            processes: {
+              p1: { serviceName: "order-service" },
+            },
+          },
+        ],
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => validJaeger,
+        text: async () => JSON.stringify(validJaeger),
+      } as unknown as Response);
+
+      const strictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(strictRes).not.toBeNull();
+      expect(strictRes?.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+
+      const dupSpanJaeger = {
+        data: [
+          {
+            traceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans: [
+              { traceID: "4bf92f3577b34da6a3ce929d0e0e4736", spanID: "dup_span", operationName: "op1", tags: [] },
+              { traceID: "4bf92f3577b34da6a3ce929d0e0e4736", spanID: "dup_span", operationName: "op2", tags: [] },
+            ],
+            processes: { p1: { serviceName: "order-service" } },
+          },
+        ],
+      };
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => dupSpanJaeger,
+        text: async () => JSON.stringify(dupSpanJaeger),
+      } as unknown as Response);
+
+      const dupStrictRes = await client.getTraceById("4bf92f3577b34da6a3ce929d0e0e4736", { allowFallback: false });
+      expect(dupStrictRes).toBeNull();
+    });
+  });
+
+  // 2. Order Service Test Endpoint Authentication & Zero Default Token
+  describe("Phase 2.4: Order Service Test Endpoint Authentication & Zero Default Token", () => {
+    let boundServer: http.Server;
+    let testPort = 4001;
+
+    const sendReq = (options: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+      path?: string;
+    }): Promise<{ status: number; body: unknown }> => {
+      return new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: testPort,
+            path: options.path || "/test/record-metric",
+            method: options.method || "POST",
+            headers: options.headers || {},
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk) => {
+              data += chunk;
+            });
+            res.on("end", () => {
+              try {
+                resolve({ status: res.statusCode || 500, body: data ? JSON.parse(data) : {} });
+              } catch {
+                resolve({ status: res.statusCode || 500, body: data });
+              }
+            });
+          }
+        );
+        req.on("error", reject);
+        if (options.body) req.write(options.body);
+        req.end();
+      });
+    };
+
+    beforeEach(async () => {
+      delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+      delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+      delete process.env.DEPLOYMENT_ENVIRONMENT;
+      (process.env as Record<string, string | undefined>).NODE_ENV = "test";
+
+      boundServer = orderServer;
+      if (!boundServer.listening) {
+        await new Promise<void>((resolve) => {
+          boundServer.listen(0, () => {
+            const addr = boundServer.address();
+            testPort = typeof addr === "object" && addr ? addr.port : 4001;
+            resolve();
+          });
+        });
+      } else {
+        const addr = boundServer.address();
+        testPort = typeof addr === "object" && addr ? addr.port : 4001;
+      }
+    });
+
+    it("fails closed with 500 when endpoint is enabled but authentication token is absent", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+
+      const res = await sendReq({
+        headers: { "Content-Type": "application/json", "x-test-token": "any_token" },
+        body: JSON.stringify({ verification_id: "verify_no_token_123", count: 1 }),
+      });
+      expect(res.status).toBe(500);
+      expect((res.body as Record<string, unknown>).misconfigured).toBe(true);
+      expect((res.body as Record<string, unknown>).error).toContain("Authentication not configured");
+    });
+
+    it("fails closed with 500 when endpoint is enabled with empty token", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "   ";
+
+      const res = await sendReq({
+        headers: { "Content-Type": "application/json", "x-test-token": "any_token" },
+        body: JSON.stringify({ verification_id: "verify_empty_token_123", count: 1 }),
+      });
+      expect(res.status).toBe(500);
+      expect((res.body as Record<string, unknown>).misconfigured).toBe(true);
+    });
+
+    it("rejects the old hardcoded default token when another token is configured", async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "unpredictable_secret_token_abc123";
+
+      const res = await sendReq({
+        headers: { "Content-Type": "application/json", "x-test-token": "test-metric-secret-token" },
+        body: JSON.stringify({ verification_id: "verify_default_pw_test", count: 1 }),
+      });
+      expect(res.status).toBe(401);
+      expect((res.body as Record<string, unknown>).error).toContain("Unauthorized");
+    });
+  });
+
+  // 3. Metric Cardinality Ceiling & Cleanup Protection
+  describe("Phase 2.4: Metric Cardinality Ceiling & Cleanup Protection", () => {
+    let boundServer: http.Server;
+    let testPort = 4001;
+
+    const sendReq = (options: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+      path?: string;
+    }): Promise<{ status: number; body: unknown }> => {
+      const headers = { ...(options.headers || {}) };
+      if (options.body && !headers["Content-Length"] && !headers["content-length"]) {
+        headers["Content-Length"] = String(Buffer.byteLength(options.body));
+      }
+      return new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: testPort,
+            path: options.path || "/test/record-metric",
+            method: options.method || "POST",
+            headers,
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk) => {
+              data += chunk;
+            });
+            res.on("end", () => {
+              try {
+                resolve({ status: res.statusCode || 500, body: data ? JSON.parse(data) : {} });
+              } catch {
+                resolve({ status: res.statusCode || 500, body: data });
+              }
+            });
+          }
+        );
+        req.on("error", reject);
+        if (options.body) req.write(options.body);
+        req.end();
+      });
+    };
+
+    beforeEach(async () => {
+      process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+      process.env.TEST_METRIC_ENDPOINT_TOKEN = "secret_ceiling_token_123";
+      (process.env as Record<string, string | undefined>).NODE_ENV = "test";
+      orderTelemetry.clearSyntheticVerificationIds();
+
+      boundServer = orderServer;
+      if (!boundServer.listening) {
+        await new Promise<void>((resolve) => {
+          boundServer.listen(0, () => {
+            const addr = boundServer.address();
+            testPort = typeof addr === "object" && addr ? addr.port : 4001;
+            resolve();
+          });
+        });
+      } else {
+        const addr = boundServer.address();
+        testPort = typeof addr === "object" && addr ? addr.port : 4001;
+      }
+    });
+
+    afterEach(() => {
+      orderTelemetry.clearSyntheticVerificationIds();
+    });
+
+    it("accepts repeated use of the same ID without consuming additional capacity", async () => {
+      for (let i = 0; i < 5; i++) {
+        const res = await sendReq({
+          headers: { "Content-Type": "application/json", "x-test-token": "secret_ceiling_token_123" },
+          body: JSON.stringify({ verification_id: "verify_same_id_reuse", count: 1, status: "test_verified" }),
+        });
+        expect(res.status).toBe(200);
+      }
+      expect(orderTelemetry.getActiveSyntheticVerificationIds().length).toBe(1);
+    });
+
+    it("accepts distinct IDs up to the ceiling (100) and rejects the 101st with 429", async () => {
+      for (let i = 1; i <= 100; i++) {
+        orderTelemetry.recordSyntheticMetric(`verify_unique_${String(i).padStart(4, "0")}`, 1, "test_verified");
+      }
+      expect(orderTelemetry.getActiveSyntheticVerificationIds().length).toBe(100);
+
+      expect(() => {
+        orderTelemetry.recordSyntheticMetric("verify_unique_over_ceiling", 1, "test_verified");
+      }).toThrow(/cardinality ceiling/);
+
+      const res = await sendReq({
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_ceiling_token_123" },
+        body: JSON.stringify({ verification_id: "verify_unique_over_ceiling", count: 1, status: "test_verified" }),
+      });
+      expect(res.status).toBe(429);
+      expect((res.body as Record<string, unknown>).ceiling).toBe(100);
+    });
+
+    it("releases capacity upon deterministic cleanup and allows new ID", async () => {
+      for (let i = 1; i <= 100; i++) {
+        orderTelemetry.recordSyntheticMetric(`verify_clean_${String(i).padStart(4, "0")}`, 1, "test_verified");
+      }
+      expect(orderTelemetry.getActiveSyntheticVerificationIds().length).toBe(100);
+
+      const delRes = await sendReq({
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_ceiling_token_123" },
+        body: JSON.stringify({ verification_id: "verify_clean_0001" }),
+      });
+      expect(delRes.body).toEqual({ success: true, removed: true, verification_id: "verify_clean_0001" });
+      expect(delRes.status).toBe(200);
+      expect(orderTelemetry.getActiveSyntheticVerificationIds().length).toBe(99);
+
+      const postRes = await sendReq({
+        headers: { "Content-Type": "application/json", "x-test-token": "secret_ceiling_token_123" },
+        body: JSON.stringify({ verification_id: "verify_brand_new_id", count: 1, status: "test_verified" }),
+      });
+      expect(postRes.status).toBe(200);
+      expect(orderTelemetry.getActiveSyntheticVerificationIds().length).toBe(100);
+    });
+  });
+
+  // 4. Path B Disposable Service Isolation
+  describe("Phase 2.4: Path B Disposable Service Isolation", () => {
+    it("starts a disposable service on an isolated dynamically allocated port with ephemeral credentials", async () => {
+      const ephemeralToken = "test_ephemeral_token_xyz987";
+      const disposable = await startDisposableOrderService({ token: ephemeralToken });
+
+      try {
+        expect(disposable.port).toBeGreaterThan(0);
+        expect(disposable.baseUrl).toBe(`http://localhost:${disposable.port}`);
+
+        const healthRes = await fetch(`${disposable.baseUrl}/health`);
+        expect(healthRes.ok).toBe(true);
+
+        const recordRes = await fetch(`${disposable.baseUrl}/test/record-metric`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-token": ephemeralToken,
+          },
+          body: JSON.stringify({
+            verification_id: "verify_disposable_1",
+            count: 3,
+            status: "test_verified",
+          }),
+        });
+        expect(recordRes.ok).toBe(true);
+
+        const metricsRes = await fetch(`${disposable.baseUrl}/metrics`);
+        const metricsText = await metricsRes.text();
+        expect(metricsText).toContain('verification_id="verify_disposable_1"');
+      } finally {
+        await disposable.stop();
+      }
+    });
+
+    it("handles occupied port by allocating an isolated free port without disrupting existing listener", async () => {
+      const blocker = http.createServer((_, res) => {
+        res.writeHead(200);
+        res.end("blocker-response");
+      });
+      await new Promise<void>((resolve) => blocker.listen(0, resolve));
+      const blockerPort = (blocker.address() as { port: number }).port;
+
+      try {
+        const disposable = await startDisposableOrderService({
+          port: blockerPort,
+          token: "isolated_token_456",
+        });
+
+        try {
+          expect(disposable.port).not.toBe(blockerPort);
+          expect(disposable.port).toBeGreaterThan(0);
+
+          const blockerRes = await fetch(`http://127.0.0.1:${blockerPort}`);
+          expect(await blockerRes.text()).toBe("blocker-response");
+
+          const healthRes = await fetch(`${disposable.baseUrl}/health`);
+          expect(healthRes.ok).toBe(true);
+        } finally {
+          await disposable.stop();
+        }
+      } finally {
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+  });
+
+  // 5. Prometheus YAML Generation & Real YAML Parsing
+  describe("Phase 2.4: Prometheus YAML Generation & Real YAML Parsing", () => {
+    it("safely escapes special characters in credentials and produces valid YAML parsed by real parser", () => {
+      const specialUser = '1871065:special\\user"with#chars';
+      const specialToken = 'glc_token:with"quotes\nand\\backslashes#hash';
+      const yamlStr = generatePrometheusConfig({
+        remoteWriteUrl: "https://prometheus-prod.grafana.net/api/prom/push",
+        remoteWriteUser: specialUser,
+        remoteWriteToken: specialToken,
+      });
+
+      const validation = validateGeneratedYaml(yamlStr);
+      expect(validation.valid).toBe(true);
+
+      const parsed = YAML.parse(yamlStr);
+      expect(parsed.remote_write).toBeDefined();
+      expect(parsed.remote_write[0].basic_auth.username).toBe(specialUser);
+      expect(parsed.remote_write[0].basic_auth.password).toBe(specialToken);
+    });
+
+    it("throws when remote_write is requested with incomplete configuration", () => {
+      expect(() => {
+        generatePrometheusConfig({
+          remoteWriteUrl: "https://prometheus-prod.grafana.net/api/prom/push",
+          remoteWriteToken: "",
+        });
+      }).toThrow(/Incomplete or invalid remote_write configuration/);
+
+      expect(() => {
+        generatePrometheusConfig({
+          remoteWriteUrl: "https://prometheus-prod.grafana.net/api/prom/push",
+          remoteWriteToken: "valid_token",
+          remoteWriteUser: "",
+        });
+      }).toThrow(/Incomplete or invalid remote_write configuration/);
+    });
+
+    it("rejects YAML parser failures on invalid structure or non-object roots", () => {
+      const invalidSyntax = "global: [missing bracket\n";
+      const res1 = validateGeneratedYaml(invalidSyntax);
+      expect(res1.valid).toBe(false);
+      expect(res1.error).toContain("YAML parse error");
+
+      const stringOnly = "just a plain string, not a mapping";
+      const res2 = validateGeneratedYaml(stringOnly);
+      expect(res2.valid).toBe(false);
+      expect(res2.error).toContain("root configuration mapping");
+
+      const noScrape = "global:\n  scrape_interval: 5s\n";
+      const res3 = validateGeneratedYaml(noScrape);
+      expect(res3.valid).toBe(false);
+      expect(res3.error).toContain("scrape_configs");
     });
   });
 });

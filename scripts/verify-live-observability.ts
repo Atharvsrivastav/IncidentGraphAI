@@ -131,6 +131,71 @@ export interface LiveVerificationReport {
   overallPassed: boolean;
 }
 
+export interface DisposableServiceInstance {
+  server: import("http").Server;
+  port: number;
+  baseUrl: string;
+  token: string;
+  stop: () => Promise<void>;
+}
+
+export async function startDisposableOrderService(options?: {
+  port?: number;
+  token?: string;
+}): Promise<DisposableServiceInstance> {
+  const token = options?.token || `verify_token_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+
+  process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
+  process.env.TEST_METRIC_ENDPOINT_TOKEN = token;
+
+  const { createOrderServer } = await import("../sample-services/order/server");
+  const server = createOrderServer();
+
+  const preferredPort = options?.port;
+  let boundPort: number;
+
+  try {
+    boundPort = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(preferredPort ?? 0, () => {
+        const addr = server.address();
+        const p = typeof addr === "object" && addr ? addr.port : 0;
+        resolve(p);
+      });
+    });
+  } catch {
+    server.removeAllListeners("error");
+    boundPort = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, () => {
+        const addr = server.address();
+        const p = typeof addr === "object" && addr ? addr.port : 0;
+        resolve(p);
+      });
+    });
+  }
+
+  const baseUrl = `http://localhost:${boundPort}`;
+
+  const stop = async () => {
+    delete process.env.ENABLE_TEST_METRIC_ENDPOINT;
+    delete process.env.TEST_METRIC_ENDPOINT_TOKEN;
+    if (server.listening) {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  };
+
+  return {
+    server,
+    port: boundPort,
+    baseUrl,
+    token,
+    stop,
+  };
+}
+
 export async function runLiveObservabilityVerification(): Promise<LiveVerificationReport> {
   console.log("\n===============================================================================");
   console.log("   IncidentGraph AI — Genuine Live Observability Verification Suite (v2.1)");
@@ -346,25 +411,15 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
   const uniqueRwId = `verify_rw_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
   report.prometheusRemoteWriteResult.verificationId = uniqueRwId;
 
-  const orderServicePort = Number(process.env.SAMPLE_ORDER_PORT) || 4001;
-  const orderServiceBase = `http://localhost:${orderServicePort}`;
-  let startedLocalOrderServer: import("http").Server | null = null;
+  let disposableService: DisposableServiceInstance | null = null;
 
   try {
     const testAuthToken = `verify_test_token_${uniqueRwId}`;
-    process.env.ENABLE_TEST_METRIC_ENDPOINT = "true";
-    process.env.TEST_METRIC_ENDPOINT_TOKEN = testAuthToken;
-
-    const isServiceRunning = await isHttpEndpointReachable(`${orderServiceBase}/health`, 1500);
-    if (!isServiceRunning) {
-      console.log(`  Starting disposable order-service instance on port ${orderServicePort}...`);
-      const { server } = await import("../sample-services/order/server");
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(orderServicePort, () => resolve());
-      });
-      startedLocalOrderServer = server;
-    }
+    console.log("  Starting isolated disposable order-service instance with dynamic port allocation...");
+    disposableService = await startDisposableOrderService({ token: testAuthToken });
+    const orderServiceBase = disposableService.baseUrl;
+    const orderServicePort = disposableService.port;
+    console.log(`  ✓ Disposable order-service bound to isolated port ${disposableService.port}.`);
 
     // Record synthetic metric via actual running sample-service HTTP endpoint with test authentication
     console.log(`  Emitting synthetic metric to ${orderServiceBase}/test/record-metric with verification_id: ${uniqueRwId}`);
@@ -508,10 +563,10 @@ export async function runLiveObservabilityVerification(): Promise<LiveVerificati
     report.prometheusRemoteWriteResult.details = `Path B execution error: ${msg}`;
     console.warn(`  Warning in Path B: ${msg}`);
   } finally {
-    if (startedLocalOrderServer) {
+    if (disposableService) {
       try {
-        await new Promise<void>((resolve) => startedLocalOrderServer!.close(() => resolve()));
-        console.log("  Cleaned up disposable order-service instance.");
+        await disposableService.stop();
+        console.log("  Cleaned up disposable order-service instance and ephemeral credentials.");
       } catch {
         // Ignore
       }

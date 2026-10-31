@@ -73,12 +73,53 @@ export class PrometheusRegistry {
     return this.healthStatus;
   }
 
+  public static readonly MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS = 100;
+  private activeSyntheticIds = new Set<string>();
+
+  public getActiveSyntheticVerificationIds(): string[] {
+    return Array.from(this.activeSyntheticIds);
+  }
+
+  public clearSyntheticVerificationIds(): void {
+    for (const key of Array.from(this.requests.keys())) {
+      if (key.includes("verification_id=")) {
+        this.requests.delete(key);
+      }
+    }
+    this.activeSyntheticIds.clear();
+  }
+
+  public clearSyntheticVerificationId(verificationId: string): boolean {
+    const trimmed = verificationId.trim();
+    if (!this.activeSyntheticIds.has(trimmed)) {
+      return false;
+    }
+    for (const key of Array.from(this.requests.keys())) {
+      if (key.includes(`verification_id="${escapeLabelValue(trimmed)}"`)) {
+        this.requests.delete(key);
+      }
+    }
+    this.activeSyntheticIds.delete(trimmed);
+    return true;
+  }
+
   public recordRequest(count: number = 1, attributes?: MetricAttributes): void {
     if (typeof count !== "number" || isNaN(count) || count < 0) {
       throw new Error(`Invalid metric count: ${count}`);
     }
     const rawStatus = String(attributes?.status ?? "200");
     const status = /^\d{3}$/.test(rawStatus) ? rawStatus : "unknown";
+
+    if (attributes?.verification_id) {
+      const vId = String(attributes.verification_id).trim();
+      if (!this.activeSyntheticIds.has(vId) && this.activeSyntheticIds.size >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
+        throw new Error(
+          `Synthetic verification ID cardinality ceiling (${PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS}) reached. Cannot register new verification ID until existing IDs are expired or cleaned up.`
+        );
+      }
+      this.activeSyntheticIds.add(vId);
+    }
+
     const extraVerification = attributes?.verification_id
       ? `,verification_id="${escapeLabelValue(String(attributes.verification_id))}"`
       : "";
@@ -185,6 +226,9 @@ export interface ServiceTelemetry {
   otlpTargetUrl: string;
   registry: PrometheusRegistry;
   recordSyntheticMetric: (verificationId: string, count?: number, status?: string) => void;
+  getActiveSyntheticVerificationIds: () => string[];
+  clearSyntheticVerificationIds: () => void;
+  clearSyntheticVerificationId: (verificationId: string) => boolean;
   getPrometheusMetrics: () => string;
   handleMetricsRequest: (res: import("http").ServerResponse) => void;
   setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
@@ -416,13 +460,25 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
       throw new Error(`Invalid synthetic metric count: ${count}. Must be a finite positive integer between 1 and 1000.`);
     }
     const ALLOWED_STATUSES = new Set(["synthetic", "test_verified", "smoke_test"]);
-    const safeStatus = ALLOWED_STATUSES.has(status) ? status : "test_verified";
+    if (status !== undefined && !ALLOWED_STATUSES.has(status)) {
+      throw new Error(`Invalid synthetic metric status: "${status}". Must be one of ['synthetic', 'test_verified', 'smoke_test'].`);
+    }
+    const safeStatus = status || "test_verified";
+    const vId = verificationId.trim();
+
+    // Cardinality check before modifying either PrometheusRegistry or OpenTelemetry
+    const activeIds = registry.getActiveSyntheticVerificationIds();
+    if (!activeIds.includes(vId) && activeIds.length >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
+      throw new Error(
+        `Synthetic verification ID cardinality ceiling (${PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS}) reached. Cannot register new verification ID until existing IDs are expired or cleaned up.`
+      );
+    }
 
     registry.recordRequest(count, {
       method: "POST",
       route: "/test/synthetic",
       status_code: 200,
-      verification_id: verificationId.trim(),
+      verification_id: vId,
       status: safeStatus,
     });
     try {
@@ -430,7 +486,7 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
         method: "POST",
         route: "/test/synthetic",
         status_code: 200,
-        verification_id: verificationId.trim(),
+        verification_id: vId,
         status: safeStatus,
       });
     } catch (err: unknown) {
@@ -516,6 +572,9 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     otlpTargetUrl: traceUrl,
     registry,
     recordSyntheticMetric,
+    getActiveSyntheticVerificationIds: () => registry.getActiveSyntheticVerificationIds(),
+    clearSyntheticVerificationIds: () => registry.clearSyntheticVerificationIds(),
+    clearSyntheticVerificationId: (id: string) => registry.clearSyntheticVerificationId(id),
     getPrometheusMetrics,
     handleMetricsRequest,
     setHealthStatus,

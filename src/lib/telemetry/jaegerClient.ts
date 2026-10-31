@@ -280,13 +280,38 @@ export class JaegerClient {
       const json = await res.json();
 
       if (Array.isArray(json.data) && json.data.length > 0) {
-        const parsed = this.parseTrace(json.data[0]);
+        const rawTrace = json.data[0];
+        if (!allowFallback) {
+          if (!rawTrace.traceID || typeof rawTrace.traceID !== "string" || rawTrace.traceID.trim().length === 0) {
+            return null;
+          }
+          if (!Array.isArray(rawTrace.spans) || rawTrace.spans.length === 0) {
+            return null;
+          }
+          const seenSpans = new Set<string>();
+          for (const s of rawTrace.spans) {
+            if (!s.spanID || typeof s.spanID !== "string" || s.spanID.trim().length === 0) {
+              return null;
+            }
+            if (seenSpans.has(s.spanID)) {
+              return null;
+            }
+            seenSpans.add(s.spanID);
+            if (!s.traceID || typeof s.traceID !== "string" || s.traceID.trim().length === 0) {
+              return null;
+            }
+            if (s.traceID.toLowerCase() !== rawTrace.traceID.toLowerCase()) {
+              return null;
+            }
+          }
+        }
+        const parsed = this.parseTrace(rawTrace);
         if (!allowFallback && (!parsed.allSpans || parsed.allSpans.length === 0)) {
           return null;
         }
         return parsed;
       }
-      if (json.batches || json.resourceSpans || json.spans || json.traceID) {
+      if (json.batches || json.resourceSpans || json.spans || json.traceID || json.traceId) {
         return this.parseTempoTraceDetail(json, traceId, { allowFallback });
       }
       return null;
@@ -458,13 +483,19 @@ export class JaegerClient {
       return allowFallback ? this.createFallbackTrace(requestedTraceId) : null;
     }
 
-    const backendRootTraceId = (
-      typeof json.traceID === "string" ? json.traceID :
-      typeof json.traceId === "string" ? json.traceId :
-      undefined
-    );
+    const jsonRecord = json as Record<string, unknown>;
+    const jsonTraceID = typeof jsonRecord.traceID === "string" ? jsonRecord.traceID.trim() : "";
+    const jsonTraceId = typeof jsonRecord.traceId === "string" ? jsonRecord.traceId.trim() : "";
+    if (!allowFallback && jsonTraceID && jsonTraceId && jsonTraceID.toLowerCase() !== jsonTraceId.toLowerCase()) {
+      return null;
+    }
+    const backendRootTraceId = jsonTraceID || jsonTraceId || undefined;
 
-    const batches = (json.batches || json.resourceSpans) as Array<{
+    if (!allowFallback && (!backendRootTraceId || backendRootTraceId.length === 0)) {
+      return null;
+    }
+
+    const batches = ((jsonRecord.batches || jsonRecord.resourceSpans) as Array<{
       traceId?: string;
       traceID?: string;
       resource?: { attributes?: Array<{ key: string; value: { stringValue?: string } }> };
@@ -483,7 +514,7 @@ export class JaegerClient {
           attributes?: Array<{ key: string; value: { stringValue?: string; intValue?: number; boolValue?: boolean } }>;
         }>;
       }>;
-    }>;
+    }>) || [];
 
     if (!Array.isArray(batches) || batches.length === 0) {
       return allowFallback ? this.createFallbackTrace(backendRootTraceId || requestedTraceId) : null;
@@ -493,39 +524,70 @@ export class JaegerClient {
     const spanMap = new Map<string, TraceSpan>();
     const services = new Set<string>();
     let hasErrors = false;
-    let firstSpanTraceId: string | undefined;
 
     for (const batch of batches) {
       const serviceAttr = batch.resource?.attributes?.find((a) => a.key === "service.name");
       const serviceName = serviceAttr?.value?.stringValue || "unknown-service";
       services.add(serviceName);
 
-      const batchTraceId = batch.traceId || batch.traceID;
-      if (!allowFallback && backendRootTraceId && batchTraceId && backendRootTraceId.toLowerCase() !== batchTraceId.toLowerCase()) {
+      const batchTraceID = typeof batch.traceID === "string" ? batch.traceID.trim() : "";
+      const batchTraceId = typeof batch.traceId === "string" ? batch.traceId.trim() : "";
+      if (!allowFallback && batchTraceID && batchTraceId && batchTraceID.toLowerCase() !== batchTraceId.toLowerCase()) {
+        return null;
+      }
+      const resolvedBatchTraceId = batchTraceID || batchTraceId || undefined;
+
+      if (!allowFallback && backendRootTraceId && resolvedBatchTraceId && backendRootTraceId.toLowerCase() !== resolvedBatchTraceId.toLowerCase()) {
         return null;
       }
 
       for (const scope of batch.scopeSpans || []) {
         for (const rawSpan of scope.spans || []) {
-          const rawTraceId = rawSpan.traceId || rawSpan.traceID || batchTraceId || backendRootTraceId;
+          const spanTraceID = typeof rawSpan.traceID === "string" ? rawSpan.traceID.trim() : "";
+          const spanTraceId = typeof rawSpan.traceId === "string" ? rawSpan.traceId.trim() : "";
+
+          if (!allowFallback) {
+            // Reject conflicting field spellings on the span
+            if (spanTraceID && spanTraceId && spanTraceID.toLowerCase() !== spanTraceId.toLowerCase()) {
+              return null;
+            }
+            // Require every span to contain its own non-empty backend-returned traceId or traceID
+            if (!spanTraceID && !spanTraceId) {
+              return null;
+            }
+          }
+
+          const spanGenuineTraceId = spanTraceID || spanTraceId || undefined;
+          const rawTraceId = spanGenuineTraceId || (allowFallback ? (resolvedBatchTraceId || backendRootTraceId) : undefined);
           if (!allowFallback && !rawTraceId) {
             return null;
           }
-          if (!allowFallback && rawSpan.traceId && backendRootTraceId && rawSpan.traceId.toLowerCase() !== backendRootTraceId.toLowerCase()) {
+          if (!allowFallback && rawTraceId && backendRootTraceId && rawTraceId.toLowerCase() !== backendRootTraceId.toLowerCase()) {
             return null;
           }
-          if (!allowFallback && rawSpan.traceId && batchTraceId && rawSpan.traceId.toLowerCase() !== batchTraceId.toLowerCase()) {
+          if (!allowFallback && rawTraceId && resolvedBatchTraceId && rawTraceId.toLowerCase() !== resolvedBatchTraceId.toLowerCase()) {
             return null;
           }
-          if (!firstSpanTraceId && rawTraceId) {
-            firstSpanTraceId = rawTraceId;
+
+          const spanFinalTraceId = rawTraceId || (allowFallback ? requestedTraceId : "");
+
+          const spanSpanID = typeof rawSpan.spanID === "string" ? rawSpan.spanID.trim() : "";
+          const spanSpanId = typeof rawSpan.spanId === "string" ? rawSpan.spanId.trim() : "";
+
+          if (!allowFallback) {
+            if (spanSpanID && spanSpanId && spanSpanID.toLowerCase() !== spanSpanId.toLowerCase()) {
+              return null;
+            }
+            if (!spanSpanID && !spanSpanId) {
+              return null;
+            }
           }
-          const spanTraceId = rawTraceId || (allowFallback ? requestedTraceId : "");
-          const rawSpanId = rawSpan.spanId || rawSpan.spanID;
-          if (!allowFallback && (!rawSpanId || rawSpanId.trim().length === 0)) {
+
+          const spanGenuineSpanId = spanSpanID || spanSpanId || undefined;
+          if (!allowFallback && !spanGenuineSpanId) {
             return null;
           }
-          const sId = rawSpanId || (allowFallback ? requestedTraceId.slice(0, 16) : "");
+          const sId = spanGenuineSpanId || (allowFallback ? requestedTraceId.slice(0, 16) : "");
           if (!allowFallback && spanMap.has(sId)) {
             return null;
           }
@@ -544,7 +606,7 @@ export class JaegerClient {
           const span: TraceSpan = {
             spanId: sId,
             parentSpanId: pId,
-            traceId: spanTraceId,
+            traceId: spanFinalTraceId,
             operationName: rawSpan.name || "HTTP Operation",
             serviceName,
             startTimeUs: startMs * 1000,
@@ -568,10 +630,10 @@ export class JaegerClient {
     // Build hierarchy and assign depths
     this.linkChildrenAndAssignDepths(allSpans, spanMap);
 
-    if (!allowFallback && !backendRootTraceId && !firstSpanTraceId) {
+    if (!allowFallback && (!backendRootTraceId || backendRootTraceId.trim().length === 0)) {
       return null;
     }
-    const actualTraceId = backendRootTraceId || firstSpanTraceId || (allowFallback ? requestedTraceId : "");
+    const actualTraceId = backendRootTraceId || (allowFallback ? (allSpans[0]?.traceId || requestedTraceId) : "");
     if (!allowFallback && (!actualTraceId || actualTraceId.trim().length === 0)) {
       return null;
     }
@@ -634,14 +696,15 @@ export class JaegerClient {
         "unknown-service";
 
       servicesSet.add(serviceName);
-      const isError = Boolean(s.tags.find((t) => t.key === "error" && t.value === true));
+      const tags = s.tags || [];
+      const isError = Boolean(tags.find((t) => t.key === "error" && t.value === true));
       if (isError) hasErrors = true;
 
       const parentRef = s.references?.find((r) => r.refType === "CHILD_OF");
       const parentSpanId = parentRef?.spanID;
 
       const attributes: Record<string, unknown> = {};
-      for (const tag of s.tags) {
+      for (const tag of tags) {
         attributes[tag.key] = tag.value;
       }
 
