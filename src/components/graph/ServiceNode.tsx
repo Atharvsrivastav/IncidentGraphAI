@@ -20,12 +20,15 @@ export interface ServiceNodeCustomData {
   name: string;
   serviceType: string;
   tier: number;
-  status: "HEALTHY" | "DEGRADED" | "DOWN";
-  latency: number;
+  status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
+  latency: number | null;
   baselineLatency: number;
-  errorRate: number;
+  errorRate: number | null;
   baselineErrorRate: number;
-  requestRate: number;
+  requestRate: number | null;
+  hasValidLatency?: boolean;
+  hasValidErrorRate?: boolean;
+  hasValidRequestRate?: boolean;
   isRootCause?: boolean;
   isAffected?: boolean;
 }
@@ -57,6 +60,7 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
   const isDown = nodeData.status === "DOWN";
   const isDegraded = nodeData.status === "DEGRADED";
   const isHealthy = nodeData.status === "HEALTHY";
+  const isUnknown = nodeData.status === "UNKNOWN";
 
   let statusBorder = "border-slate-800 hover:border-slate-700";
   let statusBg = "bg-slate-900/90";
@@ -70,6 +74,10 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
     statusBorder = "border-amber-500 shadow-lg shadow-amber-950/40";
     statusBg = "bg-amber-950/20";
     statusBadgeColor = "bg-amber-500/20 text-amber-300 border-amber-500/40";
+  } else if (isUnknown) {
+    statusBorder = "border-slate-700/80 shadow-md shadow-slate-950/40";
+    statusBg = "bg-slate-900/70";
+    statusBadgeColor = "bg-slate-700/50 text-slate-400 border-slate-600/50";
   } else if (isHealthy) {
     statusBorder = "border-emerald-600/40 hover:border-emerald-500/70";
   }
@@ -77,8 +85,13 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
   const selectionBorder = selected ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-slate-950" : "";
   const rootCauseRing = nodeData.isRootCause ? "ring-2 ring-purple-500 shadow-xl shadow-purple-950/60" : "";
 
+  const hasLatency = nodeData.hasValidLatency !== false && nodeData.latency !== null && nodeData.latency !== undefined;
+  const hasError = nodeData.hasValidErrorRate !== false && nodeData.errorRate !== null && nodeData.errorRate !== undefined;
+  const hasVolume = nodeData.hasValidRequestRate !== false && nodeData.requestRate !== null && nodeData.requestRate !== undefined;
+
   return (
     <div
+      data-testid={`service-node-${nodeData.id}`}
       className={`relative min-w-[220px] rounded-xl border p-3 transition-all duration-200 backdrop-blur-md ${statusBg} ${statusBorder} ${selectionBorder} ${rootCauseRing}`}
     >
       {/* React Flow Connection Handles */}
@@ -120,6 +133,8 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
                 ? "bg-rose-500/20 border-rose-500/40 text-rose-400"
                 : isDegraded
                 ? "bg-amber-500/20 border-amber-500/40 text-amber-400"
+                : isUnknown
+                ? "bg-slate-800/80 border-slate-700/80 text-slate-400"
                 : "bg-slate-800 border-slate-700 text-blue-400"
             }`}
           >
@@ -147,35 +162,45 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
         <div>
           <span className="text-[10px] text-slate-400">Latency</span>
           <div className="flex items-baseline gap-1">
-            <span
-              className={`font-semibold ${
-                nodeData.latency > nodeData.baselineLatency * 2
-                  ? "text-rose-400"
-                  : nodeData.latency > nodeData.baselineLatency * 1.3
-                  ? "text-amber-400"
-                  : "text-slate-200"
-              }`}
-            >
-              {Math.round(nodeData.latency)}ms
-            </span>
-            <span className="text-[9px] text-slate-400">({nodeData.baselineLatency}ms)</span>
+            {hasLatency ? (
+              <>
+                <span
+                  className={`font-semibold ${
+                    nodeData.latency! > nodeData.baselineLatency * 2
+                      ? "text-rose-400"
+                      : nodeData.latency! > nodeData.baselineLatency * 1.3
+                      ? "text-amber-400"
+                      : "text-slate-200"
+                  }`}
+                >
+                  {Math.round(nodeData.latency!)}ms
+                </span>
+                <span className="text-[9px] text-slate-400">({nodeData.baselineLatency}ms)</span>
+              </>
+            ) : (
+              <span className="text-slate-400 font-mono">N/A</span>
+            )}
           </div>
         </div>
 
         <div>
           <span className="text-[10px] text-slate-400">Error Rate</span>
           <div className="flex items-baseline gap-1">
-            <span
-              className={`font-semibold ${
-                nodeData.errorRate > 10
-                  ? "text-rose-400"
-                  : nodeData.errorRate > 1
-                  ? "text-amber-400"
-                  : "text-emerald-400"
-              }`}
-            >
-              {nodeData.errorRate.toFixed(1)}%
-            </span>
+            {hasError ? (
+              <span
+                className={`font-semibold ${
+                  nodeData.errorRate! > 10
+                    ? "text-rose-400"
+                    : nodeData.errorRate! > 1
+                    ? "text-amber-400"
+                    : "text-emerald-400"
+                }`}
+              >
+                {nodeData.errorRate!.toFixed(1)}%
+              </span>
+            ) : (
+              <span className="text-slate-400 font-mono">N/A</span>
+            )}
           </div>
         </div>
       </div>
@@ -183,7 +208,9 @@ export const ServiceNode = memo(({ data, selected }: NodeProps) => {
       {/* Request Volume Footer */}
       <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
         <span>Volume:</span>
-        <span className="font-mono text-slate-300">{nodeData.requestRate} req/s</span>
+        <span className="font-mono text-slate-300">
+          {hasVolume ? `${nodeData.requestRate} req/s` : "N/A"}
+        </span>
       </div>
     </div>
   );

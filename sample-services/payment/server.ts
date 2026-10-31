@@ -14,11 +14,17 @@ let serviceFailureRate = 0;
 export function setPaymentFault(delayMs: number, failureRate: number = 0) {
   serviceDelayMs = delayMs;
   serviceFailureRate = failureRate;
+  if (failureRate > 0.2 || delayMs > 2000) {
+    telemetry.setHealthStatus(0);
+  } else if (failureRate > 0 || delayMs > 500) {
+    telemetry.setHealthStatus("DEGRADED");
+  }
 }
 
 export function resetPaymentFault() {
   serviceDelayMs = 0;
   serviceFailureRate = 0;
+  telemetry.setHealthStatus(1);
 }
 
 export const server = http.createServer(async (req, res) => {
@@ -59,6 +65,12 @@ export const server = http.createServer(async (req, res) => {
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, transactionId: "tx_" + Date.now(), status: "AUTHORIZED" }));
+        telemetry.endSpan(span, SpanStatusCode.OK);
+        return;
+      }
+
+      if (url.pathname === "/metrics") {
+        telemetry.handleMetricsRequest(res);
         telemetry.endSpan(span, SpanStatusCode.OK);
         return;
       }

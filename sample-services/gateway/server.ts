@@ -57,6 +57,7 @@ export const server = http.createServer(async (req, res) => {
         resetOrderFault();
         resetPaymentFault();
         resetInventoryFault();
+        telemetry.setHealthStatus(1);
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "BASELINE_RESTORED" }));
@@ -112,6 +113,12 @@ export const server = http.createServer(async (req, res) => {
         telemetry.requestCounter.add(1, { service: SERVICE_NAME, status: String(invRes.status) });
         res.writeHead(invRes.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(invData));
+        telemetry.endSpan(span, SpanStatusCode.OK);
+        return;
+      }
+
+      if (url.pathname === "/metrics") {
+        telemetry.handleMetricsRequest(res);
         telemetry.endSpan(span, SpanStatusCode.OK);
         return;
       }

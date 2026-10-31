@@ -18,6 +18,246 @@ import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 
+export interface MetricAttributes {
+  service?: string;
+  status?: string;
+  method?: string;
+  [key: string]: unknown;
+}
+
+function escapeLabelValue(val: string): string {
+  return String(val)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
+
+export class PrometheusRegistry {
+  private serviceName: string;
+  private requests = new Map<string, number>();
+  private errors = new Map<string, number>();
+  private durations: { sum: number; count: number; buckets: Map<number, number> };
+  private healthStatus: number = 1;
+  public static readonly BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 10];
+
+  constructor(serviceName: string) {
+    this.serviceName = serviceName;
+    const bucketMap = new Map<number, number>();
+    for (const b of PrometheusRegistry.BUCKETS) {
+      bucketMap.set(b, 0);
+    }
+    this.durations = { sum: 0, count: 0, buckets: bucketMap };
+  }
+
+  public setHealthStatus(status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN"): void {
+    if (typeof status === "number") {
+      if (status === 1 || status === 0.5 || status === 0) {
+        this.healthStatus = status;
+      } else {
+        throw new Error(`Invalid numeric health status: ${status}. Must be 1 (HEALTHY), 0.5 (DEGRADED), or 0 (DOWN)`);
+      }
+    } else if (typeof status === "boolean") {
+      this.healthStatus = status ? 1 : 0;
+    } else if (status === "HEALTHY") {
+      this.healthStatus = 1;
+    } else if (status === "DEGRADED") {
+      this.healthStatus = 0.5;
+    } else if (status === "DOWN") {
+      this.healthStatus = 0;
+    } else {
+      throw new Error(`Invalid health status value: ${String(status)}`);
+    }
+  }
+
+  public getHealthStatus(): number {
+    return this.healthStatus;
+  }
+
+  public static readonly MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS = 100;
+  public static readonly DEFAULT_SYNTHETIC_ID_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  private syntheticIdTtlMs: number = PrometheusRegistry.DEFAULT_SYNTHETIC_ID_TTL_MS;
+  private activeSyntheticIds = new Map<string, number>();
+  private timeProvider: () => number = () => Date.now();
+
+  public setTimeProvider(fn: () => number): void {
+    if (typeof fn !== "function") {
+      throw new Error("Time provider must be a function returning milliseconds");
+    }
+    this.timeProvider = fn;
+  }
+
+  public getTimeProvider(): () => number {
+    return this.timeProvider;
+  }
+
+  public setSyntheticIdTtlMs(ttlMs: number): void {
+    if (typeof ttlMs !== "number" || isNaN(ttlMs) || ttlMs <= 0) {
+      throw new Error(`Invalid TTL ms: ${ttlMs}`);
+    }
+    this.syntheticIdTtlMs = ttlMs;
+  }
+
+  public getSyntheticIdTtlMs(): number {
+    return this.syntheticIdTtlMs;
+  }
+
+  public pruneExpiredSyntheticIds(nowMs?: number, customTtlMs?: number): number {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
+    const ttl = customTtlMs ?? this.syntheticIdTtlMs;
+    let prunedCount = 0;
+    for (const [id, registeredAt] of Array.from(this.activeSyntheticIds.entries())) {
+      if (now - registeredAt >= ttl) {
+        this.clearSyntheticVerificationId(id);
+        prunedCount++;
+      }
+    }
+    return prunedCount;
+  }
+
+  public getActiveSyntheticVerificationIds(nowMs?: number): string[] {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
+    this.pruneExpiredSyntheticIds(now);
+    return Array.from(this.activeSyntheticIds.keys());
+  }
+
+  public clearSyntheticVerificationIds(): void {
+    for (const key of Array.from(this.requests.keys())) {
+      if (key.includes("verification_id=")) {
+        this.requests.delete(key);
+      }
+    }
+    this.activeSyntheticIds.clear();
+  }
+
+  public clearSyntheticVerificationId(verificationId: string): boolean {
+    const trimmed = verificationId.trim();
+    let removed = false;
+    for (const key of Array.from(this.requests.keys())) {
+      if (key.includes(`verification_id="${escapeLabelValue(trimmed)}"`)) {
+        this.requests.delete(key);
+        removed = true;
+      }
+    }
+    if (this.activeSyntheticIds.has(trimmed)) {
+      this.activeSyntheticIds.delete(trimmed);
+      removed = true;
+    }
+    return removed;
+  }
+
+  public recordRequest(count: number = 1, attributes?: MetricAttributes): void {
+    if (typeof count !== "number" || isNaN(count) || count < 0) {
+      throw new Error(`Invalid metric count: ${count}`);
+    }
+    const rawStatus = String(attributes?.status ?? "200");
+    const status = /^\d{3}$/.test(rawStatus) ? rawStatus : "unknown";
+
+    if (attributes?.verification_id) {
+      const vId = String(attributes.verification_id).trim();
+      const now = typeof attributes._recordTimeMs === "number" ? attributes._recordTimeMs : this.timeProvider();
+      this.pruneExpiredSyntheticIds(now);
+      if (!this.activeSyntheticIds.has(vId) && this.activeSyntheticIds.size >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
+        throw new Error(
+          `Synthetic verification ID cardinality ceiling (${PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS}) reached. Cannot register new verification ID until existing IDs are expired or cleaned up.`
+        );
+      }
+      this.activeSyntheticIds.set(vId, now);
+    }
+
+    const extraVerification = attributes?.verification_id
+      ? `,verification_id="${escapeLabelValue(String(attributes.verification_id))}"`
+      : "";
+    const key = `service="${escapeLabelValue(this.serviceName)}",status="${escapeLabelValue(status)}"${extraVerification}`;
+    this.requests.set(key, (this.requests.get(key) || 0) + count);
+  }
+
+  public recordError(count: number = 1, attributes?: MetricAttributes): void {
+    if (typeof count !== "number" || isNaN(count) || count < 0) {
+      throw new Error(`Invalid error count: ${count}`);
+    }
+    const rawStatus = String(attributes?.status ?? "500");
+    const status = /^\d{3}$/.test(rawStatus) ? rawStatus : "500";
+    const key = `service="${escapeLabelValue(this.serviceName)}",status="${escapeLabelValue(status)}"`;
+    this.errors.set(key, (this.errors.get(key) || 0) + count);
+  }
+
+  public recordDuration(seconds: number): void {
+    if (typeof seconds !== "number" || isNaN(seconds) || seconds < 0) {
+      throw new Error(`Invalid duration seconds: ${seconds}`);
+    }
+    this.durations.sum += seconds;
+    this.durations.count += 1;
+    for (const b of PrometheusRegistry.BUCKETS) {
+      if (seconds <= b) {
+        this.durations.buckets.set(b, (this.durations.buckets.get(b) || 0) + 1);
+      }
+    }
+  }
+
+  public toPrometheusFormat(nowMs?: number): string {
+    const now = typeof nowMs === "number" ? nowMs : this.timeProvider();
+    this.pruneExpiredSyntheticIds(now);
+    const lines: string[] = [];
+
+    // http_requests_total
+    lines.push("# HELP http_requests_total Total number of HTTP requests processed by this service");
+    lines.push("# TYPE http_requests_total counter");
+    if (this.requests.size === 0) {
+      lines.push(`http_requests_total{service="${escapeLabelValue(this.serviceName)}",status="200"} 0`);
+    } else {
+      for (const [labels, val] of this.requests.entries()) {
+        lines.push(`http_requests_total{${labels}} ${val}`);
+      }
+    }
+
+    // http_request_errors_total
+    lines.push("# HELP http_request_errors_total Total number of HTTP error responses (5xx or timeouts)");
+    lines.push("# TYPE http_request_errors_total counter");
+    if (this.errors.size === 0) {
+      lines.push(`http_request_errors_total{service="${escapeLabelValue(this.serviceName)}",status="500"} 0`);
+    } else {
+      for (const [labels, val] of this.errors.entries()) {
+        lines.push(`http_request_errors_total{${labels}} ${val}`);
+      }
+    }
+
+    // http_request_duration_seconds
+    lines.push("# HELP http_request_duration_seconds Duration of HTTP request processing in seconds");
+    lines.push("# TYPE http_request_duration_seconds histogram");
+    for (const b of PrometheusRegistry.BUCKETS) {
+      const count = this.durations.buckets.get(b) || 0;
+      lines.push(`http_request_duration_seconds_bucket{service="${escapeLabelValue(this.serviceName)}",le="${b}"} ${count}`);
+    }
+    lines.push(`http_request_duration_seconds_bucket{service="${escapeLabelValue(this.serviceName)}",le="+Inf"} ${this.durations.count}`);
+    lines.push(`http_request_duration_seconds_sum{service="${escapeLabelValue(this.serviceName)}"} ${this.durations.sum.toFixed(6)}`);
+    lines.push(`http_request_duration_seconds_count{service="${escapeLabelValue(this.serviceName)}"} ${this.durations.count}`);
+
+    // service_health_status
+    lines.push("# HELP service_health_status Health status of the service (1=healthy, 0.5=degraded, 0=down)");
+    lines.push("# TYPE service_health_status gauge");
+    lines.push(`service_health_status{service="${escapeLabelValue(this.serviceName)}"} ${this.healthStatus}`);
+
+    return lines.join("\n") + "\n";
+  }
+}
+
+export interface SignalExportStatus {
+  status: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
+  lastSuccessTime?: string;
+  lastFailureTime?: string;
+  lastError?: string;
+  successCount: number;
+  failureCount: number;
+}
+
+export function sanitizeErrorMessage(msg?: string): string | undefined {
+  if (!msg) return undefined;
+  return msg
+    .replace(/(Bearer|Basic)\s+[A-Za-z0-9+/=._-]+/gi, "$1 [REDACTED]")
+    .replace(/(glc_[A-Za-z0-9_-]+)/gi, "[REDACTED_TOKEN]")
+    .replace(/password=[^&\s]+/gi, "password=[REDACTED]");
+}
+
 export interface ServiceTelemetry {
   tracer: Tracer;
   meter: Meter;
@@ -30,6 +270,30 @@ export interface ServiceTelemetry {
   endSpan: (span: Span, statusCode?: SpanStatusCode, errorMessage?: string) => void;
   isCloudExportEnabled: boolean;
   otlpTargetUrl: string;
+  registry: PrometheusRegistry;
+  recordSyntheticMetric: (verificationId: string, count?: number, status?: string) => void;
+  getActiveSyntheticVerificationIds: (nowMs?: number) => string[];
+  clearSyntheticVerificationIds: () => void;
+  clearSyntheticVerificationId: (verificationId: string) => boolean;
+  pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => number;
+  setSyntheticIdTtlMs: (ttlMs: number) => void;
+  getSyntheticIdTtlMs: () => number;
+  setTimeProvider: (fn: () => number) => void;
+  getTimeProvider: () => () => number;
+  getPrometheusMetrics: () => string;
+  handleMetricsRequest: (res: import("http").ServerResponse) => void;
+  setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
+  getHealthStatus: () => number;
+  getExportStatus: () => {
+    isCloudExport: boolean;
+    metrics: SignalExportStatus;
+    traces: SignalExportStatus;
+    lastExportStatus: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
+    lastExportTime?: string;
+    lastExportError?: string;
+    successCount: number;
+    failureCount: number;
+  };
 }
 
 const initializedServices = new Map<string, ServiceTelemetry>();
@@ -38,6 +302,8 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   if (initializedServices.has(serviceName)) {
     return initializedServices.get(serviceName)!;
   }
+
+  const registry = new PrometheusRegistry(serviceName);
 
   // Determine OTLP endpoint: Grafana Cloud takes precedence if configured
   const otlpEndpoint = (
@@ -75,12 +341,50 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     "deployment.environment": process.env.DEPLOYMENT_ENVIRONMENT || process.env.ENVIRONMENT || (isCloudExport ? "production-hosted" : "development"),
   });
 
+  // Track genuine exporter outcomes independently
+  const metricTracker: SignalExportStatus = {
+    status: isCloudExport ? "PENDING" : "DISABLED",
+    lastSuccessTime: undefined,
+    lastFailureTime: undefined,
+    lastError: undefined,
+    successCount: 0,
+    failureCount: 0,
+  };
+
+  const traceTracker: SignalExportStatus = {
+    status: isCloudExport ? "PENDING" : "DISABLED",
+    lastSuccessTime: undefined,
+    lastFailureTime: undefined,
+    lastError: undefined,
+    successCount: 0,
+    failureCount: 0,
+  };
+
   // 1. Trace provider with OTLP HTTP trace exporter
   const traceUrl = otlpEndpoint.endsWith("/v1/traces") ? otlpEndpoint : `${otlpEndpoint}/v1/traces`;
   const traceExporter = new OTLPTraceExporter({
     url: traceUrl,
     headers,
   });
+
+  // Intercept trace exporter callback to track genuine live outcomes
+  const origTraceExport = traceExporter.export.bind(traceExporter);
+  traceExporter.export = (spans, resultCallback) => {
+    origTraceExport(spans, (result) => {
+      if (result.code === 0) {
+        traceTracker.status = "SUCCESS";
+        traceTracker.lastSuccessTime = new Date().toISOString();
+        traceTracker.lastError = undefined;
+        traceTracker.successCount++;
+      } else {
+        traceTracker.status = "FAILED";
+        traceTracker.lastFailureTime = new Date().toISOString();
+        traceTracker.lastError = sanitizeErrorMessage(result.error?.message || "OTLP trace export failed");
+        traceTracker.failureCount++;
+      }
+      resultCallback(result);
+    });
+  };
 
   const provider = new NodeTracerProvider({
     resource,
@@ -94,6 +398,25 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     url: metricUrl,
     headers,
   });
+
+  // Intercept metric exporter callback to track genuine live outcomes
+  const origMetricExport = metricExporter.export.bind(metricExporter);
+  metricExporter.export = (metricsData, resultCallback) => {
+    origMetricExport(metricsData, (result) => {
+      if (result.code === 0) {
+        metricTracker.status = "SUCCESS";
+        metricTracker.lastSuccessTime = new Date().toISOString();
+        metricTracker.lastError = undefined;
+        metricTracker.successCount++;
+      } else {
+        metricTracker.status = "FAILED";
+        metricTracker.lastFailureTime = new Date().toISOString();
+        metricTracker.lastError = sanitizeErrorMessage(result.error?.message || "OTLP metric export failed");
+        metricTracker.failureCount++;
+      }
+      resultCallback(result);
+    });
+  };
 
   const metricReader = new PeriodicExportingMetricReader({
     exporter: metricExporter,
@@ -109,17 +432,17 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
   const tracer = trace.getTracer(serviceName, "1.0.0");
   const meter = metrics.getMeter(serviceName, "1.0.0");
 
-  const requestCounter = meter.createCounter("http_requests_total", {
+  const rawRequestCounter = meter.createCounter("http_requests_total", {
     description: "Total number of HTTP requests processed by this service",
     unit: "1",
   });
 
-  const errorCounter = meter.createCounter("http_request_errors_total", {
+  const rawErrorCounter = meter.createCounter("http_request_errors_total", {
     description: "Total number of HTTP error responses (5xx or timeouts)",
     unit: "1",
   });
 
-  const durationHistogram = meter.createHistogram("http_request_duration_seconds", {
+  const rawDurationHistogram = meter.createHistogram("http_request_duration_seconds", {
     description: "Duration of HTTP request processing in seconds",
     unit: "s",
   });
@@ -143,6 +466,84 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
       console.warn(JSON.stringify(payload));
     } else {
       console.log(JSON.stringify(payload));
+    }
+  };
+
+  const requestCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordRequest(value, attributes as MetricAttributes);
+      try {
+        rawRequestCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel counter.add failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
+      }
+    },
+  };
+
+  const errorCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordError(value, attributes as MetricAttributes);
+      try {
+        rawErrorCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel errorCounter.add failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
+      }
+    },
+  };
+
+  const durationHistogram: Histogram = {
+    record: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordDuration(value);
+      try {
+        rawDurationHistogram.record(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel durationHistogram.record failed", { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) });
+      }
+    },
+  };
+
+  const recordSyntheticMetric = (verificationId: string, count = 1, status = "test_verified") => {
+    const VERIFICATION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+    if (!verificationId || !VERIFICATION_ID_REGEX.test(verificationId.trim())) {
+      throw new Error(`Invalid verificationId: must be 8-64 alphanumeric, dash, or underscore characters, got "${verificationId}"`);
+    }
+    if (typeof count !== "number" || !Number.isFinite(count) || count <= 0 || !Number.isInteger(count) || count > 1000) {
+      throw new Error(`Invalid synthetic metric count: ${count}. Must be a finite positive integer between 1 and 1000.`);
+    }
+    const ALLOWED_STATUSES = new Set(["synthetic", "test_verified", "smoke_test"]);
+    if (status !== undefined && !ALLOWED_STATUSES.has(status)) {
+      throw new Error(`Invalid synthetic metric status: "${status}". Must be one of ['synthetic', 'test_verified', 'smoke_test'].`);
+    }
+    const safeStatus = status || "test_verified";
+    const vId = verificationId.trim();
+
+    // Cardinality check before modifying either PrometheusRegistry or OpenTelemetry
+    registry.pruneExpiredSyntheticIds();
+    const activeIds = registry.getActiveSyntheticVerificationIds();
+    if (!activeIds.includes(vId) && activeIds.length >= PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS) {
+      throw new Error(
+        `Synthetic verification ID cardinality ceiling (${PrometheusRegistry.MAX_ACTIVE_SYNTHETIC_VERIFICATION_IDS}) reached. Cannot register new verification ID until existing IDs are expired or cleaned up.`
+      );
+    }
+
+    registry.recordRequest(count, {
+      method: "POST",
+      route: "/test/synthetic",
+      status_code: 200,
+      verification_id: vId,
+      status: safeStatus,
+    });
+    try {
+      rawRequestCounter.add(count, {
+        service: serviceName,
+        method: "POST",
+        route: "/test/synthetic",
+        status: safeStatus,
+      });
+    } catch (err: unknown) {
+      log("warn", "OTel counter.add for synthetic metric failed", {
+        error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      });
     }
   };
 
@@ -173,6 +574,41 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     span.end();
   };
 
+  const getPrometheusMetrics = () => registry.toPrometheusFormat();
+
+  const handleMetricsRequest = (res: import("http").ServerResponse) => {
+    res.writeHead(200, {
+      "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+    });
+    res.end(registry.toPrometheusFormat());
+  };
+
+  const setHealthStatus = (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => {
+    registry.setHealthStatus(status);
+  };
+
+  const getHealthStatus = () => registry.getHealthStatus();
+
+  const getExportStatus = () => {
+    const computeOverall = (): "SUCCESS" | "FAILED" | "PENDING" | "DISABLED" => {
+      if (!isCloudExport) return "DISABLED";
+      if (metricTracker.status === "FAILED" || traceTracker.status === "FAILED") return "FAILED";
+      if (metricTracker.status === "SUCCESS" && traceTracker.status === "SUCCESS") return "SUCCESS";
+      return "PENDING";
+    };
+
+    return {
+      isCloudExport,
+      metrics: { ...metricTracker },
+      traces: { ...traceTracker },
+      lastExportStatus: computeOverall(),
+      lastExportTime: metricTracker.lastSuccessTime || traceTracker.lastSuccessTime,
+      lastExportError: metricTracker.lastError || traceTracker.lastError,
+      successCount: metricTracker.successCount + traceTracker.successCount,
+      failureCount: metricTracker.failureCount + traceTracker.failureCount,
+    };
+  };
+
   const instance: ServiceTelemetry = {
     tracer,
     meter,
@@ -185,6 +621,21 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     endSpan,
     isCloudExportEnabled: isCloudExport,
     otlpTargetUrl: traceUrl,
+    registry,
+    recordSyntheticMetric,
+    getActiveSyntheticVerificationIds: (nowMs?: number) => registry.getActiveSyntheticVerificationIds(nowMs),
+    clearSyntheticVerificationIds: () => registry.clearSyntheticVerificationIds(),
+    clearSyntheticVerificationId: (id: string) => registry.clearSyntheticVerificationId(id),
+    pruneExpiredSyntheticIds: (nowMs?: number, customTtlMs?: number) => registry.pruneExpiredSyntheticIds(nowMs, customTtlMs),
+    setSyntheticIdTtlMs: (ttlMs: number) => registry.setSyntheticIdTtlMs(ttlMs),
+    getSyntheticIdTtlMs: () => registry.getSyntheticIdTtlMs(),
+    setTimeProvider: (fn: () => number) => registry.setTimeProvider(fn),
+    getTimeProvider: () => registry.getTimeProvider(),
+    getPrometheusMetrics,
+    handleMetricsRequest,
+    setHealthStatus,
+    getHealthStatus,
+    getExportStatus,
   };
 
   initializedServices.set(serviceName, instance);

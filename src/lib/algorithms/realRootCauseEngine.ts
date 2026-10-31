@@ -47,32 +47,99 @@ export class RealRootCauseEngine {
       }
     }
 
-    // 2. Fetch live observed metrics & traces from TelemetryManager
-    const { observedServices } = await telemetryManager.getObservedServices();
-    const recentTraces = await telemetryManager.getRecentTraces(undefined, 25);
+    // 2. Fetch live observed metrics, historical normalized batch, and recent traces from TelemetryManager
+    const [batch, { observedServices }, recentTraces] = await Promise.all([
+      telemetryManager.getNormalizedBatch(),
+      telemetryManager.getObservedServices(),
+      telemetryManager.getRecentTraces(undefined, 25),
+    ]);
 
-    // 3. Construct TelemetryPoints and current states from actual measurements
-    const currentServiceStates = new Map<string, { status: "HEALTHY" | "DEGRADED" | "DOWN"; latency: number; errorRate: number }>();
+    // 3. Extract unique timestamps across all normalized historical metrics
+    const uniqueTimestamps = new Set<string>();
+    for (const m of batch.metrics) {
+      if (m.metricType === "REQUEST_RATE" || m.metricType === "ERROR_RATE" || m.metricType === "LATENCY_AVG") {
+        uniqueTimestamps.add(m.timestamp);
+      }
+    }
+
+    // Sort historical timestamps in ascending chronological order
+    const sortedTimestamps = Array.from(uniqueTimestamps).sort(
+      (a, b) => new Date(a).getTime() - new Date(b).getTime()
+    );
+
+    // Convert historical timestamps into monotonically increasing observation steps (1, 2, 3...)
+    const stepByTimestamp = new Map<string, number>();
+    sortedTimestamps.forEach((ts, idx) => {
+      stepByTimestamp.set(ts, idx + 1);
+    });
+
+    // 4. Construct multiple chronological TelemetryPoint samples per service from historical batch
     const telemetrySamples: TelemetryPoint[] = [];
 
-    const now = new Date();
-    for (const obs of observedServices) {
-      const stateStatus = obs.status === "UNKNOWN" ? "HEALTHY" : obs.status;
-      currentServiceStates.set(obs.serviceId, {
-        status: stateStatus,
-        latency: obs.latencyMs,
-        errorRate: obs.errorRate,
-      });
+    for (const svc of services) {
+      const svcMetrics = batch.metrics.filter(
+        (m) => m.serviceName === svc.id || m.serviceName === svc.name
+      );
 
-      // Synthetic sample step 1
-      telemetrySamples.push({
-        serviceId: obs.serviceId,
-        simulationStep: 1,
-        timestamp: now,
+      for (const ts of sortedTimestamps) {
+        const reqRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "REQUEST_RATE");
+        const errRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "ERROR_RATE");
+        const latRec = svcMetrics.find((m) => m.timestamp === ts && m.metricType === "LATENCY_AVG");
+
+        // Only construct a valid TelemetryPoint when measurements actually exist
+        // Do not fabricate healthy metrics from database baselines or use zero as missing-data sentinel!
+        if (latRec !== undefined || errRec !== undefined) {
+          const hasValidLatency = latRec !== undefined && Number.isFinite(latRec.value);
+          const hasValidErrorRate = errRec !== undefined && Number.isFinite(errRec.value);
+          const hasValidRequestCount = reqRec !== undefined && Number.isFinite(reqRec.value);
+
+          const latency = hasValidLatency ? latRec.value : undefined;
+          const errorRate = hasValidErrorRate ? errRec.value : undefined; // Preserves actual ERROR_RATE percentage
+          const requestCount = hasValidRequestCount ? reqRec.value * 60 : undefined;
+
+          let healthStatus = "HEALTHY";
+          if (
+            (hasValidErrorRate && errorRate! > 25) ||
+            (hasValidLatency && svc.baselineLatency > 0 && latency! >= svc.baselineLatency * 4)
+          ) {
+            healthStatus = "DOWN";
+          } else if (
+            (hasValidErrorRate && errorRate! > 3) ||
+            (hasValidLatency && svc.baselineLatency > 0 && latency! >= svc.baselineLatency * 1.8)
+          ) {
+            healthStatus = "DEGRADED";
+          } else if (!hasValidLatency || !hasValidErrorRate) {
+            healthStatus = "UNKNOWN";
+          }
+
+          telemetrySamples.push({
+            serviceId: svc.id,
+            simulationStep: stepByTimestamp.get(ts)!,
+            timestamp: new Date(ts),
+            latency,
+            errorRate,
+            requestCount,
+            healthStatus,
+            hasValidLatency,
+            hasValidErrorRate,
+            hasValidRequestCount,
+          });
+        }
+      }
+    }
+
+    // 5. Construct current service states from actual measurements
+    // Preserve UNKNOWN; do NOT map UNKNOWN to HEALTHY!
+    const currentServiceStates = new Map<
+      string,
+      { status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN"; latency: number; errorRate: number }
+    >();
+
+    for (const obs of observedServices) {
+      currentServiceStates.set(obs.serviceId, {
+        status: obs.status,
         latency: obs.latencyMs,
         errorRate: obs.errorRate,
-        requestCount: obs.requestRate * 60,
-        healthStatus: stateStatus,
       });
     }
 

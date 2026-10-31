@@ -1,5 +1,6 @@
 import prisma from "../db/prisma";
 import { telemetryManager } from "../telemetry/telemetryManager";
+import { BackendHealthStatus } from "../telemetry/types";
 import { simulator } from "../simulation/simulator";
 import { realRootCauseEngine } from "../algorithms/realRootCauseEngine";
 import { AIProvider, AIInvestigationContext, AIProviderError } from "./providers/types";
@@ -10,6 +11,102 @@ import { validateAndGroundInvestigation } from "./groundingValidator";
 export interface InvestigateOptions {
   provider?: AIProvider;
   forceRefresh?: boolean;
+}
+
+export function determineTelemetryProvenance(params: {
+  isLiveScenario?: boolean;
+  simulationScenario?: string | null;
+  hasSimulationScenario?: boolean;
+  isSimulationOrigin?: boolean;
+  isExplicitLiveObservation?: boolean;
+  requestedMode?: string;
+  effectiveMode: string;
+  backendHealth: {
+    backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" | "SIMULATION";
+    prometheusAvailable: boolean;
+    jaegerAvailable: boolean;
+  };
+}): TelemetryProvenance {
+  const { backendHealth, effectiveMode } = params;
+
+  // 1. Identify simulation-origin incidents
+  // Explicit simulation scenario or a reliable persisted origin marker is required to assign SIMULATED.
+  // A simulation-origin incident must remain SIMULATED even after the application switches to LIVE
+  // or genuine/mock providers are present.
+  const isSimulationOrigin =
+    params.isSimulationOrigin === true ||
+    (Boolean(params.simulationScenario) && params.simulationScenario !== "live-telemetry-observation") ||
+    (params.hasSimulationScenario === true &&
+      params.simulationScenario !== "live-telemetry-observation" &&
+      !params.isExplicitLiveObservation &&
+      !params.isLiveScenario);
+
+  if (isSimulationOrigin) {
+    return "SIMULATED";
+  }
+
+  // 2. Identify live-origin incidents
+  // simulationScenario === "live-telemetry-observation" identifies explicit live-observation origin.
+  const isLiveOrigin =
+    params.isExplicitLiveObservation === true ||
+    params.simulationScenario === "live-telemetry-observation" ||
+    (params.isLiveScenario === true && !isSimulationOrigin);
+
+  if (!isLiveOrigin && !params.isExplicitLiveObservation) {
+    // Incidents with unverified origin must NOT automatically become SIMULATED merely because global mode is SIMULATION.
+    // Unknown origin + mock provider returns MOCK without falsely labeling as simulation-derived.
+    if (backendHealth.backendType === "MOCK_EMULATION") {
+      return "MOCK";
+    }
+    return "UNAVAILABLE";
+  }
+
+  // 3. For live-origin incidents:
+  if (backendHealth.backendType === "MOCK_EMULATION") {
+    return "MOCK";
+  }
+
+  const isGenuineBackend =
+    backendHealth.backendType === "GRAFANA_CLOUD" ||
+    backendHealth.backendType === "GENUINE_STACK";
+
+  if (isGenuineBackend) {
+    // determineTelemetryProvenance() must not independently label an investigation LIVE_TELEMETRY
+    // unless all required conditions are satisfied:
+    // - effectiveMode is LIVE
+    // - backendType is GRAFANA_CLOUD or GENUINE_STACK
+    // - prometheusAvailable is true
+    // - jaegerAvailable is true
+    if (
+      effectiveMode === "LIVE" &&
+      backendHealth.prometheusAvailable === true &&
+      backendHealth.jaegerAvailable === true
+    ) {
+      return "LIVE_TELEMETRY";
+    }
+
+    // A genuine provider that is only partially available must be PARTIAL_TELEMETRY, not LIVE_TELEMETRY.
+    if (backendHealth.prometheusAvailable || backendHealth.jaegerAvailable) {
+      return "PARTIAL_TELEMETRY";
+    }
+
+    return "UNAVAILABLE";
+  }
+
+  return "UNAVAILABLE";
+}
+
+export function parsePersistedProvenance(raw: unknown): TelemetryProvenance {
+  if (
+    raw === "LIVE_TELEMETRY" ||
+    raw === "PARTIAL_TELEMETRY" ||
+    raw === "UNAVAILABLE" ||
+    raw === "SIMULATED" ||
+    raw === "MOCK"
+  ) {
+    return raw;
+  }
+  return "UNAVAILABLE";
 }
 
 /**
@@ -49,11 +146,16 @@ export async function investigateIncident(
 
   // 3. Ensure deterministic root-cause candidates exist
   let deterministicCandidates = incident.rootCauseCandidates;
+  const isSimulationIncident = Boolean(
+    incident.simulationScenario && incident.simulationScenario !== "live-telemetry-observation"
+  );
+  const isExplicitLiveObservation = incident.simulationScenario === "live-telemetry-observation";
+
   if (deterministicCandidates.length === 0) {
-    if (incident.simulationScenario === "live-telemetry-observation" || telemetryManager.getMode() === "REAL") {
-      await realRootCauseEngine.analyzeRealIncident(incidentId);
-    } else {
+    if (isSimulationIncident) {
       await simulator.recalculateRootCauses(incidentId);
+    } else {
+      await realRootCauseEngine.analyzeRealIncident(incidentId);
     }
 
     const refreshedCandidates = await prisma.rootCauseCandidate.findMany({
@@ -64,13 +166,47 @@ export async function investigateIncident(
     deterministicCandidates = refreshedCandidates;
   }
 
-  // 4. Determine Provenance truthfully
-  let provenance: TelemetryProvenance = "SIMULATED";
-  if (incident.simulationScenario === "live-telemetry-observation" || telemetryManager.getMode() === "REAL") {
-    provenance = "LIVE_TELEMETRY";
-  } else if (!incident.simulationScenario) {
-    provenance = "MOCK";
+  // 4. Determine Provenance truthfully with a consistent observation snapshot
+  const requestedMode = telemetryManager.getRequestedMode();
+  let effectiveMode = telemetryManager.getEffectiveMode();
+  let health: BackendHealthStatus;
+
+  if (isSimulationIncident || requestedMode === "SIMULATION") {
+    health = await telemetryManager.getBackendHealth(false);
+    effectiveMode = "SIMULATION";
+  } else {
+    try {
+      // Reuses fresh 3s observation snapshot; provides consistent effectiveMode & health
+      const observation = await telemetryManager.getObservedServices(false);
+      effectiveMode = observation.effectiveMode ?? observation.mode;
+      health = observation.backendHealth;
+    } catch {
+      telemetryManager.markDegraded();
+      effectiveMode = "DEGRADED";
+      health = await telemetryManager.getBackendHealth(false).catch(() => ({
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: "",
+        jaegerUrl: "",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "UNAVAILABLE" as const,
+        lastChecked: new Date().toISOString(),
+        details: "Observation snapshot probe failed during investigation",
+      }));
+    }
   }
+
+  const provenance: TelemetryProvenance = determineTelemetryProvenance({
+    isSimulationOrigin: isSimulationIncident,
+    isExplicitLiveObservation,
+    simulationScenario: incident.simulationScenario,
+    hasSimulationScenario: Boolean(incident.simulationScenario),
+    requestedMode,
+    effectiveMode,
+    backendHealth: health,
+  });
 
   // 5. Gather service topology
   const services = await prisma.service.findMany({
@@ -90,47 +226,57 @@ export async function investigateIncident(
     dependencies: s.outgoingDependencies.map((d) => d.targetServiceId),
   }));
 
-  // 6. Gather recent traces if available
+  // 6. Gather recent traces if available (strictly isolated by incident origin)
   let recentTraces: AIInvestigationContext["recentTraces"] = [];
-  try {
-    const rawTraces = await telemetryManager.getRecentTraces(undefined, 8);
-    recentTraces = rawTraces.map((t) => {
-      let bottleneckSpan:
-        | {
-            service: string;
-            operation: string;
-            durationMs: number;
-            isError: boolean;
+  if (isSimulationIncident) {
+    // Simulation-origin incidents must never query genuine live trace providers.
+    // If simulation-specific traces exist, retrieve only traces scoped to that incident/scenario.
+    // Otherwise pass an empty trace collection and make the lack of trace evidence explicit.
+    recentTraces = [];
+  } else if (isExplicitLiveObservation && health.jaegerAvailable) {
+    // Explicit live-observation incidents may collect genuine provider traces, subject to verified backend state
+    try {
+      const rawTraces = await telemetryManager.getRecentTraces(undefined, 8);
+      recentTraces = rawTraces.map((t) => {
+        let bottleneckSpan:
+          | {
+              service: string;
+              operation: string;
+              durationMs: number;
+              isError: boolean;
+            }
+          | undefined = undefined;
+
+        const spans = t.allSpans ?? [];
+        if (spans.length > 0) {
+          const longestSpan = spans.reduce(
+            (max, s) => (s.durationMs > (max?.durationMs ?? 0) ? s : max),
+            spans[0]
+          );
+          if (longestSpan) {
+            bottleneckSpan = {
+              service: longestSpan.serviceName,
+              operation: longestSpan.operationName,
+              durationMs: longestSpan.durationMs,
+              isError: longestSpan.statusCode === "ERROR",
+            };
           }
-        | undefined = undefined;
-
-      const spans = t.allSpans ?? [];
-      if (spans.length > 0) {
-        const longestSpan = spans.reduce(
-          (max, s) => (s.durationMs > (max?.durationMs ?? 0) ? s : max),
-          spans[0]
-        );
-        if (longestSpan) {
-          bottleneckSpan = {
-            service: longestSpan.serviceName,
-            operation: longestSpan.operationName,
-            durationMs: longestSpan.durationMs,
-            isError: longestSpan.statusCode === "ERROR",
-          };
         }
-      }
 
-      return {
-        traceId: t.traceId,
-        rootService: t.rootServiceName,
-        durationMs: t.durationMs,
-        hasErrors: t.hasErrors,
-        servicesInvolved: t.servicesInvolved,
-        bottleneckSpan,
-      };
-    });
-  } catch {
-    // Non-fatal if trace backend is offline
+        return {
+          traceId: t.traceId,
+          rootService: t.rootServiceName,
+          durationMs: t.durationMs,
+          hasErrors: t.hasErrors,
+          servicesInvolved: t.servicesInvolved,
+          bottleneckSpan,
+        };
+      });
+    } catch {
+      // Non-fatal if trace backend is offline
+      recentTraces = [];
+    }
+  } else {
     recentTraces = [];
   }
 
@@ -356,7 +502,7 @@ function parsePersistedInvestigation(
     remediationOptions,
     missingEvidence,
     nextObservations,
-    provenance: record.provenance as TelemetryProvenance,
+    provenance: parsePersistedProvenance(record.provenance),
     groundingValidation: {
       totalEvidenceCitations: totalCitations,
       validEvidenceCitations: validCitations,

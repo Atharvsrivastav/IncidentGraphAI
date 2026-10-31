@@ -161,6 +161,7 @@ function IncidentDetailContent({
             <button
               onClick={handleReanalyze}
               disabled={analyzing}
+              data-testid="reanalyze-button"
               className="flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-purple-600/30 transition-all disabled:opacity-50"
             >
               <RefreshCw className={`h-4 w-4 ${analyzing ? "animate-spin" : ""}`} />
@@ -185,6 +186,7 @@ function IncidentDetailContent({
         </button>
         <button
           onClick={() => setActiveTab("root-causes")}
+          data-testid="ranked-root-causes-tab"
           className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
             activeTab === "root-causes"
               ? "border-purple-500 text-purple-400 font-bold"
@@ -192,10 +194,11 @@ function IncidentDetailContent({
           }`}
         >
           <Zap className="h-4 w-4" />
-          <span>DSA Graph Candidates ({candidates.length})</span>
+          <span>Ranked Root Causes (DSA) ({candidates.length})</span>
         </button>
         <button
           onClick={() => setActiveTab("evidence")}
+          data-testid="evidence-timeline-tab"
           className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition-colors ${
             activeTab === "evidence"
               ? "border-blue-500 text-blue-400 font-bold"
@@ -238,6 +241,7 @@ function IncidentDetailContent({
               return (
                 <div
                   key={cand.id}
+                  data-testid={`root-cause-candidate-${cand.candidateServiceId}`}
                   className={`rounded-2xl border p-6 transition-all ${
                     isTopRank
                       ? "border-purple-500/60 bg-gradient-to-r from-purple-950/20 via-slate-900/80 to-slate-900/90 shadow-xl"
@@ -248,6 +252,7 @@ function IncidentDetailContent({
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800/80">
                     <div className="flex items-center gap-3">
                       <div
+                        data-testid={`candidate-rank-${cand.candidateServiceId}`}
                         className={`flex h-9 w-9 items-center justify-center rounded-xl font-mono text-sm font-black ${
                           isTopRank
                             ? "bg-purple-600 text-white shadow-lg shadow-purple-600/40"
@@ -274,7 +279,10 @@ function IncidentDetailContent({
                         <span className="text-[10px] font-mono text-purple-400 block uppercase">
                           Heuristic Score
                         </span>
-                        <span className="text-sm font-black font-mono text-purple-300">
+                        <span
+                          data-testid={`candidate-score-${cand.candidateServiceId}`}
+                          className="text-sm font-black font-mono text-purple-300"
+                        >
                           {cand.score} / 100
                         </span>
                       </div>
@@ -352,7 +360,10 @@ function IncidentDetailContent({
 
       {/* Tab 2: Evidence Timeline */}
       {activeTab === "evidence" && (
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 backdrop-blur-md">
+        <div
+          data-testid="evidence-timeline-panel"
+          className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 backdrop-blur-md"
+        >
           {evidences.length === 0 ? (
             <div className="py-8 text-center text-xs text-slate-400 italic">
               No evidence recorded yet.

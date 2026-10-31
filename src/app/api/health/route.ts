@@ -3,6 +3,7 @@ import prisma from "@/lib/db/prisma";
 import { TelemetryManager } from "@/lib/telemetry/telemetryManager";
 import { getAIProviderStatus } from "@/lib/ai/providers/factory";
 import { ensureDatabaseSeeded } from "@/lib/db/ensure-seeded";
+import { validateDatabaseIsolation } from "@/lib/db/isolation-validator";
 
 export async function GET() {
   const startTime = Date.now();
@@ -53,6 +54,8 @@ export async function GET() {
   const dbProvider = dbUrl.startsWith("postgres://") || dbUrl.startsWith("postgresql://")
     ? "postgresql"
     : "sqlite";
+  const isolationResult = validateDatabaseIsolation(dbUrl, process.env.E2E_ISOLATED);
+  const isIsolated = isolationResult.isIsolated;
 
   return NextResponse.json(
     {
@@ -66,6 +69,7 @@ export async function GET() {
         provider: dbProvider,
         servicesCount,
         error: dbError,
+        isIsolated,
       },
       telemetry: {
         mode: telemetryMode,

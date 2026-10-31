@@ -262,25 +262,37 @@ export function AiInvestigationSection({
                 className={`flex items-center gap-1.5 rounded px-2.5 py-0.5 text-[10px] font-mono font-bold uppercase ${
                   provenance === "LIVE_TELEMETRY"
                     ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                    : provenance === "SIMULATED"
-                    ? "bg-blue-500/20 text-blue-300 border border-blue-500/30"
-                    : "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                    : provenance === "PARTIAL_TELEMETRY"
+                    ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                    : provenance === "MOCK"
+                    ? "bg-purple-500/20 text-purple-300 border border-purple-500/30"
+                    : provenance === "UNAVAILABLE"
+                    ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                    : "bg-blue-500/20 text-blue-300 border border-blue-500/30"
                 }`}
               >
                 <span
                   className={`h-1.5 w-1.5 rounded-full ${
                     provenance === "LIVE_TELEMETRY"
                       ? "bg-emerald-400 animate-pulse"
-                      : provenance === "SIMULATED"
-                      ? "bg-blue-400"
-                      : "bg-amber-400"
+                      : provenance === "PARTIAL_TELEMETRY"
+                      ? "bg-amber-400"
+                      : provenance === "MOCK"
+                      ? "bg-purple-400"
+                      : provenance === "UNAVAILABLE"
+                      ? "bg-rose-400"
+                      : "bg-blue-400"
                   }`}
                 />
                 {provenance === "LIVE_TELEMETRY"
-                  ? "Live Telemetry (Grafana Cloud)"
-                  : provenance === "SIMULATED"
-                  ? "Simulated Telemetry"
-                  : "Mock Telemetry"}
+                  ? "Live Telemetry"
+                  : provenance === "PARTIAL_TELEMETRY"
+                  ? "Partial Telemetry (Degraded)"
+                  : provenance === "MOCK"
+                  ? "Mock Telemetry Emulation"
+                  : provenance === "UNAVAILABLE"
+                  ? "Telemetry Unavailable"
+                  : "Simulated Telemetry"}
               </span>
 
               {/* Diagnosis Status Badge */}

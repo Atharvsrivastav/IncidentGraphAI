@@ -1,4 +1,6 @@
-export type TelemetryMode = "SIMULATION" | "REAL";
+export type TelemetryMode = "SIMULATION" | "LIVE" | "DEGRADED" | "REAL";
+
+export type TelemetryProvenanceState = "LIVE" | "MOCK_EMULATION" | "LOCAL" | "DISABLED" | "ERROR";
 
 export interface BackendHealthStatus {
   prometheusAvailable: boolean;
@@ -8,19 +10,30 @@ export interface BackendHealthStatus {
   isMockBackend: boolean;
   isCloudBackend: boolean;
   cloudConfigured: boolean;
-  backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE";
+  backendType: "GRAFANA_CLOUD" | "GENUINE_STACK" | "MOCK_EMULATION" | "UNAVAILABLE" | "SIMULATION";
+  provenance?: TelemetryProvenanceState;
   details?: string;
   lastChecked: string;
+  lastIngestedAt?: string;
+  lastVerifiedAt?: string;
+  metricsIngested?: boolean;
+  tracesIngested?: boolean;
 }
 
 export interface ObservedServiceMetric {
   serviceId: string;
   serviceName: string;
   source: "PROMETHEUS" | "JAEGER" | "SIMULATION";
+  provenance?: TelemetryProvenanceState;
   status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
   latencyMs: number;
+  hasValidLatency?: boolean;
+  latencyP95Ms?: number;
+  hasValidP95?: boolean;
   errorRate: number; // 0 - 100 percentage
+  hasValidErrorRate?: boolean;
   requestRate: number; // req/sec
+  hasValidRequestRate?: boolean;
   lastObserved: string;
   traceCount: number;
   isStale: boolean;
@@ -59,6 +72,8 @@ export interface DistributedTrace {
   servicesInvolved: string[];
   rootSpan: TraceSpan | null;
   allSpans: TraceSpan[];
+  isFallback?: boolean;
+  isSearchSummary?: boolean;
 }
 
 export interface RealTelemetryEvidence {

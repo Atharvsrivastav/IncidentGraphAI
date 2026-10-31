@@ -30,12 +30,42 @@ services:
     image: prom/prometheus:v2.50.1
     container_name: incidentgraph-prometheus
     restart: unless-stopped
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.enable-lifecycle"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL
+      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER
+      - GRAFANA_CLOUD_INSTANCE_ID
+      - GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        RW_TOKEN="$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN"
+        RW_USER="$${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER:-$$GRAFANA_CLOUD_INSTANCE_ID}"
+        if [ -n "$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL" ] && [ -n "$$RW_TOKEN" ]; then
+          echo "[Prometheus] Configuring Grafana Cloud remote-write integration..."
+          cp /etc/prometheus/prometheus.yml /tmp/prometheus.yml
+          cat <<EOF >> /tmp/prometheus.yml
+
+        remote_write:
+          - url: "$$GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL"
+            basic_auth:
+              username: "$$RW_USER"
+              password: "$$RW_TOKEN"
+            queue_config:
+              max_samples_per_send: 500
+              max_shards: 4
+              batch_send_deadline: 5s
+        EOF
+          exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus --web.enable-lifecycle
+        else
+          echo "[Prometheus] Cloud credentials not set. Running in local standalone scrape mode..."
+          exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.enable-lifecycle
+        fi
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/file_sd:/etc/prometheus/file_sd
     ports:
       - "9090:9090" # Prometheus Web UI & PromQL Query API
     depends_on:

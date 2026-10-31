@@ -9,13 +9,16 @@ interface ServiceDetailDrawerProps {
     name: string;
     serviceType: string;
     tier: number;
-    status: "HEALTHY" | "DEGRADED" | "DOWN";
-    currentLatency: number;
+    status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
+    currentLatency: number | null;
     baselineLatency: number;
-    currentErrorRate: number;
+    currentErrorRate: number | null;
     baselineErrorRate: number;
-    requestRate: number;
+    requestRate: number | null;
     description: string;
+    hasValidLatency?: boolean;
+    hasValidErrorRate?: boolean;
+    hasValidRequestRate?: boolean;
   };
   dependencies: {
     sourceServiceId: string;
@@ -68,19 +71,54 @@ export function ServiceDetailDrawer({
     }
   };
 
+  const statusBadgeColor =
+    service.status === "DOWN"
+      ? "bg-rose-500/20 text-rose-300 border-rose-500/50"
+      : service.status === "DEGRADED"
+      ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
+      : service.status === "UNKNOWN"
+      ? "bg-slate-700/50 text-slate-300 border-slate-600/50"
+      : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
+
+  const hasLatency =
+    service.hasValidLatency !== false &&
+    service.currentLatency !== null &&
+    service.currentLatency !== undefined;
+
+  const hasError =
+    service.hasValidErrorRate !== false &&
+    service.currentErrorRate !== null &&
+    service.currentErrorRate !== undefined;
+
+  const hasVolume =
+    service.hasValidRequestRate !== false &&
+    service.requestRate !== null &&
+    service.requestRate !== undefined;
+
   return (
-    <div className="absolute top-0 right-0 z-30 h-full w-full max-w-md border-l border-slate-800 bg-slate-900/95 p-6 shadow-2xl backdrop-blur-xl overflow-y-auto animate-in slide-in-from-right duration-200">
+    <div
+      data-testid="service-detail-drawer"
+      className="absolute top-0 right-0 z-30 h-full w-full max-w-md border-l border-slate-800 bg-slate-900/95 p-6 shadow-2xl backdrop-blur-xl overflow-y-auto animate-in slide-in-from-right duration-200"
+    >
       {/* Drawer Header */}
       <div className="flex items-start justify-between pb-4 border-b border-slate-800">
         <div>
-          <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-slate-400">
-            Tier {service.tier} · {service.serviceType}
-          </span>
-          <h3 className="mt-1 text-lg font-bold text-white tracking-tight">{service.name}</h3>
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-slate-400">
+              Tier {service.tier} · {service.serviceType}
+            </span>
+            <span
+              className={`rounded border px-1.5 py-0.5 text-[10px] font-mono font-semibold uppercase ${statusBadgeColor}`}
+            >
+              {service.status}
+            </span>
+          </div>
+          <h3 className="mt-1.5 text-lg font-bold text-white tracking-tight">{service.name}</h3>
           <p className="mt-1 text-xs text-slate-400 leading-relaxed">{service.description}</p>
         </div>
         <button
           onClick={onClose}
+          data-testid="close-service-detail-btn"
           className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white transition-colors"
         >
           <X className="h-5 w-5" />
@@ -98,7 +136,7 @@ export function ServiceDetailDrawer({
             <span className="text-[11px] text-slate-400">Response Latency</span>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-xl font-bold font-mono text-slate-100">
-                {Math.round(service.currentLatency)}ms
+                {hasLatency ? `${Math.round(service.currentLatency!)}ms` : "N/A"}
               </span>
               <span className="text-[10px] font-mono text-slate-400">
                 base: {service.baselineLatency}ms
@@ -110,7 +148,7 @@ export function ServiceDetailDrawer({
             <span className="text-[11px] text-slate-400">Error Rate</span>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-xl font-bold font-mono text-slate-100">
-                {service.currentErrorRate.toFixed(1)}%
+                {hasError ? `${service.currentErrorRate!.toFixed(1)}%` : "N/A"}
               </span>
               <span className="text-[10px] font-mono text-slate-400">
                 base: {service.baselineErrorRate}%
@@ -123,7 +161,7 @@ export function ServiceDetailDrawer({
           <div>
             <span className="text-[11px] text-slate-400">Throughput Volume</span>
             <div className="text-sm font-bold font-mono text-slate-100">
-              {service.requestRate} requests / sec
+              {hasVolume ? `${service.requestRate} requests / sec` : "N/A"}
             </div>
           </div>
           <Clock className="h-5 w-5 text-slate-400" />
@@ -186,7 +224,7 @@ export function ServiceDetailDrawer({
       <div className="mt-8 pt-4 border-t border-slate-800 flex gap-3">
         <button
           onClick={handleRestore}
-          disabled={isRestoring || service.status === "HEALTHY"}
+          disabled={isRestoring || service.status === "HEALTHY" || service.status === "UNKNOWN"}
           className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-400 py-2.5 text-xs font-semibold text-white transition-colors"
         >
           <RefreshCw className={`h-4 w-4 ${isRestoring ? "animate-spin" : ""}`} />

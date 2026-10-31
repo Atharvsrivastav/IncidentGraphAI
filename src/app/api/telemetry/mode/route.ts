@@ -1,15 +1,56 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { telemetryManager } from "@/lib/telemetry/telemetryManager";
+import { BackendHealthStatus } from "@/lib/telemetry/types";
 
 const ModeSchema = z.object({
-  mode: z.enum(["SIMULATION", "REAL"]),
+  mode: z.enum(["SIMULATION", "LIVE", "DEGRADED", "REAL"]),
 });
 
 export async function GET() {
-  const mode = telemetryManager.getMode();
-  const health = await telemetryManager.getBackendHealth();
-  return NextResponse.json({ mode, health });
+  const requestedMode = telemetryManager.getRequestedMode();
+  let effectiveMode = telemetryManager.getEffectiveMode();
+  let health: BackendHealthStatus;
+  let lastIngestedAt = telemetryManager.getLastIngestedAt();
+
+  if (requestedMode === "SIMULATION") {
+    // Strict simulation isolation: zero external network probes, single isolated probe
+    effectiveMode = "SIMULATION";
+    health = await telemetryManager.getBackendHealth(false);
+  } else {
+    try {
+      // LIVE mode: obtain latest valid observation snapshot (reusing 3s cache)
+      const observation = await telemetryManager.getObservedServices(false);
+      effectiveMode = observation.effectiveMode ?? observation.mode;
+      health = observation.backendHealth;
+      lastIngestedAt = observation.lastIngestedAt ?? lastIngestedAt;
+    } catch {
+      // Backend loss or failed observations transition internal state and response to DEGRADED
+      telemetryManager.markDegraded();
+      effectiveMode = "DEGRADED";
+      const fallbackHealth = await telemetryManager.getBackendHealth(false).catch(() => null);
+      health = fallbackHealth ?? {
+        prometheusAvailable: false,
+        jaegerAvailable: false,
+        prometheusUrl: "",
+        jaegerUrl: "",
+        isMockBackend: false,
+        isCloudBackend: false,
+        cloudConfigured: false,
+        backendType: "UNAVAILABLE",
+        lastChecked: new Date().toISOString(),
+        details: "Observation snapshot failed; operational state degraded.",
+      };
+    }
+  }
+
+  return NextResponse.json({
+    mode: effectiveMode,
+    requestedMode,
+    effectiveMode,
+    health,
+    lastIngestedAt,
+  });
 }
 
 export async function POST(request: Request) {
@@ -18,17 +59,36 @@ export async function POST(request: Request) {
     const validated = ModeSchema.parse(body);
 
     telemetryManager.setMode(validated.mode);
-    const health = await telemetryManager.getBackendHealth();
+
+    let effectiveMode = telemetryManager.getEffectiveMode();
+    let health = await telemetryManager.getBackendHealth();
+
+    // If LIVE or REAL was requested, probe observation to determine truthful initial operational state
+    if (validated.mode === "LIVE" || validated.mode === "REAL") {
+      try {
+        const observation = await telemetryManager.getObservedServices(true);
+        effectiveMode = observation.effectiveMode ?? observation.mode;
+        health = observation.backendHealth;
+      } catch {
+        telemetryManager.markDegraded();
+        effectiveMode = "DEGRADED";
+      }
+    }
+
+    const requestedMode = telemetryManager.getRequestedMode();
 
     return NextResponse.json({
       success: true,
-      mode: validated.mode,
+      mode: effectiveMode,
+      requestedMode,
+      effectiveMode,
       health,
-      message: `Telemetry mode switched to ${validated.mode}`,
+      lastIngestedAt: telemetryManager.getLastIngestedAt(),
+      message: `Telemetry mode switched to ${requestedMode} (effective: ${effectiveMode})`,
     });
   } catch (err: unknown) {
     if (err instanceof z.ZodError) {
-      return NextResponse.json({ error: "Invalid mode. Allowed: SIMULATION, REAL" }, { status: 400 });
+      return NextResponse.json({ error: "Invalid mode. Allowed: SIMULATION, LIVE, DEGRADED, REAL" }, { status: 400 });
     }
     return NextResponse.json({ error: "Failed to update mode" }, { status: 500 });
   }

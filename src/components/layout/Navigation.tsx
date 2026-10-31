@@ -25,6 +25,8 @@ const NAV_ITEMS = [
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
+import { TelemetryUIMode, normalizeTelemetryMode } from "@/lib/telemetry/mergeServiceMetrics";
+
 export function Navigation() {
   const pathname = usePathname();
   const [systemStatus, setSystemStatus] = useState<string>("HEALTHY");
@@ -32,7 +34,11 @@ export function Navigation() {
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
   const [canReset, setCanReset] = useState<boolean>(false);
-  const [telemetryMode, setTelemetryMode] = useState<"SIMULATION" | "REAL">("SIMULATION");
+  const [requestedMode, setRequestedMode] = useState<TelemetryUIMode>("SIMULATION");
+  const [effectiveMode, setEffectiveMode] = useState<TelemetryUIMode>("SIMULATION");
+  const [backendType, setBackendType] = useState<string>("SIMULATION");
+  const [provenance, setProvenance] = useState<string>("DISABLED");
+  const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -55,7 +61,18 @@ export function Navigation() {
       }
       if (modeRes.ok) {
         const modeData = await modeRes.json();
-        setTelemetryMode(modeData.mode || "SIMULATION");
+        const eff = normalizeTelemetryMode(modeData.effectiveMode ?? modeData.mode);
+        const req = normalizeTelemetryMode(modeData.requestedMode ?? modeData.mode);
+        setEffectiveMode(eff);
+        setRequestedMode(req);
+        if (modeData.health?.backendType) {
+          setBackendType(modeData.health.backendType);
+        }
+        if (modeData.health?.provenance) {
+          setProvenance(modeData.health.provenance);
+        } else if (eff === "SIMULATION") {
+          setProvenance("DISABLED");
+        }
       }
     } catch {
       // Ignored in background polling
@@ -142,15 +159,32 @@ export function Navigation() {
           <div className="flex items-center rounded-lg border border-slate-800 bg-slate-900/90 p-0.5 text-xs font-mono">
             <button
               onClick={async () => {
-                await fetch("/api/telemetry/mode", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ mode: "SIMULATION" }),
-                });
-                setTelemetryMode("SIMULATION");
+                setIsSwitchingMode(true);
+                try {
+                  const res = await fetch("/api/telemetry/mode", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ mode: "SIMULATION" }),
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setEffectiveMode(normalizeTelemetryMode(data.effectiveMode ?? data.mode));
+                    setRequestedMode("SIMULATION");
+                    if (data.health?.backendType) {
+                      setBackendType(data.health.backendType);
+                    } else {
+                      setBackendType("SIMULATION");
+                    }
+                  }
+                } catch {
+                  // Keep current state on error; never fabricate mode
+                } finally {
+                  setIsSwitchingMode(false);
+                }
               }}
+              disabled={isSwitchingMode}
               className={`rounded px-2 py-1 text-[10px] font-semibold transition-colors ${
-                telemetryMode === "SIMULATION"
+                requestedMode === "SIMULATION"
                   ? "bg-blue-600 text-white font-bold shadow-sm"
                   : "text-slate-400 hover:text-slate-200"
               }`}
@@ -159,20 +193,57 @@ export function Navigation() {
             </button>
             <button
               onClick={async () => {
-                await fetch("/api/telemetry/mode", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ mode: "REAL" }),
-                });
-                setTelemetryMode("REAL");
+                setIsSwitchingMode(true);
+                try {
+                  const res = await fetch("/api/telemetry/mode", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ mode: "LIVE" }),
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setEffectiveMode(normalizeTelemetryMode(data.effectiveMode ?? data.mode));
+                    setRequestedMode("LIVE");
+                    if (data.health?.backendType) {
+                      setBackendType(data.health.backendType);
+                    }
+                  } else {
+                    // Under NO circumstance does a failed request set status to LIVE!
+                    console.error("Failed to switch telemetry mode to LIVE");
+                  }
+                } catch {
+                  // Under NO circumstance does a network failure set status to LIVE!
+                  console.error("Network error switching telemetry mode");
+                } finally {
+                  setIsSwitchingMode(false);
+                }
               }}
+              disabled={isSwitchingMode}
               className={`rounded px-2 py-1 text-[10px] font-semibold transition-colors ${
-                telemetryMode === "REAL"
-                  ? "bg-indigo-600 text-white font-bold shadow-sm"
+                isSwitchingMode
+                  ? "bg-slate-800 text-slate-300 font-bold shadow-sm animate-pulse"
+                  : requestedMode === "LIVE" && (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE")
+                  ? "bg-amber-600 text-white font-bold shadow-sm"
+                  : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                  ? "bg-purple-600 text-white font-bold shadow-sm"
+                  : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                  ? "bg-sky-600 text-white font-bold shadow-sm"
+                  : requestedMode === "LIVE" && effectiveMode === "LIVE"
+                  ? "bg-emerald-600 text-white font-bold shadow-sm"
                   : "text-slate-400 hover:text-slate-200"
               }`}
             >
-              Real OTel
+              {isSwitchingMode
+                ? "Connecting..."
+                : requestedMode === "LIVE" && (effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE")
+                ? "OTel (Degraded)"
+                : requestedMode === "LIVE" && backendType === "MOCK_EMULATION"
+                ? "Mock Emulation"
+                : requestedMode === "LIVE" && backendType === "GRAFANA_CLOUD"
+                ? "Grafana Cloud (Connected)"
+                : requestedMode === "LIVE" && effectiveMode === "LIVE"
+                ? "Live OTel (Connected)"
+                : "Live OTel"}
             </button>
           </div>
 
@@ -182,15 +253,31 @@ export function Navigation() {
               className={`h-2 w-2 rounded-full ${
                 systemStatus === "INCIDENT"
                   ? "bg-red-500 animate-pulse"
-                  : "bg-emerald-500"
+                  : provenance === "LIVE"
+                  ? "bg-emerald-400 animate-pulse"
+                  : provenance === "MOCK_EMULATION"
+                  ? "bg-purple-400"
+                  : provenance === "LOCAL"
+                  ? "bg-blue-400"
+                  : provenance === "ERROR" || effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
+                  ? "bg-amber-500 animate-pulse"
+                  : "bg-slate-400"
               }`}
             />
             <span className="font-medium text-slate-300">
               {systemStatus === "INCIDENT"
-                ? `Active Incident (${activeScenario ?? "Simulated"})`
-                : "All Systems Operational"}
+                ? `Active Incident (${activeScenario ?? (requestedMode === "SIMULATION" ? "Simulated" : "Live")})`
+                : provenance === "LIVE"
+                ? "LIVE: Grafana Cloud Verified"
+                : provenance === "MOCK_EMULATION"
+                ? "MOCK_EMULATION: Synthetic Telemetry"
+                : provenance === "LOCAL"
+                ? "LOCAL: Unverified Stack"
+                : provenance === "ERROR" || effectiveMode === "DEGRADED" || backendType === "UNAVAILABLE"
+                ? "Telemetry Pipeline Degraded"
+                : "Simulation Mode (Isolated)"}
             </span>
-            {currentStep > 0 && (
+            {currentStep > 0 && requestedMode === "SIMULATION" && (
               <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-mono text-slate-400">
                 Step {currentStep}
               </span>

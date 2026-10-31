@@ -11,7 +11,57 @@ scrape_configs:
           environment: 'development'
           cluster: 'local-sample-mesh'
 
+  # Scrape sample microservices exposing standard Prometheus /metrics
+  - job_name: 'incidentgraph-services'
+    scrape_interval: 5s
+    static_configs:
+      - targets:
+          - 'host.docker.internal:4000'
+          - 'host.docker.internal:4001'
+          - 'host.docker.internal:4002'
+          - 'host.docker.internal:4003'
+        labels:
+          environment: 'development'
+          cluster: 'local-sample-mesh'
+
+  # Scrape Next.js application control-plane metrics
+  - job_name: 'incidentgraph-app'
+    scrape_interval: 5s
+    metrics_path: '/api/metrics'
+    static_configs:
+      - targets: ['host.docker.internal:3000']
+        labels:
+          environment: 'development'
+          cluster: 'local-sample-mesh'
+
   # Self-scrape Prometheus health metrics
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+
+  # Dynamic file-based target discovery for disposable test verification services
+  - job_name: 'order-service-dynamic'
+    scrape_interval: 1s
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/file_sd/*.json'
+          - './docker/file_sd/*.json'
+        refresh_interval: 1s
+
+# -----------------------------------------------------------------------------
+# Grafana Cloud Prometheus Remote-Write Integration
+# -----------------------------------------------------------------------------
+# When streaming local metrics to Grafana Cloud Metrics:
+# In Docker Compose, this block is dynamically generated and appended if
+# GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL and dedicated GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN are set.
+# Note: Read-only query tokens (GRAFANA_CLOUD_PROMETHEUS_TOKEN) cannot authorize Remote-Write.
+#
+# remote_write:
+#   - url: "${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_URL}"
+#     basic_auth:
+#       username: "${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_USER}"
+#       password: "${GRAFANA_CLOUD_PROMETHEUS_REMOTE_WRITE_TOKEN}"
+#     queue_config:
+#       max_samples_per_send: 500
+#       max_shards: 4
+#       batch_send_deadline: 5s

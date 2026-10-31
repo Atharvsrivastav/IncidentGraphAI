@@ -37,6 +37,9 @@ jobs:
       - name: Initialize Database Schema
         run: npx prisma db push
 
+      - name: Validate Local Configuration
+        run: npm run config:check
+
       - name: Typecheck (tsc)
         run: npx tsc --noEmit
 
@@ -46,8 +49,14 @@ jobs:
       - name: Run Test Suite (vitest)
         run: npm test
 
+      - name: Run Algorithmic Benchmark Test
+        run: npm run test:benchmark
+
       - name: Run Root-Cause Reliability Benchmark
         run: npm run benchmark
 
       - name: Build Next.js Application
         run: npm run build
+
+      - name: Run Browser E2E Test Suite
+        run: npm run test:browser

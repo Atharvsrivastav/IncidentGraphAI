@@ -14,6 +14,7 @@ import {
   Zap,
   Play,
   ShieldAlert,
+  Radio,
 } from "lucide-react";
 import {
   AreaChart,
@@ -35,6 +36,19 @@ interface OverviewData {
     downCount: number;
     activeIncidentsCount: number;
     currentSeverity: string;
+  };
+  telemetry?: {
+    mode: string;
+    effectiveMode: string;
+    provenance: "LIVE" | "MOCK_EMULATION" | "LOCAL" | "DISABLED" | "ERROR";
+    backendType: string;
+    prometheusAvailable: boolean;
+    jaegerAvailable: boolean;
+    metricsIngested: boolean;
+    tracesIngested: boolean;
+    lastIngestedAt: string | null;
+    lastVerifiedAt: string | null;
+    details?: string;
   };
   distribution: { name: string; count: number; color: string }[];
   trends: { step: string; latency: number; errorRate: number }[];
@@ -141,11 +155,34 @@ export default function OverviewPage() {
               Operations Center
             </span>
             <span className="rounded bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-emerald-400">
-              Neon PostgreSQL Connected
+              PostgreSQL Connected
             </span>
-            <span className="rounded bg-purple-500/10 border border-purple-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-purple-400">
-              Grafana Cloud Active
-            </span>
+            {data.telemetry?.provenance === "LIVE" ? (
+              <span className="rounded bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-emerald-400 flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                PROVENANCE: LIVE (Grafana Cloud Verified)
+              </span>
+            ) : data.telemetry?.provenance === "MOCK_EMULATION" ? (
+              <span className="rounded bg-purple-500/10 border border-purple-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-purple-400 flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-purple-400" />
+                PROVENANCE: MOCK_EMULATION (Synthetic)
+              </span>
+            ) : data.telemetry?.provenance === "LOCAL" ? (
+              <span className="rounded bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-blue-400 flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-blue-400" />
+                PROVENANCE: LOCAL (Unverified External)
+              </span>
+            ) : data.telemetry?.provenance === "ERROR" ? (
+              <span className="rounded bg-rose-500/10 border border-rose-500/30 px-2 py-0.5 text-[11px] font-mono font-bold text-rose-400 flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-rose-400 animate-pulse" />
+                PROVENANCE: ERROR (Degraded)
+              </span>
+            ) : (
+              <span className="rounded bg-slate-800 border border-slate-700 px-2 py-0.5 text-[11px] font-mono font-bold text-slate-400 flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-slate-500" />
+                PROVENANCE: DISABLED (Simulation)
+              </span>
+            )}
           </div>
           <h1 className="mt-2 text-2xl font-black text-white tracking-tight sm:text-3xl">
             IncidentGraph AI Console
@@ -187,6 +224,127 @@ export default function OverviewPage() {
             <span>Topology</span>
             <ArrowRight className="h-3.5 w-3.5" />
           </Link>
+        </div>
+      </div>
+
+      {/* Telemetry Ingestion & Provenance Status Panel */}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 backdrop-blur-sm space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/80 pb-3">
+          <div className="flex items-center gap-2">
+            <Radio className="h-4 w-4 text-blue-400" />
+            <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+              Telemetry Pipeline & Provenance Status
+            </h3>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] font-mono">
+            <span className="text-slate-400">Live Smoke Test:</span>
+            <code className="rounded bg-slate-950 px-2 py-0.5 text-blue-400 border border-slate-800">
+              npm run test:observability:live
+            </code>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          {/* Provenance Card */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-3 space-y-1">
+            <div className="text-[10px] uppercase font-mono text-slate-400">Provenance State</div>
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-2.5 w-2.5 rounded-full ${
+                  data.telemetry?.provenance === "LIVE"
+                    ? "bg-emerald-400 animate-pulse"
+                    : data.telemetry?.provenance === "MOCK_EMULATION"
+                    ? "bg-purple-400"
+                    : data.telemetry?.provenance === "LOCAL"
+                    ? "bg-blue-400"
+                    : data.telemetry?.provenance === "ERROR"
+                    ? "bg-rose-400 animate-pulse"
+                    : "bg-slate-500"
+                }`}
+              />
+              <span className="font-mono font-bold text-white text-xs">
+                {data.telemetry?.provenance ?? "DISABLED"}
+              </span>
+            </div>
+            <div className="text-[10px] text-slate-400">
+              {data.telemetry?.provenance === "LIVE"
+                ? "Verified external ingestion"
+                : data.telemetry?.provenance === "MOCK_EMULATION"
+                ? "Development synthetic data"
+                : data.telemetry?.provenance === "LOCAL"
+                ? "Local unverified pipeline"
+                : data.telemetry?.provenance === "ERROR"
+                ? "Integration error / degraded"
+                : "Simulation mode active"}
+            </div>
+          </div>
+
+          {/* Metrics Ingestion Card */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-3 space-y-1">
+            <div className="text-[10px] uppercase font-mono text-slate-400">Prometheus / Cloud Metrics</div>
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  data.telemetry?.metricsIngested
+                    ? "bg-emerald-400"
+                    : data.telemetry?.prometheusAvailable
+                    ? "bg-amber-400"
+                    : "bg-slate-500"
+                }`}
+              />
+              <span className="font-mono font-semibold text-white text-xs">
+                {data.telemetry?.metricsIngested
+                  ? "Ingestion Confirmed"
+                  : data.telemetry?.prometheusAvailable
+                  ? "Reachable (No Ingestion)"
+                  : "Not Connected"}
+              </span>
+            </div>
+            <div className="text-[10px] text-slate-400 font-mono">
+              Scrape: /api/metrics & sample microservices
+            </div>
+          </div>
+
+          {/* Traces Ingestion Card */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-3 space-y-1">
+            <div className="text-[10px] uppercase font-mono text-slate-400">Tempo / OTLP Traces</div>
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  data.telemetry?.tracesIngested
+                    ? "bg-emerald-400"
+                    : data.telemetry?.jaegerAvailable
+                    ? "bg-amber-400"
+                    : "bg-slate-500"
+                }`}
+              />
+              <span className="font-mono font-semibold text-white text-xs">
+                {data.telemetry?.tracesIngested
+                  ? "OTLP Traces Verified"
+                  : data.telemetry?.jaegerAvailable
+                  ? "Reachable (No Traces)"
+                  : "Not Connected"}
+              </span>
+            </div>
+            <div className="text-[10px] text-slate-400 font-mono">
+              OTLP: /v1/traces via W3C context
+            </div>
+          </div>
+
+          {/* Last Verification / Export */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-3 space-y-1">
+            <div className="text-[10px] uppercase font-mono text-slate-400">Last Verified / Ingested</div>
+            <div className="font-mono text-white text-xs font-semibold truncate">
+              {data.telemetry?.lastVerifiedAt
+                ? new Date(data.telemetry.lastVerifiedAt).toLocaleTimeString()
+                : data.telemetry?.lastIngestedAt
+                ? new Date(data.telemetry.lastIngestedAt).toLocaleTimeString()
+                : "No verified export yet"}
+            </div>
+            <div className="text-[10px] text-slate-400 font-mono truncate">
+              Mode: {data.telemetry?.mode ?? "SIMULATION"} (Eff: {data.telemetry?.effectiveMode ?? "SIMULATION"})
+            </div>
+          </div>
         </div>
       </div>
 
@@ -422,12 +580,18 @@ export default function OverviewPage() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-sm font-bold text-white tracking-tight">
-                Simulated Latency & Error Trend
+                {data.telemetry?.provenance === "LIVE"
+                  ? "Live Telemetry Latency & Error Trend"
+                  : "Simulated Latency & Error Trend"}
               </h3>
-              <p className="text-xs text-slate-400">Average response time across simulation steps</p>
+              <p className="text-xs text-slate-400">Average response time across observation intervals</p>
             </div>
             <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono text-slate-400">
-              Moving Telemetry
+              {data.telemetry?.provenance === "LIVE"
+                ? "Source: Verified Live Telemetry"
+                : data.telemetry?.provenance === "MOCK_EMULATION"
+                ? "Source: Mock Emulation"
+                : "Source: Simulation Engine"}
             </span>
           </div>
 

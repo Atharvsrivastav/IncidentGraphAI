@@ -68,7 +68,7 @@ export default function TracesPage() {
             <span className="rounded bg-indigo-500/20 px-2.5 py-0.5 text-xs font-semibold text-indigo-400 border border-indigo-500/30">
               Distributed Tracing
             </span>
-            <span className="text-xs text-slate-400 font-mono">OpenTelemetry & Jaeger Engine</span>
+            <span className="text-xs text-slate-400 font-mono">OpenTelemetry, Grafana Cloud Tempo & Jaeger Engine</span>
           </div>
           <h1 className="mt-1.5 text-2xl font-black text-white tracking-tight sm:text-3xl">
             Trace Waterfall Investigation

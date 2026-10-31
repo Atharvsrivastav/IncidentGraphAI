@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/db/prisma";
+import { telemetryManager } from "@/lib/telemetry/telemetryManager";
 
 export async function GET() {
   try {
@@ -84,6 +85,11 @@ export async function GET() {
       };
     }
 
+    const health = await telemetryManager.getBackendHealth();
+    const mode = telemetryManager.getMode();
+    const effectiveMode = telemetryManager.getEffectiveMode();
+    const lastIngestedAt = telemetryManager.getLastIngestedAt();
+
     return NextResponse.json({
       summary: {
         totalServices,
@@ -92,6 +98,19 @@ export async function GET() {
         downCount,
         activeIncidentsCount: activeIncidents.length,
         currentSeverity,
+      },
+      telemetry: {
+        mode,
+        effectiveMode,
+        provenance: health.provenance ?? (mode === "SIMULATION" ? "DISABLED" : "LOCAL"),
+        backendType: health.backendType,
+        prometheusAvailable: health.prometheusAvailable,
+        jaegerAvailable: health.jaegerAvailable,
+        metricsIngested: Boolean(health.metricsIngested),
+        tracesIngested: Boolean(health.tracesIngested),
+        lastIngestedAt,
+        lastVerifiedAt: health.lastVerifiedAt ?? null,
+        details: health.details,
       },
       distribution: [
         { name: "Healthy", count: healthyCount, color: "#10b981" },

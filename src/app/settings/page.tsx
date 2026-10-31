@@ -168,7 +168,10 @@ export default function SettingsPage() {
                 Reset & Re-Seed Database
               </h3>
               {health?.environment === "production" && (
-                <span className="rounded bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-mono font-semibold text-amber-400">
+                <span
+                  data-testid="protected-in-production-badge"
+                  className="rounded bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-mono font-semibold text-amber-400"
+                >
                   Protected in Production
                 </span>
               )}
@@ -183,6 +186,7 @@ export default function SettingsPage() {
           {health?.environment === "production" ? (
             <button
               disabled
+              data-testid="reset-database-button"
               title="Database reset is disabled in production"
               className="flex items-center gap-2 rounded-xl bg-slate-800/80 border border-slate-700/60 px-4 py-2.5 text-xs font-bold text-slate-400 cursor-not-allowed shrink-0"
             >
@@ -193,6 +197,7 @@ export default function SettingsPage() {
             <button
               onClick={handleReset}
               disabled={resetting}
+              data-testid="reset-database-button"
               className="flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-blue-600/30 transition-all shrink-0"
             >
               <RefreshCw className={`h-4 w-4 ${resetting ? "animate-spin" : ""}`} />

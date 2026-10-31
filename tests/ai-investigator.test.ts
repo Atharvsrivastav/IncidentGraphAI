@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { redactSensitiveText, sanitizeContextForLLM, wrapAsUntrustedTelemetry } from "../src/lib/ai/redactor";
 import { MockAIProvider } from "../src/lib/ai/providers/mock";
 import { OpenAIProvider } from "../src/lib/ai/providers/openai";
@@ -6,8 +6,9 @@ import { getAIProviderStatus, setCustomAIProvider } from "../src/lib/ai/provider
 import { validateAndGroundInvestigation } from "../src/lib/ai/groundingValidator";
 import { investigateIncident } from "../src/lib/ai/investigator";
 import { InvestigationLLMOutput } from "../src/lib/ai/types";
-import { AIInvestigationContext, AIProviderError } from "../src/lib/ai/providers/types";
+import { AIProvider, AIInvestigationContext, AIProviderError } from "../src/lib/ai/providers/types";
 import { simulator } from "../src/lib/simulation/simulator";
+import { telemetryManager } from "../src/lib/telemetry/telemetryManager";
 import { seedDatabase } from "../src/lib/db/seed";
 import prisma from "../src/lib/db/prisma";
 import { GET as getAiInvestigation, POST as postAiInvestigation } from "../src/app/api/incidents/[id]/ai-investigation/route";
@@ -434,6 +435,51 @@ describe("AI Incident Investigation Vertical Slice Tests", () => {
       const cachedReport = await investigateIncident(incidentId, { forceRefresh: false });
       expect(cachedReport.id).toBe(persistedRecord?.id);
       expect(cachedReport.summary).toBe(report.summary);
+    });
+
+    it("prevents live trace leakage: simulation-origin incidents never query genuine live traces even when global mode is LIVE", async () => {
+      // 1. Inject a simulation incident (has simulationScenario: 'payment-failure')
+      const injection = await simulator.injectFailure({
+        scenarioId: "payment-failure",
+      });
+      const incidentId = injection.incidentId;
+
+      // 2. Set global telemetry mode to LIVE
+      telemetryManager.setMode("LIVE");
+
+      // 3. Spy on telemetryManager.getRecentTraces and provider generateInvestigation
+      const traceSpy = vi.spyOn(telemetryManager, "getRecentTraces");
+      let capturedContext: AIInvestigationContext | null = null;
+      const defaultMock = new MockAIProvider();
+      const customProvider: AIProvider = {
+        providerName: "test-recorder",
+        modelName: "test-model",
+        isConfigured: () => true,
+        generateInvestigation: async (ctx: AIInvestigationContext) => {
+          capturedContext = ctx;
+          return await defaultMock.generateInvestigation(ctx);
+        },
+      };
+
+      setCustomAIProvider(customProvider);
+
+      try {
+        const report = await investigateIncident(incidentId, { forceRefresh: true });
+
+        // 4. Assert provenance is strictly SIMULATED despite global mode being LIVE
+        expect(report.provenance).toBe("SIMULATED");
+
+        // 5. Assert telemetryManager.getRecentTraces was NEVER called
+        expect(traceSpy).not.toHaveBeenCalled();
+
+        // 6. Assert captured context contains no live traces
+        expect(capturedContext).toBeDefined();
+        expect((capturedContext as unknown as AIInvestigationContext)?.recentTraces).toEqual([]);
+      } finally {
+        traceSpy.mockRestore();
+        telemetryManager.setMode("SIMULATION");
+        setCustomAIProvider(new MockAIProvider());
+      }
     });
   });
 
