@@ -72,6 +72,7 @@ export interface DistributedTrace {
   servicesInvolved: string[];
   rootSpan: TraceSpan | null;
   allSpans: TraceSpan[];
+  isFallback?: boolean;
 }
 
 export interface RealTelemetryEvidence {

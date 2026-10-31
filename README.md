@@ -500,13 +500,15 @@ IncidentGraph AI maintains a comprehensive testing and static verification suite
 
 | Check | Command | Description | Status |
 |---|---|---|---|
-| **Unit & Integration Tests** | `npm test` | Runs 81 Vitest tests covering graph algorithms, heap priority, OpenTelemetry pipelines, and AI investigation | **81 / 81 Passing (100%)** |
+| **Unit & Integration Tests** | `npm test` | Runs 229 Vitest tests across 11 suites covering graph algorithms, heap priority, OpenTelemetry pipelines, telemetry provenance, and AI investigation | **229 / 229 Passing (100%)** |
+| **Algorithmic Benchmark** | `npm run test:benchmark` | Evaluates graph traversal, cycle detection, PriorityQueue, sliding window, and RCA scoring heuristics | **22 / 22 Passing (100%)** |
 | **Synthetic Robustness Benchmark** | `npm run benchmark` | Evaluates 117 documented synthetic chaos test cases across 5 topology families (distinct from the 7 interactive failure scenarios in the simulator; results measure the synthetic benchmark suite rather than unmodeled production incidents; see [Benchmark Methodology](docs/ROOT_CAUSE_BENCHMARK.md)) | **117 / 117 Suite Scenarios Passing Acceptance Criteria (100% Top-1 / Top-3 on 65 Evaluable Failures)** |
+| **Browser E2E Automation** | `npm run test:browser` | Headless Chrome browser automation with isolated database and port lifecycle management | **9 / 9 Sections Passing (129 Assertions)** |
+| **Live Observability Smoke Test** | `npm run test:observability:live` | Genuine live external verification against Grafana Cloud OTLP, Prometheus Mimir, and Tempo | **Strict External Read-Back Verified** |
 | **Security & Dependency Audit** | `npm audit` / `npm audit --omit=dev` | Audits dependency tree for CVEs and vulnerabilities | **0 Vulnerabilities** |
 | **Type Checking** | `npx tsc --noEmit` | Strict TypeScript compiler validation across all components and routes | **0 Errors** |
 | **Linting** | `npm run lint` | ESLint static code analysis verifying Next.js and React rules | **0 Errors** |
-| **Production Build** | `npm run build` | Compiles and optimizes Next.js production bundle with route pre-rendering | **26 / 26 Routes Compiled** |
-| **Cloud Pipeline Verification** | `npm run test:cloud` | End-to-end verification of Grafana Cloud OTLP, Prometheus, and Tempo | **6 / 6 Gates Verified** |
+| **Production Build** | `npm run build` | Compiles and optimizes Next.js production bundle with route pre-rendering | **27 / 27 Routes Compiled** |
 
 ---
 

@@ -25,11 +25,19 @@ export interface MetricAttributes {
   [key: string]: unknown;
 }
 
+function escapeLabelValue(val: string): string {
+  return String(val)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
+
 export class PrometheusRegistry {
   private serviceName: string;
   private requests = new Map<string, number>();
   private errors = new Map<string, number>();
   private durations: { sum: number; count: number; buckets: Map<number, number> };
+  private healthStatus: number = 1;
   public static readonly BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 10];
 
   constructor(serviceName: string) {
@@ -41,19 +49,49 @@ export class PrometheusRegistry {
     this.durations = { sum: 0, count: 0, buckets: bucketMap };
   }
 
+  public setHealthStatus(status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN"): void {
+    if (typeof status === "number") {
+      this.healthStatus = status <= 0 ? 0 : 1;
+    } else if (typeof status === "boolean") {
+      this.healthStatus = status ? 1 : 0;
+    } else if (status === "HEALTHY") {
+      this.healthStatus = 1;
+    } else {
+      this.healthStatus = 0;
+    }
+  }
+
+  public getHealthStatus(): number {
+    return this.healthStatus;
+  }
+
   public recordRequest(count: number = 1, attributes?: MetricAttributes): void {
-    const status = String(attributes?.status ?? "200");
-    const key = `service="${this.serviceName}",status="${status}"`;
+    if (typeof count !== "number" || isNaN(count) || count < 0) {
+      throw new Error(`Invalid metric count: ${count}`);
+    }
+    const rawStatus = String(attributes?.status ?? "200");
+    const status = /^\d{3}$/.test(rawStatus) ? rawStatus : "unknown";
+    const extraVerification = attributes?.verification_id
+      ? `,verification_id="${escapeLabelValue(String(attributes.verification_id))}"`
+      : "";
+    const key = `service="${escapeLabelValue(this.serviceName)}",status="${escapeLabelValue(status)}"${extraVerification}`;
     this.requests.set(key, (this.requests.get(key) || 0) + count);
   }
 
   public recordError(count: number = 1, attributes?: MetricAttributes): void {
-    const status = String(attributes?.status ?? "500");
-    const key = `service="${this.serviceName}",status="${status}"`;
+    if (typeof count !== "number" || isNaN(count) || count < 0) {
+      throw new Error(`Invalid error count: ${count}`);
+    }
+    const rawStatus = String(attributes?.status ?? "500");
+    const status = /^\d{3}$/.test(rawStatus) ? rawStatus : "500";
+    const key = `service="${escapeLabelValue(this.serviceName)}",status="${escapeLabelValue(status)}"`;
     this.errors.set(key, (this.errors.get(key) || 0) + count);
   }
 
   public recordDuration(seconds: number): void {
+    if (typeof seconds !== "number" || isNaN(seconds) || seconds < 0) {
+      throw new Error(`Invalid duration seconds: ${seconds}`);
+    }
     this.durations.sum += seconds;
     this.durations.count += 1;
     for (const b of PrometheusRegistry.BUCKETS) {
@@ -70,7 +108,7 @@ export class PrometheusRegistry {
     lines.push("# HELP http_requests_total Total number of HTTP requests processed by this service");
     lines.push("# TYPE http_requests_total counter");
     if (this.requests.size === 0) {
-      lines.push(`http_requests_total{service="${this.serviceName}",status="200"} 0`);
+      lines.push(`http_requests_total{service="${escapeLabelValue(this.serviceName)}",status="200"} 0`);
     } else {
       for (const [labels, val] of this.requests.entries()) {
         lines.push(`http_requests_total{${labels}} ${val}`);
@@ -81,7 +119,7 @@ export class PrometheusRegistry {
     lines.push("# HELP http_request_errors_total Total number of HTTP error responses (5xx or timeouts)");
     lines.push("# TYPE http_request_errors_total counter");
     if (this.errors.size === 0) {
-      lines.push(`http_request_errors_total{service="${this.serviceName}",status="500"} 0`);
+      lines.push(`http_request_errors_total{service="${escapeLabelValue(this.serviceName)}",status="500"} 0`);
     } else {
       for (const [labels, val] of this.errors.entries()) {
         lines.push(`http_request_errors_total{${labels}} ${val}`);
@@ -93,16 +131,16 @@ export class PrometheusRegistry {
     lines.push("# TYPE http_request_duration_seconds histogram");
     for (const b of PrometheusRegistry.BUCKETS) {
       const count = this.durations.buckets.get(b) || 0;
-      lines.push(`http_request_duration_seconds_bucket{service="${this.serviceName}",le="${b}"} ${count}`);
+      lines.push(`http_request_duration_seconds_bucket{service="${escapeLabelValue(this.serviceName)}",le="${b}"} ${count}`);
     }
-    lines.push(`http_request_duration_seconds_bucket{service="${this.serviceName}",le="+Inf"} ${this.durations.count}`);
-    lines.push(`http_request_duration_seconds_sum{service="${this.serviceName}"} ${this.durations.sum.toFixed(6)}`);
-    lines.push(`http_request_duration_seconds_count{service="${this.serviceName}"} ${this.durations.count}`);
+    lines.push(`http_request_duration_seconds_bucket{service="${escapeLabelValue(this.serviceName)}",le="+Inf"} ${this.durations.count}`);
+    lines.push(`http_request_duration_seconds_sum{service="${escapeLabelValue(this.serviceName)}"} ${this.durations.sum.toFixed(6)}`);
+    lines.push(`http_request_duration_seconds_count{service="${escapeLabelValue(this.serviceName)}"} ${this.durations.count}`);
 
     // service_health_status
     lines.push("# HELP service_health_status Health status of the service (1=healthy, 0=unhealthy)");
     lines.push("# TYPE service_health_status gauge");
-    lines.push(`service_health_status{service="${this.serviceName}"} 1`);
+    lines.push(`service_health_status{service="${escapeLabelValue(this.serviceName)}"} ${this.healthStatus}`);
 
     return lines.join("\n") + "\n";
   }
@@ -122,11 +160,15 @@ export interface ServiceTelemetry {
   otlpTargetUrl: string;
   getPrometheusMetrics: () => string;
   handleMetricsRequest: (res: import("http").ServerResponse) => void;
+  setHealthStatus: (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => void;
+  getHealthStatus: () => number;
   getExportStatus: () => {
     isCloudExport: boolean;
     lastExportStatus: "SUCCESS" | "FAILED" | "PENDING" | "DISABLED";
     lastExportTime?: string;
     lastExportError?: string;
+    successCount: number;
+    failureCount: number;
   };
 }
 
@@ -175,12 +217,39 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     "deployment.environment": process.env.DEPLOYMENT_ENVIRONMENT || process.env.ENVIRONMENT || (isCloudExport ? "production-hosted" : "development"),
   });
 
+  // Track genuine exporter outcomes
+  const exportTracker = {
+    status: (isCloudExport ? "PENDING" : "DISABLED") as "SUCCESS" | "FAILED" | "PENDING" | "DISABLED",
+    lastTime: undefined as string | undefined,
+    lastError: undefined as string | undefined,
+    successCount: 0,
+    failureCount: 0,
+  };
+
   // 1. Trace provider with OTLP HTTP trace exporter
   const traceUrl = otlpEndpoint.endsWith("/v1/traces") ? otlpEndpoint : `${otlpEndpoint}/v1/traces`;
   const traceExporter = new OTLPTraceExporter({
     url: traceUrl,
     headers,
   });
+
+  // Intercept trace exporter callback to track genuine live outcomes
+  const origTraceExport = traceExporter.export.bind(traceExporter);
+  traceExporter.export = (spans, resultCallback) => {
+    origTraceExport(spans, (result) => {
+      if (result.code === 0) {
+        exportTracker.status = "SUCCESS";
+        exportTracker.lastTime = new Date().toISOString();
+        exportTracker.lastError = undefined;
+        exportTracker.successCount++;
+      } else {
+        exportTracker.status = "FAILED";
+        exportTracker.lastError = result.error?.message || "OTLP trace export failed";
+        exportTracker.failureCount++;
+      }
+      resultCallback(result);
+    });
+  };
 
   const provider = new NodeTracerProvider({
     resource,
@@ -194,6 +263,24 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     url: metricUrl,
     headers,
   });
+
+  // Intercept metric exporter callback to track genuine live outcomes
+  const origMetricExport = metricExporter.export.bind(metricExporter);
+  metricExporter.export = (metricsData, resultCallback) => {
+    origMetricExport(metricsData, (result) => {
+      if (result.code === 0) {
+        exportTracker.status = "SUCCESS";
+        exportTracker.lastTime = new Date().toISOString();
+        exportTracker.lastError = undefined;
+        exportTracker.successCount++;
+      } else {
+        exportTracker.status = "FAILED";
+        exportTracker.lastError = result.error?.message || "OTLP metric export failed";
+        exportTracker.failureCount++;
+      }
+      resultCallback(result);
+    });
+  };
 
   const metricReader = new PeriodicExportingMetricReader({
     exporter: metricExporter,
@@ -224,39 +311,6 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     unit: "s",
   });
 
-  const requestCounter: Counter = {
-    add: (value: number, attributes?: Record<string, unknown>) => {
-      registry.recordRequest(value, attributes as MetricAttributes);
-      try {
-        rawRequestCounter.add(value, attributes as Record<string, string | number | boolean>);
-      } catch {
-        // safe fallback
-      }
-    },
-  };
-
-  const errorCounter: Counter = {
-    add: (value: number, attributes?: Record<string, unknown>) => {
-      registry.recordError(value, attributes as MetricAttributes);
-      try {
-        rawErrorCounter.add(value, attributes as Record<string, string | number | boolean>);
-      } catch {
-        // safe fallback
-      }
-    },
-  };
-
-  const durationHistogram: Histogram = {
-    record: (value: number, attributes?: Record<string, unknown>) => {
-      registry.recordDuration(value);
-      try {
-        rawDurationHistogram.record(value, attributes as Record<string, string | number | boolean>);
-      } catch {
-        // safe fallback
-      }
-    },
-  };
-
   const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
     const activeSpan = trace.getSpan(context.active());
     const spanContext = activeSpan?.spanContext();
@@ -277,6 +331,39 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     } else {
       console.log(JSON.stringify(payload));
     }
+  };
+
+  const requestCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordRequest(value, attributes as MetricAttributes);
+      try {
+        rawRequestCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel counter.add failed", { error: err instanceof Error ? err.message : String(err) });
+      }
+    },
+  };
+
+  const errorCounter: Counter = {
+    add: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordError(value, attributes as MetricAttributes);
+      try {
+        rawErrorCounter.add(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel errorCounter.add failed", { error: err instanceof Error ? err.message : String(err) });
+      }
+    },
+  };
+
+  const durationHistogram: Histogram = {
+    record: (value: number, attributes?: Record<string, unknown>) => {
+      registry.recordDuration(value);
+      try {
+        rawDurationHistogram.record(value, attributes as Record<string, string | number | boolean>);
+      } catch (err: unknown) {
+        log("warn", "OTel durationHistogram.record failed", { error: err instanceof Error ? err.message : String(err) });
+      }
+    },
   };
 
   const startSpan = (name: string, carrier?: Record<string, string>) => {
@@ -315,10 +402,19 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     res.end(registry.toPrometheusFormat());
   };
 
+  const setHealthStatus = (status: number | boolean | "HEALTHY" | "DEGRADED" | "DOWN") => {
+    registry.setHealthStatus(status);
+  };
+
+  const getHealthStatus = () => registry.getHealthStatus();
+
   const getExportStatus = () => ({
     isCloudExport,
-    lastExportStatus: (isCloudExport ? "SUCCESS" : "DISABLED") as "SUCCESS" | "FAILED" | "PENDING" | "DISABLED",
-    lastExportTime: new Date().toISOString(),
+    lastExportStatus: exportTracker.status,
+    lastExportTime: exportTracker.lastTime,
+    lastExportError: exportTracker.lastError,
+    successCount: exportTracker.successCount,
+    failureCount: exportTracker.failureCount,
   });
 
   const instance: ServiceTelemetry = {
@@ -335,6 +431,8 @@ export function initServiceTelemetry(serviceName: string): ServiceTelemetry {
     otlpTargetUrl: traceUrl,
     getPrometheusMetrics,
     handleMetricsRequest,
+    setHealthStatus,
+    getHealthStatus,
     getExportStatus,
   };
 

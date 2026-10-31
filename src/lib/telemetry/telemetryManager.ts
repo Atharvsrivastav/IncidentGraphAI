@@ -21,6 +21,9 @@ export class TelemetryManager {
   private effectiveMode: TelemetryMode = "SIMULATION";
   private lastHealthCheck: BackendHealthStatus | null = null;
   private lastIngestedAt: string | null = null;
+  private lastVerifiedAt: string | null = null;
+  private metricsIngested: boolean = false;
+  private tracesIngested: boolean = false;
   private cachedObservation: {
     timestamp: number;
     data: {
@@ -73,6 +76,9 @@ export class TelemetryManager {
 
     if (normalized === "SIMULATION") {
       this.effectiveMode = "SIMULATION";
+      this.metricsIngested = false;
+      this.tracesIngested = false;
+      this.lastVerifiedAt = null;
     } else {
       // LIVE mode requires confirmed telemetry observations; starts at DEGRADED until verified
       this.effectiveMode = "DEGRADED";
@@ -145,7 +151,7 @@ export class TelemetryManager {
     } else if (!promHealth.available || !jaegerHealth.available) {
       provenance = "ERROR";
     } else if (isCloud && !isMock) {
-      provenance = (this.effectiveMode === "LIVE" && this.lastIngestedAt) ? "LIVE" : "LOCAL";
+      provenance = (this.effectiveMode === "LIVE" && this.metricsIngested && this.tracesIngested && this.lastVerifiedAt) ? "LIVE" : "LOCAL";
     } else {
       provenance = "LOCAL";
     }
@@ -164,9 +170,9 @@ export class TelemetryManager {
       provenance,
       lastChecked: new Date().toISOString(),
       lastIngestedAt: this.lastIngestedAt || undefined,
-      lastVerifiedAt: this.effectiveMode === "LIVE" && this.lastIngestedAt ? this.lastIngestedAt : undefined,
-      metricsIngested: promHealth.available,
-      tracesIngested: jaegerHealth.available,
+      lastVerifiedAt: this.lastVerifiedAt || undefined,
+      metricsIngested: this.metricsIngested,
+      tracesIngested: this.tracesIngested,
       details,
     };
 
@@ -252,17 +258,45 @@ export class TelemetryManager {
       jaegerClient.getRecentTracesDetailed(undefined, 30),
     ]);
 
-    const promSuccess = promMetricsDetailed.success && promMetricsDetailed.metrics.size > 0;
-    const tempoSuccess = traceDetailed.success && traceDetailed.traces.length > 0;
-    const hasData = promSuccess || tempoSuccess;
+    const knownServiceIds = new Set(dbServices.map((s) => s.id));
+    const knownServiceNames = new Set(dbServices.map((s) => s.name));
 
-    // Truthful mode decision: requires BOTH backends to be connected, queries to succeed, and verified data returned
-    const isTrulyLive = backendHealth.prometheusAvailable && backendHealth.jaegerAvailable && promSuccess && tempoSuccess;
+    // Verify metrics: must match known topology service and contain valid non-empty data
+    let validMonitoredMetricsCount = 0;
+    for (const [key, metric] of promMetricsDetailed.metrics.entries()) {
+      if (
+        (knownServiceIds.has(key) || knownServiceNames.has(key)) &&
+        (metric.hasValidLatency || metric.hasValidErrorRate || metric.hasValidRequestRate)
+      ) {
+        validMonitoredMetricsCount++;
+      }
+    }
+    const promMetricsVerified = promMetricsDetailed.success && validMonitoredMetricsCount > 0;
+
+    // Verify traces: must have actual spans, not be fallback, belong to monitored services, and be recent
+    const verifiedRecentTraces = traceDetailed.traces.filter((t) => {
+      if (t.isFallback) return false;
+      if (!t.allSpans || t.allSpans.length === 0) return false;
+      const involvesMonitored = t.servicesInvolved.some((s) => knownServiceIds.has(s) || knownServiceNames.has(s));
+      if (!involvesMonitored) return false;
+      const ts = new Date(t.startTime).getTime();
+      return !isNaN(ts) && Date.now() - ts < 30 * 60 * 1000;
+    });
+    const tempoTracesVerified = traceDetailed.success && verifiedRecentTraces.length > 0;
+
+    this.metricsIngested = promMetricsVerified;
+    this.tracesIngested = tempoTracesVerified;
+
+    const hasData = promMetricsVerified || tempoTracesVerified;
+
+    // Truthful mode decision: requires BOTH backends to be connected, queries to succeed, and verified recent data returned
+    const isTrulyLive = backendHealth.prometheusAvailable && backendHealth.jaegerAvailable && promMetricsVerified && tempoTracesVerified;
     const effectiveMode: TelemetryMode = isTrulyLive ? "LIVE" : "DEGRADED";
     this.effectiveMode = effectiveMode;
 
     if (isTrulyLive) {
       this.lastIngestedAt = new Date().toISOString();
+      this.lastVerifiedAt = new Date().toISOString();
     }
 
     return this.buildLiveObservedServices(
@@ -281,6 +315,9 @@ export class TelemetryManager {
     backendHealth: BackendHealthStatus
   ) {
     backendHealth.provenance = "DISABLED";
+    backendHealth.metricsIngested = false;
+    backendHealth.tracesIngested = false;
+    backendHealth.lastVerifiedAt = undefined;
     const observed: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
@@ -324,6 +361,9 @@ export class TelemetryManager {
   ) {
     const offlineProvenance: TelemetryProvenanceState = backendHealth.cloudConfigured ? "ERROR" : "DISABLED";
     backendHealth.provenance = offlineProvenance;
+    backendHealth.metricsIngested = false;
+    backendHealth.tracesIngested = false;
+    backendHealth.lastVerifiedAt = undefined;
     const unavailable: ObservedServiceMetric[] = dbServices.map((s) => ({
       serviceId: s.id,
       serviceName: s.name,
@@ -373,10 +413,13 @@ export class TelemetryManager {
     const liveProvenance: TelemetryProvenanceState = backendHealth.isMockBackend
       ? "MOCK_EMULATION"
       : backendHealth.isCloudBackend
-      ? (effectiveMode === "LIVE" ? "LIVE" : "ERROR")
+      ? (effectiveMode === "LIVE" ? "LIVE" : backendHealth.prometheusAvailable && backendHealth.jaegerAvailable ? "LOCAL" : "ERROR")
       : (effectiveMode === "LIVE" ? "LOCAL" : "ERROR");
 
     backendHealth.provenance = liveProvenance;
+    backendHealth.metricsIngested = this.metricsIngested;
+    backendHealth.tracesIngested = this.tracesIngested;
+    backendHealth.lastVerifiedAt = this.lastVerifiedAt || undefined;
     const topologyIds = new Set(dbServices.map((s) => s.id));
     const traceCountByService = new Map<string, number>();
 

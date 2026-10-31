@@ -17,11 +17,17 @@ let serviceFailureRate = 0;
 export function setOrderFault(delayMs: number, failureRate: number = 0) {
   serviceDelayMs = delayMs;
   serviceFailureRate = failureRate;
+  if (failureRate > 0.2 || delayMs > 2000) {
+    telemetry.setHealthStatus(0);
+  } else if (failureRate > 0 || delayMs > 500) {
+    telemetry.setHealthStatus("DEGRADED");
+  }
 }
 
 export function resetOrderFault() {
   serviceDelayMs = 0;
   serviceFailureRate = 0;
+  telemetry.setHealthStatus(1);
 }
 
 export const server = http.createServer(async (req, res) => {

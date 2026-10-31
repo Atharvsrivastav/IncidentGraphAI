@@ -106,10 +106,10 @@ export async function GET() {
         backendType: health.backendType,
         prometheusAvailable: health.prometheusAvailable,
         jaegerAvailable: health.jaegerAvailable,
-        metricsIngested: health.metricsIngested ?? health.prometheusAvailable,
-        tracesIngested: health.tracesIngested ?? health.jaegerAvailable,
+        metricsIngested: Boolean(health.metricsIngested),
+        tracesIngested: Boolean(health.tracesIngested),
         lastIngestedAt,
-        lastVerifiedAt: health.lastVerifiedAt ?? (effectiveMode === "LIVE" ? lastIngestedAt : null),
+        lastVerifiedAt: health.lastVerifiedAt ?? null,
         details: health.details,
       },
       distribution: [
