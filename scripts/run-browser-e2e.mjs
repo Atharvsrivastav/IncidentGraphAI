@@ -11,21 +11,36 @@ const runner = new RunnerLifecycle();
 
 // Bind signal handlers to the runner's teardown orchestration
 process.on('SIGINT', async () => {
-  const code = await runner.performTeardown({ signal: 'SIGINT' });
-  process.exit(code);
+  try {
+    const code = await runner.performTeardown({ signal: 'SIGINT' });
+    process.exit(code);
+  } catch (err) {
+    console.error('Fatal error during SIGINT teardown:', err);
+    process.exit(1);
+  }
 });
 
 process.on('SIGTERM', async () => {
-  const code = await runner.performTeardown({ signal: 'SIGTERM' });
-  process.exit(code);
+  try {
+    const code = await runner.performTeardown({ signal: 'SIGTERM' });
+    process.exit(code);
+  } catch (err) {
+    console.error('Fatal error during SIGTERM teardown:', err);
+    process.exit(1);
+  }
 });
 
 // Support IPC message interruption on Windows where POSIX signals are not natively propagated
 if (process.send) {
   process.on('message', async (msg) => {
     if (msg === 'SIGINT' || msg === 'SIGTERM') {
-      const code = await runner.performTeardown({ signal: msg });
-      process.exit(code);
+      try {
+        const code = await runner.performTeardown({ signal: msg });
+        process.exit(code);
+      } catch (err) {
+        console.error(`Fatal error during ${msg} IPC teardown:`, err);
+        process.exit(1);
+      }
     }
   });
 }
@@ -271,13 +286,14 @@ async function main() {
 }
 
 main()
-  .catch(async (err) => {
-    const code = await runner.performTeardown({ error: err });
+  .then(async () => {
+    const code = await runner.performTeardown();
     console.log(`[Runner Completed] Exit code: ${code}\n`);
     process.exit(code);
   })
-  .then(async () => {
-    const code = await runner.performTeardown();
+  .catch(async (err) => {
+    console.error('\n❌ Unhandled error in main():', err);
+    const code = await runner.performTeardown({ error: err });
     console.log(`[Runner Completed] Exit code: ${code}\n`);
     process.exit(code);
   });

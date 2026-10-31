@@ -658,7 +658,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         }
 
         // Verify exit code 130
-        expect(exitCode).toBe(130);
+        expect(exitCode, `exitCode=${exitCode}\nSTDOUT:\n${stdoutOutput}\nSTDERR:\n${stderrOutput}`).toBe(130);
 
         // Verify browser Node and worker descendants stopped
         expect(isProcessAlive(browserPid!)).toBe(false);
@@ -801,7 +801,7 @@ describe("Real Production-Code E2E Isolation, Ownership & Signal Tests", () => {
         }
 
         // Verify exit code 143
-        expect(exitCode).toBe(143);
+        expect(exitCode, `exitCode=${exitCode}\nSTDOUT:\n${stdoutOutput}\nSTDERR:\n${stderrOutput}`).toBe(143);
 
         // Verify browser Node and worker descendants stopped
         expect(isProcessAlive(browserPid!)).toBe(false);

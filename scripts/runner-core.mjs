@@ -437,6 +437,15 @@ export class RunnerLifecycle {
       return;
     }
 
+    // A signal termination (code === null, signal is set) during active execution:
+    // If signal is SIGINT or SIGTERM, record it as a signal termination, NOT as natural test failure code
+    if (code === null && (signal === 'SIGINT' || signal === 'SIGTERM')) {
+      if (!this.signalReceived) {
+        this.signalReceived = signal;
+      }
+      return;
+    }
+
     // Preserve an already-established genuine non-zero browser test failure
     if (this.testExitCode !== null && this.testExitCode !== 0) {
       return;
